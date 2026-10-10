@@ -502,7 +502,7 @@ func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event
 	ev.TokenizeMS = time.Since(start).Milliseconds()
 	if err == nil {
 		ar.PromptTokens = len(tokens)
-		ar.Blocks = p.admission.PromptKeys(tokens)
+		ar.Tokens = tokens
 		ev.Tokenized = true
 	} else {
 		// Never charge less than the estimate: a 4xx may be a validation failure the

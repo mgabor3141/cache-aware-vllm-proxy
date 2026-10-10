@@ -40,6 +40,8 @@ type admissionWaiter struct {
 	session string
 	prompt  int                 // prompt tokens (exact from /tokenize, else estimated)
 	blocks  kvmirror.PromptKeys // mirror keys of the prompt
+	tokens  []int64             // the prompt, kept only until its keys match the block size
+	mirGen  uint64              // the mirror's generation when admitted
 	maxOut  int                 // the request's output cap (0: none)
 	expOut  int                 // expected output tokens, fixed at admission
 	gen     *OutputCounter
@@ -86,11 +88,6 @@ func NewAdmissionQueue(cfg AdmissionConfig) *AdmissionQueue {
 		running: map[*admissionWaiter]struct{}{}, mirror: kvmirror.New()}
 }
 
-// PromptKeys are a tokenized prompt's mirror keys.
-func (q *AdmissionQueue) PromptKeys(tokens []int64) kvmirror.PromptKeys {
-	return q.mirror.NewPromptKeys(tokens)
-}
-
 // Run re-evaluates the queue once a second: holds the engine dropped are released and
 // expendable holds become displaceable without a request finishing first.
 func (q *AdmissionQueue) Run(ctx context.Context) {
@@ -103,10 +100,7 @@ func (q *AdmissionQueue) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			q.mu.Lock()
-			q.guardDecayLocked(q.now())
-			q.grantLocked()
-			q.mu.Unlock()
+			q.tick()
 		case <-prune.C:
 			q.mu.Lock()
 			q.pruneSessionsLocked(q.now(), false)
@@ -122,8 +116,10 @@ type AdmissionRequest struct {
 	// while running and hold nothing afterwards.
 	Session      string
 	PromptTokens int
-	Blocks       kvmirror.PromptKeys
-	MaxTokens    int
+	// Tokens are the prompt's token IDs (from /tokenize), for the KV mirror; nil when the
+	// prompt could not be tokenized.
+	Tokens    []int64
+	MaxTokens int
 	// Generated, when set, counts output tokens so far; the request's charge grows with
 	// it once it passes the expected output.
 	Generated *OutputCounter
@@ -176,13 +172,20 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 
 // enqueue registers a waiter and admits it at once if it fits.
 func (q *AdmissionQueue) enqueue(ar AdmissionRequest) (*admissionWaiter, bool, AdmissionSnapshot) {
+	// Keys are built outside the queue's lock; while the block size is unknown they are
+	// built again when it is (keysLocked).
+	keys := q.mirror.NewPromptKeys(ar.Tokens)
+	tokens := ar.Tokens
+	if keys.BlockSize > 0 {
+		tokens = nil
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	now := q.now()
 	w := &admissionWaiter{
 		priority: ar.Priority, enqueued: now,
 		sequence: q.sequence, ready: make(chan struct{}), session: ar.Session,
-		prompt: max(ar.PromptTokens, 0), blocks: ar.Blocks, maxOut: ar.MaxTokens,
+		prompt: max(ar.PromptTokens, 0), blocks: keys, tokens: tokens, maxOut: ar.MaxTokens,
 		report: ar.Report, gen: ar.Generated,
 	}
 	q.sequence++
@@ -238,4 +241,16 @@ func (q *AdmissionQueue) Snapshot() AdmissionSnapshot {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.snapshotLocked()
+}
+
+// tick is the queue's once-a-second pass: the guard decays, holds are judged against the
+// mirror (syncHoldsLocked; once a second, not on every grant, as it looks at every hold),
+// and waiters are re-evaluated.
+func (q *AdmissionQueue) tick() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := q.now()
+	q.guardDecayLocked(now)
+	q.syncHoldsLocked(now)
+	q.grantLocked()
 }

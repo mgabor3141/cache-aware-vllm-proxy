@@ -68,6 +68,8 @@ type Mirror struct {
 	replayedAt                    time.Time
 	lastEvent                     time.Time
 	connected                     bool
+	// generation counts resets: subscriptions, engine restarts, AllBlocksCleared.
+	generation uint64
 	// dropLast applies the EAGLE last-block drop (speculative decoding on).
 	dropLast bool
 	stats    Stats
@@ -231,6 +233,7 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 // resetLocked forgets every block and what the groups are (a restarted engine may serve
 // another model); the block size set from metrics stays.
 func (m *Mirror) resetLocked() {
+	m.generation++
 	m.byEngine = map[uint64]*mirrorBlock{}
 	m.byKey = map[BlockKey]*mirrorBlock{}
 	m.attnMask, m.mambaMask = 0, 0
@@ -243,6 +246,7 @@ func (m *Mirror) applyLocked(e *Event) {
 	}
 	switch e.Type {
 	case "AllBlocksCleared":
+		m.generation++
 		m.byEngine = map[uint64]*mirrorBlock{}
 		m.byKey = map[BlockKey]*mirrorBlock{}
 		m.stats.Cleared++
@@ -614,3 +618,12 @@ func (m *Mirror) endReplayLocked() {
 // They queued while the replay ran and arrive at once; later, a sequence going back is a
 // restart even inside the replayed range (an idle engine restarting starts at 0).
 var overlapWindow = 5 * time.Second
+
+// Generation changes whenever the mirror forgets what it held: a (re)subscription, an
+// engine restart, or the engine clearing its cache. A block the mirror does not see now
+// was seen and lost if the generation is the same as when it should have been stored.
+func (m *Mirror) Generation() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.generation
+}

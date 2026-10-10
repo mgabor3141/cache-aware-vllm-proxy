@@ -58,10 +58,10 @@ type turn struct {
 	done     chan struct{}
 }
 
-func (q *AdmissionQueue) startReq(session string, prio, prompt int, blocks []kvmirror.BlockKey) *turn {
+func (q *AdmissionQueue) startReq(session string, prio, prompt int, tokens []int64) *turn {
 	tr := &turn{admitted: make(chan func(), 1), rep: &AdmissionReport{}, done: make(chan struct{})}
 	ar := AdmissionRequest{
-		Priority: prio, Session: session, PromptTokens: prompt, MaxTokens: 4000, Blocks: kvmirror.PromptKeys{BlockSize: 3200, Blocks: blocks}, Report: tr.rep,
+		Priority: prio, Session: session, PromptTokens: prompt, MaxTokens: 4000, Tokens: tokens, Report: tr.rep,
 		Observe: func() (CacheObservation, bool) {
 			tr.mu.Lock()
 			defer tr.mu.Unlock()
@@ -108,12 +108,6 @@ func (tr *turn) finish(rel func(), prompt, completion int) {
 	tr.obs = CacheObservation{PromptTokens: prompt, CompletionTokens: completion}
 	tr.mu.Unlock()
 	rel()
-}
-
-func (q *AdmissionQueue) tick() {
-	q.mu.Lock()
-	q.grantLocked()
-	q.mu.Unlock()
 }
 
 const settle = 50 * time.Millisecond
@@ -329,7 +323,7 @@ func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	ra := mustAdmit(t, ta, "busy")
 	cold := q.start("cold", 0, 100000)
 	clk.add(time.Second)
-	hot := q.startReq("hot", 0, len(prompt), keys)
+	hot := q.startReq("hot", 0, len(prompt), prompt)
 	mustWait(t, cold, "cold")
 	mustWait(t, hot, "hot")
 	ta.finish(ra, 1000, 10)
@@ -656,7 +650,7 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 	m.SetConnected(true)
 	prompt := testPrompt(20, 0)
 	storePrompt(m, 1, prompt, 1)
-	tr := q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr := q.startReq("a", 0, len(prompt), prompt)
 	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
 	q.tick()
 	if q.metrics().held == 0 {
@@ -672,7 +666,7 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 	// A hold made while the mirror is resyncing is judged once it is healthy.
 	m.SetConnected(false)
 	storePrompt(m, 1, prompt, 1)
-	tr = q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr = q.startReq("a", 0, len(prompt), prompt)
 	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
 	q.tick()
 	m.SetConnected(true)
@@ -848,4 +842,59 @@ func (q *AdmissionQueue) waiterWait(session string) time.Duration {
 		}
 	}
 	return -1
+}
+
+// A hold whose first look sees nothing is gone when the mirror was reset since its turn
+// was admitted (here the engine restarted mid-turn), rather than exempt from judgement
+// forever. Without a reset in between, a hold the mirror cannot match stays (review 3,
+// rev-2 #2).
+func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	m := q.mirror
+	m.SetConnected(true)
+	prompt := testPrompt(20, 0)
+	storePrompt(m, 1, prompt, 1)
+	tr := q.startReq("a", 0, len(prompt), prompt)
+	rel := mustAdmit(t, tr, "a")
+	m.Apply(2, nil)
+	m.Apply(0, nil) // the engine restarted while the turn ran
+	tr.finish(rel, len(prompt), 100)
+	for i := 0; i < 5; i++ {
+		clk.add(time.Minute)
+		q.tick()
+	}
+	if got := q.metrics(); got.held != 0 || got.evictedHolds != 1 {
+		t.Fatalf("a hold lost to a restart is kept: %+v", got)
+	}
+
+	// Control: a prompt the mirror never matches (no reset meanwhile) keeps its hold.
+	other := testPrompt(20, 7)
+	tr = q.startReq("b", 0, len(other), other)
+	tr.finish(mustAdmit(t, tr, "b"), len(other), 100)
+	q.tick()
+	if q.sessionHeld("b") == 0 {
+		t.Fatal("an unmatchable hold was dropped without evidence")
+	}
+}
+
+// A request tokenized before the engine's block size is known gets its mirror keys once
+// it is, so it is scored by what is cached and its hold can be judged (review 3, rev-2 #3).
+func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
+	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{KVEventsEndpoint: "tcp://vllm:5557"}})
+	q.mirror.SetConnected(true)
+	prompt := testPrompt(20, 0)
+	rep := &AdmissionReport{}
+	got := make(chan func(), 1)
+	go func() {
+		rel, _, _, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "a", PromptTokens: len(prompt), Tokens: prompt, Report: rep})
+		got <- rel
+	}()
+	waitForQueued(t, q, 1)
+	storePrompt(q.mirror, 1, prompt, 1)
+	q.SetPool(223, 3200)
+	rel := <-got
+	defer rel()
+	if rep.PredictedCached != 19*3200 {
+		t.Fatalf("predicted cached %d, want %d", rep.PredictedCached, 19*3200)
+	}
 }

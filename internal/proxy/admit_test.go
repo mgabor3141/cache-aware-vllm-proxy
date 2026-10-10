@@ -66,9 +66,8 @@ func TestAdmissionRequestTokenizesWithTemplateKwargs(t *testing.T) {
 	if ev.body != nil {
 		t.Error("body kept after tokenizing")
 	}
-	// Keys are built at the engine's block size (4 here), never one per token (cv-57 #5).
-	if ar.Blocks.BlockSize != 4 || len(ar.Blocks.Blocks) != 2 {
-		t.Errorf("keys %+v, want 2 blocks of 4", ar.Blocks)
+	if len(ar.Tokens) != 10 {
+		t.Errorf("tokens %v, want the 10 /tokenize returned", ar.Tokens)
 	}
 }
 

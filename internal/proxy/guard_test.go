@@ -99,7 +99,7 @@ func TestGuardIgnoresHoldEviction(t *testing.T) {
 	mustAdmit(t, q.start("big", 0, 600000), "big")
 	prompt := testPrompt(20, 0)
 	storePrompt(m, -1, prompt, 1)
-	tr := q.startReq("agent", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr := q.startReq("agent", 0, len(prompt), prompt)
 	tr.finish(mustAdmit(t, tr, "agent"), len(prompt), 100) // a firm hold, near the budget
 	q.tick()
 	g := 5
