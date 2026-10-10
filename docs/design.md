@@ -1,0 +1,111 @@
+# Design
+
+cache-aware-vllm-proxy sits in front of one vLLM engine and decides when each request reaches
+it. Everything here follows from one workload: many coding agents running tool loops on long
+contexts against a single GPU box. This document explains the choices and the measurements
+behind them.
+
+## The problem
+
+An agent turn adds a few hundred to a few thousand tokens to 50-250K tokens of context, and the
+agent comes back within seconds (in one measured run of review agents, 91% of next turns arrived
+within 1 s of the previous answer and all within 5 s). If the engine still has the context in
+its prefix cache, the turn costs a short prefill. If not, the whole context is recomputed: tens
+of seconds at a few thousand tokens per second, while every other request's decoding slows down
+too (a running prefill cut decode speed by about 94% on the reference engine).
+
+vLLM sees requests, not conversations. Under load it evicts a context that is about to be reused,
+because an agent between turns looks like an idle cached prefix. With 20 agents on a 640K-token
+pool the starting point was 13-16% of prompt tokens served from cache, and the engine spent most
+of its time recomputing.
+
+## Principles
+
+- **All queueing happens in the proxy.** The engine is only sent what it can run. A request
+  queued or preempted inside the engine loses its cache and blocks others; one waiting in the
+  proxy costs nothing.
+- **No timeouts and no queue limit.** Agents retry. Timeouts that fire for many waiters at once
+  only add load. A retry from the same conversation keeps its place in the queue.
+- **Judge by real traffic.** An early simulator gave answers that did not survive contact with
+  real agents; every figure here comes from live runs.
+- **Depend only on public engine interfaces:** the OpenAI API, `/metrics`, and KV cache events.
+  The proxy survived two engine upgrades without code changes for that reason.
+
+## Knowing what is cached: the KV mirror
+
+The engine publishes every prefix-cache block it stores or evicts (`--kv-events-config`, ZMQ).
+The `kvmirror` package replays that stream into a copy of the cache, keyed by token content, so
+for any prompt the proxy can say how many leading tokens the engine would serve from cache.
+Every request is tokenized on arrival (`/tokenize`, with the chat template) to get those tokens.
+In live runs the prediction matched the engine's reported `cached_tokens` on over 99% of requests.
+
+Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
+attention blocks: a hit at position p also needs a saved recurrent state at exactly p. The mirror
+tracks each KV group separately and only counts a hit where every group has it. Engines that
+checkpoint the recurrent state at a finer unit than the block (`--prefix-match-unit` in halt95's
+vLLM fork; not an upstream vLLM flag at the time of writing) announce
+the tail checkpoint and the span after it as small entries whose parents are never announced; the
+mirror indexes those by token content.
+
+## Admission
+
+**Budget.** The engine's KV pool, read from `vllm:cache_config_info`. Until it is known, only
+`max_active` applies.
+
+**What a running request costs.** Its prompt, its output so far or its expected output
+(whichever is larger; the expectation is the conversation's 75th percentile, else a default),
+and a fixed per-request overhead in blocks for state the engine keeps beyond the tokens. The
+charge updates as output streams.
+
+**Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
+admitted on top of it. A hold is firm (cannot be displaced by work of the same or lower
+priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
+that prefill would slow, and at least 5 s so a quick tool call always comes back warm. After that
+it is expendable: it stays while nothing needs the room.
+
+**Order.** Priority first (lower runs first, as in vLLM). Then a waiter whose prompt is at least
+half cached, or whose own conversation holds its context; then small prompts; then cold ones; each
+by arrival. A blocked waiter reserves the room it still needs, so smaller work cannot starve it.
+
+**Eviction.** An expendable hold is displaced only while fewer than 4 requests run. On a busy
+engine displacing a context only adds prefill work.
+
+**Priority is a ceiling.** A caller's identity sets the most urgent it may be; a request or an
+alias may only make it run later. Ordering is strict, so a self-promoted caller could starve
+everyone else.
+
+Holds do not control what the engine evicts: vLLM evicts its least recently freed cached blocks.
+The proxy can only keep enough room free that the engine has no reason to evict a held context.
+An engine-side retention API (vLLM RFC #37003) would let holds become real pins.
+
+## The per-request overhead
+
+Besides prompt and output tokens a running request holds blocks of its own: recurrent states,
+speculative-decoding scratch, prefix-cache checkpoints. On the reference hybrid model this was 17
+blocks per request on one engine version, 28 on another, and 7-12 on a third. Too low a figure
+means the engine runs out of KV space; too high wastes capacity.
+
+The figure is configuration, measured with `cavp -calibrate` on an idle engine. The proxy cannot
+learn it continuously: an engine that keeps finished turns pinned for their next turn reports most
+of its pool in use while nothing runs, and does not export how much of that is pinned.
+
+The overcommit guard covers a figure that is too low. It raises a margin on two signals: the
+engine preempting a request, and the engine evicting a held context while the proxy's accounting
+was near its budget. The engine's waiting queue is not a signal: it counts every request not yet
+scheduled, including ones waiting for the next step's prefill token budget, and is non-zero in
+normal operation. Using it raised the margin by 8 blocks in five minutes of normal load.
+
+## Engine findings along the way
+
+- With `mamba_cache_mode=align`, recurrent checkpoints were written only where a prefill step
+  ended on a block boundary (3,200-4,096 tokens), so a turn adding less than a block missed
+  entirely. A finer prefix-match unit fixed it.
+- On one engine version a prompt's tail checkpoint was released early and aged out of the cache
+  before the agent returned (fixed in halt95's vLLM fork, v2.5.1).
+- Each was found by tracing KV events against real misses, not by aggregate hit rates.
+
+## Results
+
+10 coding agents for 6.4 hours on 4x RTX 3090 (Qwen3.8 Flash-Next, 262K context): 91% of prompt
+tokens served from cache, 95% of quick returns cached, zero preemptions, against 13-16% with
+slot-based admission at the start.
