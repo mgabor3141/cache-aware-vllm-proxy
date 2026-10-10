@@ -203,8 +203,11 @@ func TestKVMirrorRestartInsideFormerDuplicateWindow(t *testing.T) {
 func TestKVMirrorReplayOverlap(t *testing.T) {
 	m := New()
 	toks := seqPrompt(9)
-	m.Apply(20000, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
-	m.replayedTo, m.liveSeq = m.lastSeq, -1 // as subscribe does when the replay completes
+	m.Apply(14000, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	for seq := int64(14001); seq <= 20000; seq++ { // the replay
+		m.Apply(seq, nil)
+	}
+	m.endReplayLocked() // as subscribe does when the replay completes
 	for _, seq := range []int64{14000, 14001, 20000} {
 		if !m.Apply(seq, []Event{{Type: "AllBlocksCleared"}}) {
 			t.Fatalf("seq %d: reported a gap", seq)
@@ -222,8 +225,11 @@ func TestKVMirrorReplayOverlap(t *testing.T) {
 	}
 
 	m = New()
-	m.Apply(50, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
-	m.replayedTo, m.liveSeq = m.lastSeq, -1
+	m.Apply(30, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	for seq := int64(31); seq <= 50; seq++ {
+		m.Apply(seq, nil)
+	}
+	m.endReplayLocked()
 	m.Apply(40, nil)
 	m.Apply(0, nil) // inside the overlap, but behind the previous live batch
 	if st := m.Status(); st.Stats.Restarts != 1 {
@@ -352,4 +358,39 @@ func TestKVMirrorHealthyOnlyAfterReplay(t *testing.T) {
 	if got := m2.CachedTokens(toks); got != 4 {
 		t.Fatalf("replayed blocks: %d cached, want 4", got)
 	}
+}
+
+// A restarted engine's sequence can fall inside the range the last replay covered. A
+// batch below the replay's first sequence cannot be a repeat, and once the overlap
+// window has passed (an idle engine that restarts later) none can: both are restarts,
+// and the new engine's blocks are applied (review 3, rev-2 #1).
+func TestKVMirrorRestartInsideReplayedRange(t *testing.T) {
+	old, fresh := seqPrompt(9), seqPrompt(9)
+	for i := range fresh {
+		fresh[i] += 1000
+	}
+	replay := func(from int64) *Mirror {
+		m := New()
+		m.Apply(from, []Event{attnStore(1, nil, old[:4]), attnStore(2, uint64(1), old[4:8])})
+		for seq := from + 1; seq <= 10; seq++ {
+			m.Apply(seq, nil)
+		}
+		m.endReplayLocked()
+		return m
+	}
+	check := func(m *Mirror) {
+		t.Helper()
+		if o, n := m.CachedTokens(old), m.CachedTokens(fresh); o != 0 || n != 4 || m.Status().Stats.Restarts != 1 {
+			t.Fatalf("old cached %d, new cached %d, %+v", o, n, m.Status().Stats)
+		}
+	}
+
+	m := replay(0)
+	m.replayedAt = time.Now().Add(-overlapWindow) // the engine sat idle, then restarted
+	m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
+	check(m)
+
+	m = replay(5)
+	m.Apply(2, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
+	check(m)
 }

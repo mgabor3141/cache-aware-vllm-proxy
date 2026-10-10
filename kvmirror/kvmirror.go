@@ -60,12 +60,14 @@ type Mirror struct {
 	attnMask  uint64 // groups that are attention (need a contiguous prefix)
 	mambaMask uint64 // groups that are recurrent state (need the hit block only)
 	lastSeq   int64
-	// After a replay, live delivery repeats the batches the replay already applied, once
-	// and in order: up to replayedTo, each above liveSeq, is a duplicate. Any other
-	// sequence at or below lastSeq means the engine restarted.
-	replayedTo, liveSeq int64
-	lastEvent           time.Time
-	connected           bool
+	// After a replay, live delivery repeats the batches the replay already applied, once,
+	// in order, and at once (they queued while the replay ran): for overlapWindow after
+	// the replay, a sequence from firstSeq up to replayedTo, above liveSeq, is a
+	// duplicate. Any other sequence at or below lastSeq means the engine restarted.
+	firstSeq, replayedTo, liveSeq int64
+	replayedAt                    time.Time
+	lastEvent                     time.Time
+	connected                     bool
 	// dropLast applies the EAGLE last-block drop (speculative decoding on).
 	dropLast bool
 	stats    Stats
@@ -195,7 +197,7 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if seq >= 0 && m.lastSeq >= 0 {
-		if seq <= m.replayedTo && seq > m.liveSeq {
+		if seq >= m.firstSeq && seq <= m.replayedTo && seq > m.liveSeq && time.Since(m.replayedAt) < overlapWindow {
 			m.liveSeq = seq
 			m.stats.Duplicates++
 			return true
@@ -211,6 +213,9 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 			m.lastSeq = seq
 			return false
 		}
+	}
+	if seq >= 0 && m.firstSeq < 0 {
+		m.firstSeq = seq
 	}
 	if seq >= 0 {
 		m.lastSeq = seq
@@ -229,7 +234,7 @@ func (m *Mirror) resetLocked() {
 	m.byEngine = map[uint64]*mirrorBlock{}
 	m.byKey = map[BlockKey]*mirrorBlock{}
 	m.attnMask, m.mambaMask = 0, 0
-	m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1
+	m.firstSeq, m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1, -1
 }
 
 func (m *Mirror) applyLocked(e *Event) {
@@ -457,7 +462,7 @@ func (m *Mirror) subscribe(ctx context.Context, endpoint, replay string) error {
 		log.Printf("level=info msg=\"kv events replayed\" batches=%d blocks=%d", n, m.Status().Blocks)
 	}
 	m.mu.Lock()
-	m.replayedTo, m.liveSeq = m.lastSeq, -1
+	m.endReplayLocked()
 	m.connected = true
 	m.mu.Unlock()
 	log.Printf("level=info msg=\"kv events subscribed\" endpoint=%q", endpoint)
@@ -598,3 +603,14 @@ func ReplayEndpoint(endpoint string) string {
 
 // replayFirstWait bounds the wait for a replay round's first batch.
 var replayFirstWait = 5 * time.Second
+
+// endReplayLocked opens the window in which live delivery may repeat what the replay
+// applied.
+func (m *Mirror) endReplayLocked() {
+	m.replayedTo, m.liveSeq, m.replayedAt = m.lastSeq, -1, time.Now()
+}
+
+// overlapWindow bounds how long after a replay live batches can still be repeats of it.
+// They queued while the replay ran and arrive at once; later, a sequence going back is a
+// restart even inside the replayed range (an idle engine restarting starts at 0).
+var overlapWindow = 5 * time.Second
