@@ -6,10 +6,16 @@ import (
 	"time"
 )
 
-// Slot admission (before the engine pool is known, or with cache admission off) runs
-// the lowest priority value first, then the earliest arrival.
-func TestSlotAdmissionOrder(t *testing.T) {
-	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 1})
+// slotQueue is a queue on a known pool large enough that only max_active binds.
+func slotQueue(maxActive int) *AdmissionQueue {
+	q := NewAdmissionQueue(AdmissionConfig{MaxActive: maxActive})
+	q.SetPool(1001, 3200)
+	return q
+}
+
+// Within what fits, the lowest priority value runs first, then the earliest arrival.
+func TestAdmissionPriorityOrder(t *testing.T) {
+	q := slotQueue(1)
 	release, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{})
 	if !ok {
 		t.Fatal("initial acquire failed")
@@ -21,7 +27,7 @@ func TestSlotAdmissionOrder(t *testing.T) {
 	results := make(chan result, 3)
 	enqueue := func(name string, prio, queued int) {
 		go func() {
-			r, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{Priority: prio})
+			r, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{Priority: prio, PromptTokens: 100000})
 			if ok {
 				results <- result{name, r}
 			}
@@ -42,7 +48,7 @@ func TestSlotAdmissionOrder(t *testing.T) {
 }
 
 func TestAdmissionQueueCancellationRemovesWaiter(t *testing.T) {
-	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 1})
+	q := slotQueue(1)
 	release, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{})
 	if !ok {
 		t.Fatal("initial acquire failed")
@@ -50,7 +56,7 @@ func TestAdmissionQueueCancellationRemovesWaiter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan bool)
 	go func() {
-		_, _, _, _, ok := q.Acquire(ctx, AdmissionRequest{})
+		_, _, _, _, ok := q.Acquire(ctx, AdmissionRequest{Session: "s"})
 		done <- ok
 	}()
 	waitForQueued(t, q, 1)
@@ -61,11 +67,14 @@ func TestAdmissionQueueCancellationRemovesWaiter(t *testing.T) {
 	if got := q.Snapshot().Queued; got != 0 {
 		t.Fatalf("queued=%d, want 0", got)
 	}
+	if w := q.sessions["s"].waiting; w != 0 {
+		t.Fatalf("session waiting=%d after its waiter gave up", w)
+	}
 	release()
 }
 
 func TestAdmissionAllowsConfiguredConcurrency(t *testing.T) {
-	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 4})
+	q := slotQueue(4)
 	var releases []func()
 	for i := 0; i < 4; i++ {
 		r, _, _, snap, ok := q.Acquire(context.Background(), AdmissionRequest{})
@@ -80,6 +89,76 @@ func TestAdmissionAllowsConfiguredConcurrency(t *testing.T) {
 	for _, release := range releases {
 		release()
 	}
+}
+
+// Until the engine's pool is known nothing is admitted; requests wait (the request path
+// keeps streaming clients alive meanwhile) and run once it is read.
+func TestAdmissionWaitsForThePool(t *testing.T) {
+	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 4})
+	got := make(chan func(), 1)
+	go func() {
+		r, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{Session: "s", PromptTokens: 1000})
+		if ok {
+			got <- r
+		}
+	}()
+	waitForQueued(t, q, 1)
+	select {
+	case <-got:
+		t.Fatal("admitted before the pool was known")
+	case <-time.After(50 * time.Millisecond):
+	}
+	q.SetPool(201, 3200)
+	select {
+	case r := <-got:
+		r()
+	case <-time.After(time.Second):
+		t.Fatal("not admitted once the pool was known")
+	}
+}
+
+// A session's waiting count matches its queued requests on every path: admitted at once,
+// admitted after waiting, given up (reviews cv-51 HIGH-2, cv-53 #1, cv-58 #8). A leaked
+// count would keep the session's hold firm forever.
+func TestAdmissionWaitingCountDrains(t *testing.T) {
+	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 1})
+	waiting := func() int {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.sessions["s"].waiting
+	}
+	first := make(chan func(), 1)
+	go func() {
+		r, _, _, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "s", PromptTokens: 1000})
+		first <- r
+	}()
+	waitForQueued(t, q, 1) // the pool is unknown: it waits
+	if waiting() != 1 {
+		t.Fatalf("waiting=%d while queued", waiting())
+	}
+	q.SetPool(201, 3200)
+	rel := <-first
+	if waiting() != 0 {
+		t.Fatalf("waiting=%d after admission from the queue", waiting())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		q.Acquire(ctx, AdmissionRequest{Session: "s", PromptTokens: 1000})
+		close(done)
+	}()
+	waitForQueued(t, q, 1) // max_active binds
+	cancel()
+	<-done
+	if waiting() != 0 {
+		t.Fatalf("waiting=%d after a waiter gave up", waiting())
+	}
+	rel()
+	r, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{Session: "s", PromptTokens: 1000})
+	if !ok || waiting() != 0 {
+		t.Fatalf("waiting=%d after immediate admission", waiting())
+	}
+	r()
 }
 
 func waitForQueued(t *testing.T, q *AdmissionQueue, want int) {

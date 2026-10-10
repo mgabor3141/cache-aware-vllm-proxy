@@ -60,8 +60,7 @@ func TestGuardFirmHoldEviction(t *testing.T) {
 			q, _ := newCacheQueue(t, func(a *AdmissionConfig) {
 				a.Cache.PrefillOverheadBlocks, a.Cache.DecodeOverheadBlocks = intPtr(2), intPtr(2)
 			})
-			m := kvmirror.New()
-			q.SetMirror(m)
+			m := q.mirror
 			m.SetConnected(true)
 			if c.big > 0 {
 				mustAdmit(t, q.start("big", 0, c.big), "big")
@@ -117,4 +116,49 @@ func TestFetchEngineUsageParses(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A raised margin applies to waiters already queued: their charge is priced when they are
+// granted, not frozen at arrival, so the queue never over-commits the model by the margin
+// (reviews cv-51 MED-1, cv-54 #7, cv-60 F2). And a waiter queued during a raise is not held
+// back by it once the margin decays.
+func TestGuardMarginReachesQueuedWaiters(t *testing.T) {
+	q, clk := newCacheQueuePool(t, 320000, func(a *AdmissionConfig) { // 100 blocks
+		a.Cache.PrefillOverheadBlocks, a.Cache.DecodeOverheadBlocks = intPtr(0), intPtr(0)
+	})
+	const bs = 3200
+	blocks := func(n int) int { return n*bs - 4000 } // the fixture reserves 4000 output tokens
+	aRel := mustAdmit(t, q.start("a", 0, blocks(40)), "a")
+	mustAdmit(t, q.start("b", 0, blocks(58)), "b")
+	early := q.start("early", 0, blocks(40))
+	mustWait(t, early, "early")
+
+	q.EngineSignals(3)
+	q.EngineSignals(4) // the guard raises while early waits
+	if got := waiterCharge(q.Residency(), "early"); got != (40+guardStepBlocks)*bs {
+		t.Fatalf("queued charge %d, want the raised %d", got, (40+guardStepBlocks)*bs)
+	}
+	aRel() // frees exactly the pre-raise charge: early no longer fits beside b
+	q.tick()
+	mustWait(t, early, "early, short by the margin")
+
+	clk.add(guardDecayAfter + time.Second)
+	q.mu.Lock()
+	q.guardDecayLocked(q.now())
+	q.mu.Unlock()
+	q.tick()
+	rel := mustAdmit(t, early, "early once the margin decayed")
+	if r := q.Residency(); r.RunningTokens > r.BudgetTokens {
+		t.Fatalf("over-committed: running %d of %d", r.RunningTokens, r.BudgetTokens)
+	}
+	rel()
+}
+
+func waiterCharge(r ResidencySnapshot, session string) int {
+	for _, w := range r.Waiters {
+		if w.Session == session {
+			return w.Charge
+		}
+	}
+	return -1
 }

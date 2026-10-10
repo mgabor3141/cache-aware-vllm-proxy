@@ -25,14 +25,18 @@ func (c *fakeClock) add(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// Production-shaped config: 30m queue timeout, 10m max wait.
+// newCacheQueue is a queue on a known pool of 3200-token blocks: 222 usable blocks (200 of
+// a hybrid model, plus room for 28-block runners) unless mutate sets another size.
 func newCacheQueue(t *testing.T, mutate func(*AdmissionConfig)) (*AdmissionQueue, *fakeClock) {
+	return newCacheQueuePool(t, 710400, mutate)
+}
+
+func newCacheQueuePool(t *testing.T, pool int, mutate func(*AdmissionConfig)) (*AdmissionQueue, *fakeClock) {
 	t.Helper()
 	cfg := AdmissionConfig{
 		MaxActive: 8,
 		Cache: CacheConfig{
-			Enabled: true, Tokens: 710400, BlockTokens: 3200, // 200 usable blocks of a hybrid model, plus room for 28-block runners
-			PrefillTokensPerSecond: 4200, DecodeInterference: 0.94, DefaultOutputTokens: 4000,
+			KVEventsEndpoint: "tcp://vllm:5557", PrefillTokensPerSecond: 4200, DecodeInterference: 0.94, DefaultOutputTokens: 4000,
 		},
 	}
 	if mutate != nil {
@@ -42,6 +46,7 @@ func newCacheQueue(t *testing.T, mutate func(*AdmissionConfig)) (*AdmissionQueue
 	if err := q.cfg.validate(); err != nil {
 		t.Fatal(err)
 	}
+	q.SetPool(pool/3200+1, 3200)
 	clk := &fakeClock{t: time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)}
 	q.now = clk.now
 	return q, clk
@@ -300,8 +305,7 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 // A request whose prefix the mirror reports cached costs less and goes first.
 func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
-	m := kvmirror.New()
-	q.SetMirror(m)
+	m := q.mirror
 	m.SetConnected(true)
 	prompt := make([]int64, 3200*30+10)
 	for i := range prompt {
@@ -345,8 +349,8 @@ func TestShippedConfigValidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.yaml: %v", err)
 	}
-	if !cfg.Admission.Cache.enabled() {
-		t.Fatal("shipped config has cache admission off")
+	if cfg.Admission.Cache.KVEventsEndpoint == "" {
+		t.Fatal("shipped config has no kv_events_endpoint")
 	}
 }
 
@@ -494,7 +498,7 @@ func TestCacheAdmissionTinyRequestBesideProtectedHolds(t *testing.T) {
 func TestCacheAdmissionPriorityDisplacesBestFit(t *testing.T) {
 	// 200 blocks: big and small leave holds of 63 and 18, busy runs 59, so the claw
 	// (61) does not fit in the 59-60 left without displacing one.
-	q, _ := newCacheQueue(t, func(c *AdmissionConfig) { c.Cache.Tokens = 640000 })
+	q, _ := newCacheQueuePool(t, 640000, nil)
 	big := q.start("big", 10, 200000)
 	rbig := mustAdmit(t, big, "big")
 	small := q.start("small", 10, 57600)
@@ -519,7 +523,7 @@ func TestParseEnginePool(t *testing.T) {
 	if _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
 		t.Fatal("want an error without cache_config_info")
 	}
-	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{Enabled: true}})
+	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8})
 	if q.budget() != 0 {
 		t.Fatal("pool should be unknown before SetPool")
 	}
@@ -653,9 +657,6 @@ func TestCacheAdmissionTierOrder(t *testing.T) {
 	cold := q.start("cold", 0, 100000)
 	clk.add(time.Minute)
 	small := q.start("small", 0, 5000)
-	q.mu.Lock()
-	q.mirror = nil
-	q.mu.Unlock()
 	ta.finish(ra, 100000, 1000)
 	mustAdmit(t, small, "small ahead of an older cold waiter")
 	mustWait(t, cold, "cold behind small")
@@ -713,8 +714,7 @@ func testPrompt(blocks int, salt int64) []int64 {
 // resyncing is judged once it is healthy again.
 func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
-	m := kvmirror.New()
-	q.SetMirror(m)
+	m := q.mirror
 	m.SetConnected(true)
 	prompt := testPrompt(20, 0)
 	storePrompt(m, 1, prompt, 1)

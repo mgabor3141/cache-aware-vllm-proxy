@@ -502,7 +502,7 @@ func TestTrustedHeadersNotForwarded(t *testing.T) {
 	}))
 	defer up.Close()
 	f := t.TempDir() + "/c.yaml"
-	os.WriteFile(f, []byte("upstream: "+up.URL+"\nauth:\n  mode: trusted_header\n  secret: 0123456789abcdef-secret\n"), 0o600)
+	os.WriteFile(f, []byte("upstream: "+up.URL+"\nauth:\n  mode: trusted_header\n  secret: 0123456789abcdef-secret\nadmission:\n  cache:\n    kv_events_endpoint: tcp://127.0.0.1:1\n"), 0o600)
 	cfg, err := LoadConfig(f)
 	if err != nil {
 		t.Fatal(err)
@@ -512,6 +512,7 @@ func TestTrustedHeadersNotForwarded(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.health.recordSuccess("test")
+	h.admission.SetPool(201, 3200)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set(auth.HeaderSecret, "0123456789abcdef-secret")
 	req.Header.Set(auth.HeaderUser, "alice")

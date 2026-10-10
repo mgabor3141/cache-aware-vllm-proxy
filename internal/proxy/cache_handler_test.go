@@ -30,10 +30,12 @@ func cacheTestProxy(t *testing.T, tokenize http.HandlerFunc) (*Proxy, *atomic.Va
 	cfg := &Config{
 		Aliases: map[string]AliasEntry{"default": {Target: "m"}},
 		Admission: AdmissionConfig{MaxActive: 8,
-			Cache: CacheConfig{Enabled: true, Tokens: 511562, BlockTokens: 4}},
+			Cache: CacheConfig{KVEventsEndpoint: "tcp://vllm:5557"}},
 	}
 	cfg.Admission.applyDefaults()
-	return &Proxy{cfg: cfg, upstream: u, tokenizeClient: &http.Client{}, tokenizeSem: make(chan struct{}, 4), admission: NewAdmissionQueue(cfg.Admission)}, seen
+	q := NewAdmissionQueue(cfg.Admission)
+	q.SetPool(1000, 4)
+	return &Proxy{cfg: cfg, upstream: u, tokenizeClient: &http.Client{}, tokenizeSem: make(chan struct{}, 4), admission: q}, seen
 }
 
 func rewriteForAdmission(t *testing.T, p *Proxy, body string, hdr map[string]string) (*http.Request, *Event) {

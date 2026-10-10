@@ -17,7 +17,7 @@ import (
 //	vllm:cache_config_info{block_size="3200",...,num_gpu_blocks="201",...} 1.0
 //
 // It changes only when the engine restarts with a different model or cache size, so a
-// slow refresh is enough. Until it is known, admission runs on slots alone.
+// slow refresh is enough. Until it is known, nothing is admitted.
 
 var (
 	poolBlocksRe = regexp.MustCompile(`[{,]num_gpu_blocks="(\d+)"`)
@@ -127,7 +127,7 @@ func runEnginePool(ctx context.Context, upstream string, q *AdmissionQueue) {
 		case err != nil:
 			if last[0] == 0 {
 				wait = 10 * time.Second
-				log.Printf("level=warn msg=\"engine KV pool unknown, slot admission\" err=%q", err.Error())
+				log.Printf("level=warn msg=\"engine KV pool unknown, requests wait\" err=%q", err.Error())
 			}
 		case [2]int{blocks, size} != last:
 			last = [2]int{blocks, size}

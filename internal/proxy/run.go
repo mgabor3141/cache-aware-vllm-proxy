@@ -57,16 +57,10 @@ func Main() {
 		fatal("proxy init: %v", err)
 	}
 	go prx.admission.Run(rootCtx)
-	if ep := cfg.Admission.Cache.KVEventsEndpoint; ep != "" && cfg.Admission.Cache.enabled() {
-		m := kvmirror.New()
-		prx.admission.SetMirror(m)
-		prx.mirror = m
-		go m.Run(rootCtx, ep, kvmirror.ReplayEndpoint(ep))
-	}
-	if cfg.Admission.Cache.enabled() {
-		go runEnginePool(rootCtx, cfg.Upstream, prx.admission)
-		go runEngineUsage(rootCtx, cfg.Upstream, prx.admission)
-	}
+	ep := cfg.Admission.Cache.KVEventsEndpoint
+	go prx.admission.mirror.Run(rootCtx, ep, kvmirror.ReplayEndpoint(ep))
+	go runEnginePool(rootCtx, cfg.Upstream, prx.admission)
+	go runEngineUsage(rootCtx, cfg.Upstream, prx.admission)
 
 	go resolver.RunRefreshLoop(rootCtx, cfg.ModelsRefreshInterval, func(err error) {
 		// Operator-visible but not noisy. The next successful refresh

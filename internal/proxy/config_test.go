@@ -42,9 +42,16 @@ func TestCacheConfigValidation(t *testing.T) {
 		{"    prefill_overhead_blocks: 0\n", "", 0},
 		{"    prefill_overhead_blocks: -1\n", "prefill_overhead_blocks", 0},
 		{"    decode_interference: 1.5\n", "decode_interference", 0},
+		{"    enabled: true\n", "enabled", 0}, // cache admission is always on
+		{"    kv_events_endpoint: \"\"\n", "kv_events_endpoint is required", 0},
+		{"    kv_events_endpoint: tcp://vllm\n", "host:port", 0},
 	} {
+		ep := "    kv_events_endpoint: tcp://vllm:5557\n"
+		if strings.Contains(c.yaml, "kv_events_endpoint") {
+			ep = ""
+		}
 		f := t.TempDir() + "/c.yaml"
-		os.WriteFile(f, []byte("upstream: http://x\nauth:\n  mode: none\nadmission:\n  cache:\n    enabled: true\n"+c.yaml), 0o600)
+		os.WriteFile(f, []byte("upstream: http://x\nauth:\n  mode: none\nadmission:\n  cache:\n"+ep+c.yaml), 0o600)
 		cfg, err := LoadConfig(f)
 		if c.bad != "" {
 			if err == nil || !strings.Contains(err.Error(), c.bad) {

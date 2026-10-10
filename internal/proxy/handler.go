@@ -42,7 +42,6 @@ import (
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/internal/auth"
-	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
 // Proxy carries the bits a request handler needs. Built once at
@@ -60,7 +59,6 @@ type Proxy struct {
 	// tokenizeClient sizes requests for cache-aware admission; one-shot, no retries.
 	tokenizeClient *http.Client
 	tokenizeSem    chan struct{}
-	mirror         *kvmirror.Mirror
 	// bodyBudget bounds total request-body bytes held at once. Bodies must be
 	// read to rewrite the model alias, so size is bounded in aggregate rather than
 	// per request; see bodybudget.go.
@@ -490,7 +488,7 @@ func (p *Proxy) rewriteBody(w http.ResponseWriter, r *http.Request, who *auth.Re
 
 	// Inputs for cache-aware admission (cache.go). The body is kept for /tokenize, which
 	// runs in the admission step, after a streaming client already gets keepalives.
-	if p.cfg.Admission.Cache.enabled() && p.shouldAdmit(r) {
+	if p.shouldAdmit(r) {
 		ev.maxTokens = maxTokensOf(body)
 		ev.textBytes = textBytesOf(body)
 		ev.admitBody = body
@@ -879,8 +877,7 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// admissionRequest builds the admission inputs. With cache-aware admission it tokenizes
-// the request first (exact size and the token IDs the KV mirror needs); on the streaming
+// admissionRequest builds the admission inputs. It tokenizes the request first (exact size and the token IDs the KV mirror needs); on the streaming
 // path this runs after SSE keepalives started. Observe reads ev at release time; both
 // forwarding paths fill the usage fields before their deferred release runs.
 func (p *Proxy) admissionRequest(r *http.Request, ev *Event) AdmissionRequest {
@@ -901,21 +898,12 @@ func (p *Proxy) admissionRequest(r *http.Request, ev *Event) AdmissionRequest {
 	ev.report = report
 	if body := ev.admitBody; body != nil {
 		ev.admitBody = nil
-		block := p.cfg.Admission.Cache.BlockTokens
-		if p.mirror != nil && p.mirror.BlockSize() > 0 {
-			block = p.mirror.BlockSize()
-		}
-
 		start := time.Now()
 		tokens, err := p.tokenize(r.Context(), r.URL.Path, body, tokenizeTimeout)
 		ev.TokenizeMS = time.Since(start).Milliseconds()
 		if err == nil {
 			ar.PromptTokens = len(tokens)
-			if p.mirror != nil {
-				ar.Blocks = p.mirror.NewPromptKeys(tokens)
-			} else {
-				ar.Blocks = kvmirror.PromptKeys{BlockSize: block, Blocks: kvmirror.PromptBlockKeys(tokens, block)}
-			}
+			ar.Blocks = p.admission.PromptKeys(tokens)
 			ev.Tokenized = true
 		} else {
 			// Never charge less than the estimate: a 4xx may be a validation failure the
