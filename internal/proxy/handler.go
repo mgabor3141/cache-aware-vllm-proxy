@@ -151,6 +151,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ev.User, ev.Auth = who.User, who.Source
 
+	var body []byte
+	if r.Method == http.MethodPost {
+		var ok bool
+		if body, ok = p.readBody(w, r, ev); !ok {
+			return
+		}
+	}
+
 	// Bound every write: see writeStallTimeout. The deadline is cleared at the end, as
 	// the connection may serve further requests.
 	rc := http.NewResponseController(w)
@@ -161,11 +169,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "models":
 		p.forward(w, r, ev, "/v1/models", nil)
 	case "tokenize":
-		if raw, ok := p.readBody(w, r, ev); ok {
-			p.forward(w, r, ev, "/tokenize", raw)
-		}
+		p.forward(w, r, ev, "/tokenize", body)
 	default:
-		p.serveInference(w, r, ev, who)
+		p.serveInference(w, r, ev, who, body)
 	}
 }
 
@@ -184,8 +190,10 @@ func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, ev *Event) ([]b
 		return tooLarge()
 	}
 	var buf bytes.Buffer
+	// Sized for the declared length, up to a point: memory follows bytes that arrived,
+	// not bytes that were promised.
 	if r.ContentLength > 0 {
-		buf.Grow(int(r.ContentLength) + bytes.MinRead)
+		buf.Grow(int(min(r.ContentLength, 4<<20)) + bytes.MinRead)
 	}
 	_, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, limit))
 	ev.RequestBytes = int64(buf.Len())
@@ -203,11 +211,7 @@ func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, ev *Event) ([]b
 
 // serveInference handles an admitted route: parse and amend the body, then forward it
 // as a stream or as one response.
-func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event, who *auth.Result) {
-	raw, ok := p.readBody(w, r, ev)
-	if !ok {
-		return
-	}
+func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event, who *auth.Result, raw []byte) {
 	var body map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber() // numbers pass through exactly as sent
