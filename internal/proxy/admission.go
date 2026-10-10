@@ -65,7 +65,6 @@ type AdmissionQueue struct {
 
 	sessions     map[string]*cacheSession
 	running      map[*admissionWaiter]struct{}
-	engineUsed   int // tokens the engine's running requests occupy (SetEngineUsed)
 	displaced    int
 	evictedHolds int
 

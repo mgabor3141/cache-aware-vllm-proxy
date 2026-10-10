@@ -280,8 +280,8 @@ func TestCacheAdmissionFailedTurnLeavesNoHold(t *testing.T) {
 	tr := q.start("x", 0, 350000)
 	rel := mustAdmit(t, tr, "x")
 	rel() // no observation
-	if r := q.Residency(); r.HeldTokens != 0 || r.UsedTokens != 0 {
-		t.Fatalf("after a failed turn: %+v", r)
+	if m := q.metrics(); m.held != 0 || m.usedTokens != 0 {
+		t.Fatalf("after a failed turn: %+v", m)
 	}
 }
 
@@ -294,9 +294,8 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 	rs := mustAdmit(t, side, "side")
 	main.finish(rm, 242000, 4000)
 	side.finish(rs, 3000, 50)
-	r := q.Residency()
-	if len(r.Sessions) != 1 || r.Sessions[0].Footprint != 246000 {
-		t.Fatalf("residency %+v, want footprint 246000", r.Sessions)
+	if fp := q.sessions["s"].footprint; fp != 246000 {
+		t.Fatalf("footprint %d, want 246000", fp)
 	}
 }
 
@@ -410,28 +409,17 @@ func TestCacheAdmissionFifteenThreadsAllProgress(t *testing.T) {
 				}
 			}
 		}
-		r := q.Residency()
-		maxRun = max(maxRun, r.RunningTokens)
-		if testing.Verbose() && step%30 == 0 && step < 600 {
-			var hs []string
-			for _, s := range r.Sessions {
-				hs = append(hs, fmt.Sprintf("%s:r%d/h%dK", s.Session, s.Running, s.Held/1000))
-			}
-			var ws []string
-			for _, w := range r.Waiters {
-				ws = append(ws, fmt.Sprintf("%s:%ds", w.Session, w.WaitS))
-			}
-			t.Logf("t=%3dm run=%dK held=%dK %v waiting %v", step/6, r.RunningTokens/1000, r.HeldTokens/1000, hs, ws)
-		}
+		m := q.metrics()
+		maxRun = max(maxRun, q.runningTokens())
 		if finished == threads {
-			if maxRun > r.BudgetTokens {
-				t.Fatalf("running tokens %d exceeded budget %d", maxRun, r.BudgetTokens)
+			if maxRun > m.budgetTokens {
+				t.Fatalf("running tokens %d exceeded budget %d", maxRun, m.budgetTokens)
 			}
 			if maxWait >= time.Hour {
 				t.Fatalf("a turn waited %s, past an hour", maxWait)
 			}
 			t.Logf("15 threads x %d turns in %d simulated minutes; longest wait %s; displaced %d tokens",
-				turns, step/6, maxWait, r.Displaced)
+				turns, step/6, maxWait, m.displaced)
 			return
 		}
 	}
@@ -516,10 +504,8 @@ func TestCacheAdmissionRetryKeepsWait(t *testing.T) {
 	clk.add(30 * time.Second)
 	tr := q.start("c", 0, 200000)
 	time.Sleep(settle)
-	for _, w := range q.Residency().Waiters {
-		if w.Session == "c" && w.WaitS < 8*60 {
-			t.Fatalf("retry waited %ds, want the first attempt's 8m30s", w.WaitS)
-		}
+	if w := q.waiterWait("c"); w < 8*time.Minute {
+		t.Fatalf("retry waited %s, want the first attempt's 8m30s", w)
 	}
 	mustWait(t, tr, "c retry")
 }
@@ -591,10 +577,8 @@ func TestCacheAdmissionWaitingOwnerKeepsHold(t *testing.T) {
 	q.tick()
 	mustWait(t, ta2, "a")
 	mustWait(t, tc, "c, a's owner is waiting")
-	for _, s := range q.Residency().Sessions {
-		if s.Session == "a" && s.Held != 63*3200 {
-			t.Fatalf("a's hold %d", s.Held)
-		}
+	if h := q.sessionHeld("a"); h != 63*3200 {
+		t.Fatalf("a's hold %d", h)
 	}
 }
 
@@ -625,17 +609,6 @@ func TestCacheAdmissionTierOrder(t *testing.T) {
 	ta.finish(ra, 100000, 1000)
 	mustAdmit(t, small, "small ahead of an older cold waiter")
 	mustWait(t, cold, "cold behind small")
-}
-
-// The engine's usage counts prefixes it keeps between turns, so it is no floor on running.
-func TestCacheAdmissionEngineUsageIsNoFloor(t *testing.T) {
-	q, _ := newCacheQueue(t, nil)
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.engineUsed = 169 * 3200
-	if got := q.runningLocked(); got != 0 {
-		t.Fatalf("running %d blocks with nothing running", got/3200)
-	}
 }
 
 // Raw /v1/completions has no session key; admission must not dereference a nil session
@@ -686,14 +659,14 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 	tr := q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
 	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
 	q.tick()
-	if r := q.Residency(); r.HeldTokens == 0 {
+	if q.metrics().held == 0 {
 		t.Fatal("no hold after the turn")
 	}
 	m.Apply(2, nil)
 	m.Apply(0, nil) // the engine restarted: the mirror starts over
 	q.tick()
-	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 1 {
-		t.Fatalf("hold survived an engine restart: %+v", r)
+	if m := q.metrics(); m.held != 0 || m.evictedHolds != 1 {
+		t.Fatalf("hold survived an engine restart: %+v", m)
 	}
 
 	// A hold made while the mirror is resyncing is judged once it is healthy.
@@ -711,8 +684,8 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 	}
 	m.Apply(2, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: rm, GroupIdx: &g}})
 	q.tick()
-	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 2 {
-		t.Fatalf("evicted hold kept: %+v", r)
+	if m := q.metrics(); m.held != 0 || m.evictedHolds != 2 {
+		t.Fatalf("evicted hold kept: %+v", m)
 	}
 }
 
@@ -751,13 +724,13 @@ func TestCacheAdmissionAbortedTurnKeepsHold(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	t1 := q.start("s", 0, 200000)
 	t1.finish(mustAdmit(t, t1, "turn 1"), 200000, 3000)
-	before := q.Residency().HeldTokens
+	before := q.metrics().held
 	if before == 0 {
 		t.Fatal("turn 1 left no hold")
 	}
 	t2 := q.start("s", 0, 203000)
 	mustAdmit(t, t2, "turn 2")() // released without usage
-	if got := q.Residency().HeldTokens; got != before {
+	if got := q.metrics().held; got != before {
 		t.Fatalf("held %d after an aborted turn, want the previous %d", got, before)
 	}
 
@@ -834,4 +807,45 @@ func TestCacheAdmissionSessionCapSparesHolds(t *testing.T) {
 	if _, ok := q.sessions["waiter"]; !ok {
 		t.Fatal("forgot a session with a queued request")
 	}
+}
+
+// Test views of the queue's accounting, beside the aggregate one /metrics reads.
+
+func (q *AdmissionQueue) runningTokens() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.runningLocked()
+}
+
+func (q *AdmissionQueue) sessionHeld(key string) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if s := q.sessions[key]; s != nil && s.holding(q.now()) {
+		return s.held
+	}
+	return 0
+}
+
+// waiterCharge is what a queued request of the session would be charged now; -1 if none.
+func (q *AdmissionQueue) waiterCharge(session string) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, w := range q.waiters {
+		if w.session == session {
+			return q.chargeLocked(w)
+		}
+	}
+	return -1
+}
+
+// waiterWait is how long a queued request of the session counts as having waited.
+func (q *AdmissionQueue) waiterWait(session string) time.Duration {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, w := range q.waiters {
+		if w.session == session {
+			return q.now().Sub(w.enqueued)
+		}
+	}
+	return -1
 }

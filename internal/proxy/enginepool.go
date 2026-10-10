@@ -90,10 +90,10 @@ func metricValue(line, name string) (labels string, v float64, ok bool) {
 	return labels, v, err == nil
 }
 
-// runEngineUsage feeds q the engine's occupied blocks and preemption counters every
-// second. Missing reads leave the last value; the model's own charges stay the floor
-// either way.
-func runEngineUsage(ctx context.Context, upstream string, q *AdmissionQueue) {
+// runEnginePreemptions feeds q the engine's preemption counters every second, the guard's
+// one signal. A failed read is skipped; a read without the counter is reported to the
+// guard, which logs that it is blind.
+func runEnginePreemptions(ctx context.Context, upstream string, q *AdmissionQueue) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -102,42 +102,35 @@ func runEngineUsage(ctx context.Context, upstream string, q *AdmissionQueue) {
 			return
 		case <-t.C:
 		}
-		if u, pre, ok := fetchEngineUsage(ctx, upstream); ok {
+		if pre, ok := fetchPreemptions(ctx, upstream); ok {
 			q.EngineSignals(pre)
-			q.mu.Lock()
-			pool := q.pool
-			q.mu.Unlock()
-			q.SetEngineUsed(int(u * float64(pool)))
 		}
 	}
 }
 
-// fetchEngineUsage reads the engine's KV usage (the highest, should there be several
-// series) and its preemption counter per series. ok is false when the metrics could not
-// be read or carry no usage.
-func fetchEngineUsage(ctx context.Context, upstream string) (usage float64, preemptions map[string]float64, ok bool) {
+// fetchPreemptions reads the engine's preemption counter per series. ok is false when
+// the metrics could not be read.
+func fetchPreemptions(ctx context.Context, upstream string) (preemptions map[string]float64, ok bool) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstream+"/metrics", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, nil, false
+		return nil, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, nil, false
+		return nil, false
 	}
 	preemptions = map[string]float64{}
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
-		if _, v, found := metricValue(sc.Text(), "vllm:kv_cache_usage_perc"); found {
-			usage, ok = max(usage, v), true
-		} else if labels, v, found := metricValue(sc.Text(), "vllm:num_preemptions_total"); found {
+		if labels, v, found := metricValue(sc.Text(), "vllm:num_preemptions_total"); found {
 			preemptions[labels] = v
 		}
 	}
-	return usage, preemptions, ok
+	return preemptions, sc.Err() == nil
 }
 
 // runEnginePool keeps q's pool current: every 10 s until known, then every minute. A

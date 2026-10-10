@@ -43,6 +43,7 @@ type admissionMetrics struct {
 	queued, active                 int
 	usedTokens, budgetTokens, held int
 	marginBlocks, marginRaises     int
+	displaced, evictedHolds        int
 	mirrorConnected                bool
 }
 
@@ -53,6 +54,7 @@ func (q *AdmissionQueue) metrics() admissionMetrics {
 		queued: len(q.waiters), active: q.active,
 		usedTokens: q.cacheUsedLocked(now), budgetTokens: q.budget(), held: q.heldLocked(now),
 		marginBlocks: q.margin, marginRaises: q.marginRaises,
+		displaced: q.displaced, evictedHolds: q.evictedHolds,
 	}
 	mirror := q.mirror
 	q.mu.Unlock()
@@ -77,6 +79,8 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	gauge("cavp_cache_held_tokens", "Tokens held for idle conversations.", a.held)
 	gauge("cavp_guard_margin_blocks", "Overcommit guard margin added to each running request.", a.marginBlocks)
 	counter("cavp_guard_raises_total", "Times the overcommit guard raised its margin.", uint64(a.marginRaises))
+	counter("cavp_cache_displaced_tokens_total", "Held tokens released to make room for other work (or forgotten with a full session table).", uint64(a.displaced))
+	counter("cavp_cache_holds_evicted_total", "Holds released because the KV mirror no longer saw them cached.", uint64(a.evictedHolds))
 	gauge("cavp_kv_mirror_connected", "1 while the KV event mirror is subscribed and caught up.", b2i(a.mirrorConnected))
 
 	p.metrics.mu.Lock()

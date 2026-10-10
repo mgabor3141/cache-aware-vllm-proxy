@@ -114,9 +114,11 @@ func TestGuardIgnoresHoldEviction(t *testing.T) {
 	}
 }
 
-// The guard's late signal and the usage figure come from /metrics; a format change must not
-// silently disable them.
-func TestFetchEngineUsageParses(t *testing.T) {
+// The guard's signal comes from /metrics; a format change must not silently disable it, and
+// nothing else in the exposition gates it: without the KV usage gauge the counters are still
+// read (review 3, rev-3 #1). A body without the counter is an empty read, which the guard
+// logs as blind.
+func TestFetchPreemptionsParses(t *testing.T) {
 	for name, c := range map[string]struct {
 		body string
 		pre  map[string]float64
@@ -126,14 +128,16 @@ func TestFetchEngineUsageParses(t *testing.T) {
 			"vllm:num_preemptions_total{engine=\"1\",model_name=\"m\"} 1.0\n" +
 			"vllm:num_preemptions_total_created{engine=\"0\"} 1.7e9\n",
 			map[string]float64{`{engine="0",model_name="m"}`: 2, `{engine="1",model_name="m"}`: 1}},
-		"unlabelled": {"vllm:kv_cache_usage_perc 0.25\nvllm:num_preemptions_total 3\n", map[string]float64{"": 3}},
+		"unlabelled":     {"vllm:kv_cache_usage_perc 0.25\nvllm:num_preemptions_total 3\n", map[string]float64{"": 3}},
+		"no usage gauge": {"vllm:num_preemptions_total{engine=\"0\"} 7\n", map[string]float64{`{engine="0"}`: 7}},
+		"no counter":     {"vllm:kv_cache_usage_perc 0.25\n", map[string]float64{}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(c.body)) }))
 			defer srv.Close()
-			u, pre, ok := fetchEngineUsage(context.Background(), srv.URL)
-			if !ok || u != 0.25 || len(pre) != len(c.pre) {
-				t.Fatalf("usage %v preemptions %v ok %v", u, pre, ok)
+			pre, ok := fetchPreemptions(context.Background(), srv.URL)
+			if !ok || len(pre) != len(c.pre) {
+				t.Fatalf("preemptions %v ok %v", pre, ok)
 			}
 			for k, v := range c.pre {
 				if pre[k] != v {
@@ -161,7 +165,7 @@ func TestGuardMarginReachesQueuedWaiters(t *testing.T) {
 
 	q.EngineSignals(preempted(3))
 	q.EngineSignals(preempted(4)) // the guard raises while early waits
-	if got := waiterCharge(q.Residency(), "early"); got != (40+guardStepBlocks)*bs {
+	if got := q.waiterCharge("early"); got != (40+guardStepBlocks)*bs {
 		t.Fatalf("queued charge %d, want the raised %d", got, (40+guardStepBlocks)*bs)
 	}
 	aRel() // frees exactly the pre-raise charge: early no longer fits beside b
@@ -174,17 +178,8 @@ func TestGuardMarginReachesQueuedWaiters(t *testing.T) {
 	q.mu.Unlock()
 	q.tick()
 	rel := mustAdmit(t, early, "early once the margin decayed")
-	if r := q.Residency(); r.RunningTokens > r.BudgetTokens {
-		t.Fatalf("over-committed: running %d of %d", r.RunningTokens, r.BudgetTokens)
+	if r, b := q.runningTokens(), q.metrics().budgetTokens; r > b {
+		t.Fatalf("over-committed: running %d of %d", r, b)
 	}
 	rel()
-}
-
-func waiterCharge(r ResidencySnapshot, session string) int {
-	for _, w := range r.Waiters {
-		if w.Session == session {
-			return w.Charge
-		}
-	}
-	return -1
 }

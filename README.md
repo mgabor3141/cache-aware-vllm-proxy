@@ -153,7 +153,8 @@ to zero. Every change is logged (`overcommit guard raised the margin`, with its 
 is an engine whose metrics have no preemption counter.
 
 Not signals: the engine evicting a context the proxy was holding (it drops cached prefixes for
-its own reasons too; the hold is simply released), and the engine's waiting queue: vLLM counts
+its own reasons too; the hold is simply released and counted in
+`cavp_cache_holds_evicted_total`), and the engine's waiting queue: vLLM counts
 every request it has not scheduled yet, including one admitted a moment ago and one waiting
 behind another's prefill for the step's token budget, so it is non-zero in normal operation.
 

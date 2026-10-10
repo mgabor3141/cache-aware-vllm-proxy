@@ -53,7 +53,7 @@ func Main() {
 	ep := cfg.Admission.Cache.KVEventsEndpoint
 	go prx.admission.mirror.Run(rootCtx, ep, kvmirror.ReplayEndpoint(ep))
 	go runEnginePool(rootCtx, cfg.Upstream, prx.admission)
-	go runEngineUsage(rootCtx, cfg.Upstream, prx.admission)
+	go runEnginePreemptions(rootCtx, cfg.Upstream, prx.admission)
 	go prx.ready.Run(rootCtx)
 
 	srv := &http.Server{

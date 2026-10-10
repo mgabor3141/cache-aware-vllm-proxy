@@ -477,6 +477,7 @@ func TestMetrics(t *testing.T) {
 		"# TYPE cavp_queue_length gauge\ncavp_queue_length 0\n",
 		"cavp_active_requests 0\n", "cavp_cache_used_tokens ", "cavp_cache_budget_tokens ",
 		"cavp_cache_held_tokens ", "cavp_guard_margin_blocks 0\n", "# TYPE cavp_guard_raises_total counter\n",
+		"# TYPE cavp_cache_displaced_tokens_total counter\ncavp_cache_displaced_tokens_total 0\n", "cavp_cache_holds_evicted_total 0\n",
 		"cavp_kv_mirror_connected 0\n", "cavp_engine_ready 1\n",
 		`cavp_requests_total{route="chat",status="200"} 1`, `cavp_requests_total{route="none",status="404"} 1`,
 		"cavp_prompt_tokens_total 0\n", "cavp_cached_prompt_tokens_total 0\n",

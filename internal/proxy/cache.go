@@ -37,7 +37,6 @@ package proxy
 import (
 	"fmt"
 	"log"
-	"math"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -352,36 +351,15 @@ func (q *AdmissionQueue) chargeLocked(w *admissionWaiter) int {
 }
 
 // runningLocked is the cache running requests occupy: the sum of their live charges.
-// The engine's kv_cache_usage_perc is not a floor: since v2.5.1 it also counts finished
-// turns' prefixes the engine keeps referenced until it needs the room (grace holds, which
-// yield before any preemption), so it reads high with nothing running. It stays in
-// the residency snapshot for comparison.
+// The engine's kv_cache_usage_perc is no measure of this: it also counts finished turns'
+// prefixes an engine may keep referenced until it needs the room, so it reads high with
+// nothing running. The proxy does not read it.
 func (q *AdmissionQueue) runningLocked() int {
 	model := 0
 	for w := range q.running {
 		model += q.liveCharge(w)
 	}
 	return model
-}
-
-// modelActualLocked is the model's estimate of what running requests occupy now
-// (output so far, no reserve), to compare with the engine's count.
-func (q *AdmissionQueue) modelActualLocked() int {
-	n := 0
-	for w := range q.running {
-		g := w.generated()
-		n += q.roundUp(w.prompt+g) + q.overheadLocked(g > 0)*q.block()
-	}
-	return n
-}
-
-// SetEngineUsed records the engine's occupied blocks (vllm:kv_cache_usage_perc of the
-// pool): blocks referenced by running requests. Cached blocks nothing uses count as free.
-func (q *AdmissionQueue) SetEngineUsed(tokens int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.engineUsed = tokens
-	q.grantLocked()
 }
 
 func (q *AdmissionQueue) cacheUsedLocked(now time.Time) int {
@@ -648,81 +626,4 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 type CacheObservation struct {
 	PromptTokens     int
 	CompletionTokens int
-}
-
-type ResidencySession struct {
-	Session   string `json:"session"`
-	Priority  int    `json:"priority"`
-	Footprint int    `json:"footprint_tokens"`
-	Held      int    `json:"held_tokens"`
-	Running   int    `json:"running"`
-	IdleS     int    `json:"idle_s,omitempty"`
-	FirmS     int    `json:"firm_s,omitempty"` // seconds left before the hold is expendable
-}
-
-type ResidencyWaiter struct {
-	Session  string  `json:"session,omitempty"`
-	Priority int     `json:"priority"`
-	WaitS    int     `json:"wait_s"`
-	Prompt   int     `json:"prompt_tokens"`
-	Cached   int     `json:"cached_tokens"`
-	Charge   int     `json:"charge_tokens"`
-	PrefillS float64 `json:"prefill_cost_s"`
-}
-
-type ResidencySnapshot struct {
-	BudgetTokens  int `json:"budget_tokens"`
-	UsedTokens    int `json:"used_tokens"`
-	RunningTokens int `json:"running_tokens"`
-	HeldTokens    int `json:"held_tokens"`
-	// The engine's count of running requests' blocks against the model's estimate of the
-	// same (output so far, no reserve): their gap is the accounting error.
-	EngineUsedTokens  int                `json:"engine_used_tokens"`
-	ModelActualTokens int                `json:"model_actual_tokens"`
-	Active            int                `json:"active"`
-	Queued            int                `json:"queued"`
-	Displaced         int                `json:"displaced_tokens_total"`
-	EvictedHolds      int                `json:"holds_evicted_by_engine_total"`
-	MarginBlocks      int                `json:"guard_margin_blocks"`
-	MarginRaises      int                `json:"guard_raises_total"`
-	Mirror            *kvmirror.Status   `json:"mirror,omitempty"`
-	Sessions          []ResidencySession `json:"resident"`
-	Waiters           []ResidencyWaiter  `json:"waiting"`
-}
-
-func (q *AdmissionQueue) Residency() ResidencySnapshot {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	now := q.now()
-	out := ResidencySnapshot{
-		BudgetTokens: q.budget(), UsedTokens: q.cacheUsedLocked(now),
-		RunningTokens: q.runningLocked(), HeldTokens: q.heldLocked(now),
-		EngineUsedTokens: q.engineUsed, ModelActualTokens: q.modelActualLocked(),
-		Active: q.active, Queued: len(q.waiters), Displaced: q.displaced, EvictedHolds: q.evictedHolds,
-		MarginBlocks: q.margin, MarginRaises: q.marginRaises,
-	}
-	st := q.mirror.Status()
-	out.Mirror = &st
-	for k, s := range q.sessions {
-		if s.running == 0 && !s.holding(now) {
-			continue
-		}
-		rs := ResidencySession{Session: k, Priority: s.priority, Footprint: s.footprint, Running: s.running}
-		if s.holding(now) {
-			rs.Held = s.held
-			rs.IdleS = int(now.Sub(s.lastDone).Seconds())
-			rs.FirmS = max(0, int((q.holdFor(s) - now.Sub(s.lastDone)).Seconds()))
-		}
-		out.Sessions = append(out.Sessions, rs)
-	}
-	sort.Slice(out.Sessions, func(i, j int) bool { return out.Sessions[i].Footprint > out.Sessions[j].Footprint })
-	for _, w := range q.waiters {
-		cached := q.cachedLocked(w)
-		out.Waiters = append(out.Waiters, ResidencyWaiter{
-			Session: w.session, Priority: w.priority, WaitS: int(now.Sub(w.enqueued).Seconds()),
-			Prompt: w.prompt, Cached: cached, Charge: q.chargeLocked(w),
-			PrefillS: math.Round(q.ownCost(w, cached)*10) / 10,
-		})
-	}
-	return out
 }
