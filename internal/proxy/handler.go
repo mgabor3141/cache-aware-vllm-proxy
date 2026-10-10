@@ -83,8 +83,12 @@ func NewProxy(cfg *Config, resolver *ModelResolver, logger *EventLogger) (*Proxy
 		return nil, err
 	}
 	health := newUpstreamHealth(cfg.Upstream, cfg.Retry, nil)
+	authn, err := auth.New(cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
 	p := &Proxy{
-		cfg: cfg, resolver: resolver, upstream: u, logger: logger, auth: auth.New(cfg.Auth),
+		cfg: cfg, resolver: resolver, upstream: u, logger: logger, auth: authn,
 		admission:      NewAdmissionQueue(cfg.Admission),
 		tokenizeClient: &http.Client{},
 		tokenizeSem:    make(chan struct{}, 4),
@@ -163,30 +167,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Auth required for everything, including /v1/models (see below).
-	who, authErr := p.checkAuth(r)
+	who, authErr := p.auth.Authenticate(r)
+	if authErr != nil {
+		log.Printf("level=warn msg=\"refused a malformed credential\" err=%q", authErr.Error())
+	}
 	// Credentials stop here: neither the gateway secret nor the identity headers reach
 	// the engine.
 	for _, h := range []string{auth.HeaderSecret, auth.HeaderUser, auth.HeaderPriority} {
 		r.Header.Del(h)
 	}
-	if authErr != nil {
-		// Only a rate limit from the auth backend arrives here; it is
-		// returned verbatim.
-		var kerr *auth.RateLimitedError
-		if errors.As(authErr, &kerr) && kerr.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(kerr.RetryAfter))
-		}
-		status := http.StatusTooManyRequests
-		if kerr != nil {
-			status = kerr.Status
-		}
-		writeError(w, status, authErr.Error())
-		ev.Status = status
-		ev.LatencyMS = time.Since(start).Milliseconds()
-		p.logger.Log(ev)
-		return
-	}
-	if who == nil {
+	if authErr != nil || who == nil {
 		writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
 		ev.Status = http.StatusUnauthorized
 		ev.LatencyMS = time.Since(start).Milliseconds()
@@ -195,7 +185,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ev.User = who.User
 	ev.Auth = who.Source
-	ev.Sub = who.Sub
 
 	// /v1/models is answered locally by serveModels (synthetic alias list) and,
 	// like every path here, requires an authenticated caller. Keyless liveness is
@@ -324,27 +313,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.logger.Log(ev)
 }
 
-// checkAuth resolves the caller. Returns:
-//
-//	(result, nil)                 accepted
-//	(nil, *auth.RateLimitedError)      rate limited; returned to the client verbatim
-//	(nil, nil)                    unknown or missing token: 401
-//
-// A backend failure (unreachable, unexpected status) is logged and also
-// answered 401, so an auth outage fails closed but stays visible.
-func (p *Proxy) checkAuth(r *http.Request) (*auth.Result, error) {
-	result, err := p.auth.Authenticate(r)
-	if err != nil {
-		var kerr *auth.RateLimitedError
-		if errors.As(err, &kerr) {
-			return nil, err
-		}
-		log.Printf("level=warn msg=\"auth backend failed\" err=%q", err.Error())
-		return nil, nil
-	}
-	return result, nil
-}
-
 // shouldRewriteBody decides which routes carry a JSON body with a
 // `model` field that we want to inspect. Keep the list narrow; future
 // vLLM routes that don't take `model` (e.g. /v1/tokenize *does* take
@@ -461,9 +429,9 @@ func (p *Proxy) rewriteBody(w http.ResponseWriter, r *http.Request, who *auth.Re
 	// does not affect admission or vLLM cache behavior.
 	if r.URL.Path == "/v1/chat/completions" {
 		if id := r.Header.Get("X-Session-Key"); id != "" {
-			ev.Session = sessionKeyFromID(ev.Target, who.Source+"/"+who.User+"/"+who.Sub, id)
+			ev.Session = sessionKeyFromID(ev.Target, who.Source+"/"+who.User, id)
 		} else {
-			ev.Session = sessionKey(ev.Target, who.Source+"/"+who.User+"/"+who.Sub, body)
+			ev.Session = sessionKey(ev.Target, who.Source+"/"+who.User, body)
 		}
 	}
 
@@ -860,8 +828,8 @@ func logBodyDump(ev *Event, label string, body []byte) {
 		dump = dump[:maxBodyDumpBytes]
 		truncated = fmt.Sprintf(" (truncated from %d bytes)", len(body))
 	}
-	log.Printf("body_dump path=%s alias=%q target=%q user=%q sub=%q %s%s: %s",
-		ev.Path, ev.Alias, ev.Target, ev.User, ev.Sub, label, truncated, dump)
+	log.Printf("body_dump path=%s alias=%q target=%q user=%q %s%s: %s",
+		ev.Path, ev.Alias, ev.Target, ev.User, label, truncated, dump)
 }
 
 // itoa avoids strconv for a value we know fits a small int.

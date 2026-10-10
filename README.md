@@ -119,7 +119,7 @@ climbing means capacity is being lost.
 cmd/cavp/           the binary
 internal/proxy/     flags and wiring (run.go), HTTP handling, admission (cache.go,
                     admission.go, guard.go), retry, streaming, usage accounting, calibration
-internal/auth/      none / static / external authentication
+internal/auth/      none / static / trusted_header authentication
 kvmirror/           a mirror of a vLLM engine's prefix cache from its KV events; usable
                     on its own
 docs/design.md      why it works the way it does, with the measurements

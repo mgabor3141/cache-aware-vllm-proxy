@@ -31,8 +31,7 @@ type Event struct {
 	Method       string `json:"method"`
 	Path         string `json:"path"`
 	User         string `json:"user,omitempty"`     // empty on auth failure
-	Auth         string `json:"auth,omitempty"`     // "key" or "oidc"; empty on auth failure
-	Sub          string `json:"sub,omitempty"`      // OIDC sub claim (raw UUID); empty for static-key auth
+	Auth         string `json:"auth,omitempty"`     // auth mode that accepted the caller
 	Alias        string `json:"alias,omitempty"`    // model name the caller requested
 	Target       string `json:"target,omitempty"`   // model name forwarded to vLLM
 	Priority     int    `json:"priority,omitempty"` // resolved priority (omitted when 0)

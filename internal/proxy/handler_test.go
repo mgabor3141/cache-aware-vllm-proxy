@@ -427,20 +427,8 @@ func TestSessionKeyHeaderIsNamespacedByIdentity(t *testing.T) {
 // world-readable. This test keeps it that way.
 func TestModelsRequiresBearer(t *testing.T) {
 	const goodKey = "good-key"
-	authd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/validate" || r.Header.Get("Authorization") != "Bearer "+goodKey {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("X-Authenticated-User", "tester")
-		w.Header().Set("X-User-Sub", "sub-tester")
-		w.Header().Set("X-Auth-Source", "dynamic")
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer authd.Close()
-
 	p := makeModelsProxy(t, "my-model")
-	p.auth = auth.New(auth.Config{Mode: "external", URL: authd.URL})
+	p.auth, _ = auth.New(auth.Config{Mode: "static", Keys: []auth.StaticKey{{Key: goodKey, User: "tester"}}})
 	p.logger = NewEventLogger(io.Discard)
 
 	// main.go mounts the handler at "/", so paths arrive with /v1 intact.

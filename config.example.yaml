@@ -12,7 +12,6 @@ upstream: "http://vllm:8000"
 
 # Who may call the proxy (internal/auth). Pick one mode:
 #   static          keys listed here, values from the environment
-#   external        POST <url>/validate decides (contract in auth.go)
 #   trusted_header  a gateway in front authenticates callers and sends X-Cavp-User,
 #                   X-Cavp-Priority and X-Cavp-Secret (= secret). Make cavp reachable
 #                   from the gateway alone, or anyone can claim any identity.
@@ -26,8 +25,6 @@ auth:
     - key: ${CAVP_API_KEY}
       user: default
       priority: 0
-  # mode: external
-  # url: http://auth-service:4001
   # mode: trusted_header
   # secret: ${CAVP_GATEWAY_SECRET}
 

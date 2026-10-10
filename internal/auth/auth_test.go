@@ -7,14 +7,23 @@ import (
 	"testing"
 )
 
+func mustNew(t *testing.T, c Config) Authenticator {
+	t.Helper()
+	a, err := New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
 func TestAuthConfigValidates(t *testing.T) {
 	bad := []Config{
 		{},
 		{Mode: "magic"},
+		{Mode: "external"},
 		{Mode: "static"},
 		{Mode: "static", Keys: []StaticKey{{Key: "", User: "a"}}},
 		{Mode: "static", Keys: []StaticKey{{Key: "k", User: "a"}, {Key: "k", User: "b"}}},
-		{Mode: "external"},
 	}
 	for i, c := range bad {
 		if c.Validate() == nil {
@@ -24,7 +33,7 @@ func TestAuthConfigValidates(t *testing.T) {
 	good := []Config{
 		{Mode: "none"},
 		{Mode: "static", Keys: []StaticKey{{Key: "k", User: "a"}}},
-		{Mode: "external", URL: "http://x"},
+		{Mode: "trusted_header", Secret: "0123456789abcdef"},
 	}
 	for i, c := range good {
 		if err := c.Validate(); err != nil {
@@ -33,8 +42,17 @@ func TestAuthConfigValidates(t *testing.T) {
 	}
 }
 
+// An unknown mode must fail, not fall back to accepting everyone (cv-56 #12).
+func TestNewRefusesUnknownMode(t *testing.T) {
+	for _, mode := range []string{"", "oidc", "external"} {
+		if a, err := New(Config{Mode: mode}); err == nil || a != nil {
+			t.Errorf("mode %q: got %v, %v; want an error", mode, a, err)
+		}
+	}
+}
+
 func TestStaticAuth(t *testing.T) {
-	a := New(Config{Mode: "static", Keys: []StaticKey{
+	a := mustNew(t, Config{Mode: "static", Keys: []StaticKey{
 		{Key: "alice-key", User: "alice"}, {Key: "batch-key", User: "batch", Priority: 10}}})
 	ctx := context.Background()
 	if r, _ := a.Authenticate(bearerReq(ctx, "batch-key")); r == nil || r.User != "batch" || r.Priority != 10 || r.Source != "static" {
@@ -47,58 +65,29 @@ func TestStaticAuth(t *testing.T) {
 	}
 }
 
-func TestNoAuthAcceptsMissingToken(t *testing.T) {
-	r, err := New(Config{Mode: "none"}).Authenticate(bearerReq(context.Background(), ""))
-	if err != nil || r == nil || r.User != "anonymous" {
-		t.Fatalf("%+v %v", r, err)
+// The bearer scheme is case-insensitive (RFC 7235; cv-56 #12).
+func TestBearerSchemeCaseInsensitive(t *testing.T) {
+	a := mustNew(t, Config{Mode: "static", Keys: []StaticKey{{Key: "k1", User: "u"}}})
+	for _, h := range []string{"Bearer k1", "bearer k1", "BEARER k1"} {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		r.Header.Set("Authorization", h)
+		if res, _ := a.Authenticate(r); res == nil || res.User != "u" {
+			t.Errorf("%q: %+v", h, res)
+		}
+	}
+	for _, h := range []string{"Bearer", "Bearer ", "Basic k1", "Bearerk1"} {
+		r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		r.Header.Set("Authorization", h)
+		if res, _ := a.Authenticate(r); res != nil {
+			t.Errorf("%q accepted as %+v", h, res)
+		}
 	}
 }
 
-func TestExternalAuthContract(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Header.Get("Authorization") {
-		case "Bearer ok":
-			w.Header().Set("X-Authenticated-User", "u")
-			w.Header().Set("X-User-Priority", "5")
-			w.WriteHeader(http.StatusNoContent)
-		case "Bearer slow":
-			w.Header().Set("Retry-After", "7")
-			w.WriteHeader(http.StatusTooManyRequests)
-		case "Bearer anonymous":
-			w.WriteHeader(http.StatusNoContent)
-		case "Bearer badprio":
-			w.Header().Set("X-Authenticated-User", "u")
-			w.Header().Set("X-User-Priority", "low")
-			w.WriteHeader(http.StatusNoContent)
-		case "Bearer broken":
-			w.WriteHeader(http.StatusInternalServerError)
-		default:
-			w.WriteHeader(http.StatusUnauthorized)
-		}
-	}))
-	defer srv.Close()
-	a := New(Config{Mode: "external", URL: srv.URL + "/"})
-	ctx := context.Background()
-	if r, err := a.Authenticate(bearerReq(ctx, "ok")); err != nil || r == nil || r.User != "u" || r.Priority != 5 || r.Source != "external" {
-		t.Fatalf("ok: %+v %v", r, err)
-	}
-	if r, err := a.Authenticate(bearerReq(ctx, "bad")); r != nil || err != nil {
-		t.Fatalf("bad: %+v %v", r, err)
-	}
-	_, err := a.Authenticate(bearerReq(ctx, "slow"))
-	if rl, ok := err.(*RateLimitedError); !ok || rl.RetryAfter != 7 {
-		t.Fatalf("slow: %v", err)
-	}
-	for _, tok := range []string{"anonymous", "badprio"} {
-		if r, err := a.Authenticate(bearerReq(ctx, tok)); r != nil || err == nil {
-			t.Errorf("%s: accepted as %+v (%v)", tok, r, err)
-		}
-	}
-	if r, err := a.Authenticate(bearerReq(ctx, "broken")); r != nil || err == nil {
-		t.Fatalf("broken: %+v %v", r, err)
-	}
-	if r, err := a.Authenticate(bearerReq(ctx, "")); r != nil || err != nil {
-		t.Fatalf("missing token reached the backend: %+v %v", r, err)
+func TestNoAuthAcceptsMissingToken(t *testing.T) {
+	r, err := mustNew(t, Config{Mode: "none"}).Authenticate(bearerReq(context.Background(), ""))
+	if err != nil || r == nil || r.User != "anonymous" {
+		t.Fatalf("%+v %v", r, err)
 	}
 }
 
@@ -115,7 +104,7 @@ func TestTrustedHeader(t *testing.T) {
 	if err := (Config{Mode: "trusted_header", Secret: "short"}).Validate(); err == nil {
 		t.Fatal("short secret accepted")
 	}
-	a := New(Config{Mode: "trusted_header", Secret: secret})
+	a := mustNew(t, Config{Mode: "trusted_header", Secret: secret})
 	req := func(h map[string]string) *http.Request {
 		r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 		for k, v := range h {
