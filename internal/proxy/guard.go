@@ -68,8 +68,9 @@ func (q *AdmissionQueue) guardDecayLocked(now time.Time) {
 // EngineSignals reports the engine's preemption counters, one per metric series (its
 // label set; a data-parallel engine has one per engine). A series counts when it rises
 // from its last value; a new series, or one that went down (the engine restarted), only
-// sets its baseline. A read without any series means the guard is blind: that is logged
-// once until a series appears, which then starts from a new baseline.
+// sets its baseline; a series missing from one read keeps it. A read without any series
+// means the guard is blind: that is logged once until a series appears, which then
+// starts from a new baseline.
 func (q *AdmissionQueue) EngineSignals(preemptions map[string]float64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -79,8 +80,8 @@ func (q *AdmissionQueue) EngineSignals(preemptions map[string]float64) {
 			rose = true
 		}
 	}
-	q.lastPreempt = preemptions
 	if len(preemptions) == 0 {
+		q.lastPreempt = nil
 		if !q.preemptBlind {
 			q.preemptBlind = true
 			log.Printf("level=warn msg=\"engine metrics have no vllm:num_preemptions_total: the overcommit guard cannot see preemptions\"")
@@ -88,6 +89,12 @@ func (q *AdmissionQueue) EngineSignals(preemptions map[string]float64) {
 		return
 	}
 	q.preemptBlind = false
+	if q.lastPreempt == nil {
+		q.lastPreempt = map[string]float64{}
+	}
+	for series, v := range preemptions { // a series missing from one read keeps its baseline
+		q.lastPreempt[series] = v
+	}
 	if rose {
 		q.guardRaiseLocked("engine preempted", q.now())
 	}

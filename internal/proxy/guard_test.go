@@ -183,3 +183,16 @@ func TestGuardMarginReachesQueuedWaiters(t *testing.T) {
 	}
 	rel()
 }
+
+// A series missing from one read (a partial exposition) keeps its baseline, so its rise
+// when it is back is a preemption, not a new series (review 3, rev-2 #4).
+func TestGuardSeriesMissingFromOneRead(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	two := func(a, b float64) map[string]float64 { return map[string]float64{`{engine="0"}`: a, `{engine="1"}`: b} }
+	q.EngineSignals(two(5, 3))
+	q.EngineSignals(preempted(5)) // engine 1's series is missing from this read
+	q.EngineSignals(two(5, 4))
+	if q.margin != guardStepBlocks {
+		t.Fatalf("margin %d: the rise of a series back from one missing read was not counted", q.margin)
+	}
+}
