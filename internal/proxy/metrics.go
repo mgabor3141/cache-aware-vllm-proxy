@@ -34,8 +34,12 @@ func (m *requestMetrics) observe(route string, ev *Event) {
 		m.requests = map[routeStatus]uint64{}
 	}
 	m.requests[routeStatus{route, ev.Status}]++
-	m.promptTokens += uint64(max(ev.PromptTokens, 0))
-	m.cachedTokens += uint64(max(ev.CachedPromptTokens, 0))
+	// The hit ratio counts only requests whose engine reported cache details (vLLM
+	// --enable-prompt-tokens-details): without them a hit is unknown, not a miss.
+	if ev.UsageDetails {
+		m.promptTokens += uint64(max(ev.PromptTokens, 0))
+		m.cachedTokens += uint64(max(ev.CachedPromptTokens, 0))
+	}
 }
 
 // admissionMetrics is an aggregate view of the admission queue.
@@ -100,7 +104,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	}
 	prompt, cached := p.metrics.promptTokens, p.metrics.cachedTokens
 	p.metrics.mu.Unlock()
-	counter("cavp_prompt_tokens_total", "Prompt tokens of finished requests, as the engine reported them.", prompt)
+	counter("cavp_prompt_tokens_total", "Prompt tokens of finished requests whose engine reported cache details.", prompt)
 	counter("cavp_cached_prompt_tokens_total", "Of those, tokens served from the engine's prefix cache.", cached)
 }
 

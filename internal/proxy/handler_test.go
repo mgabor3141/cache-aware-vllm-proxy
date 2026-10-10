@@ -115,7 +115,7 @@ func TestTokenizeForwardedUnadmitted(t *testing.T) {
 		seen.Store(r.URL.Path + " " + string(b))
 		w.Write([]byte(`{"tokens":[9]}`))
 	}), func(c *Config) { c.Admission.MaxActive = 1 })
-	rel, _, _, _, _ := h.p.admission.Acquire(context.Background(), AdmissionRequest{})
+	rel, _, _ := h.p.admission.Acquire(context.Background(), AdmissionRequest{})
 	defer rel()
 	for _, path := range []string{"/v1/tokenize", "/tokenize"} {
 		code, body := h.do("POST", path, `{"model":"m","prompt":"x"}`, nil)
@@ -349,7 +349,7 @@ func TestRequestsWaitForReadiness(t *testing.T) {
 // A request whose client leaves while it is queued gets a log line (cv-54 #13, cv-59 #3).
 func TestAbandonedWhileQueuedIsLogged(t *testing.T) {
 	h := newHarness(t, nil, func(c *Config) { c.Admission.MaxActive = 1 })
-	rel, _, _, _, _ := h.p.admission.Acquire(context.Background(), AdmissionRequest{})
+	rel, _, _ := h.p.admission.Acquire(context.Background(), AdmissionRequest{})
 	defer rel()
 	for i, body := range []string{chatBody, `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`} {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -532,5 +532,37 @@ func TestRequestsWaitForThePool(t *testing.T) {
 	h.p.admission.SetPool(1000, 16)
 	if code := <-done; code != 200 {
 		t.Fatalf("status %d", code)
+	}
+}
+
+// A body must be exactly one JSON object: trailing data is refused, not dropped
+// (rev-1 #3).
+func TestTrailingDataIs400(t *testing.T) {
+	var hits atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }, nil)
+	for _, body := range []string{chatBody + " garbage", chatBody + chatBody, chatBody + " {}"} {
+		if code, _ := h.do("POST", "/v1/chat/completions", body, nil); code != 400 {
+			t.Errorf("%q: %d", body, code)
+		}
+	}
+	if code, _ := h.do("POST", "/v1/chat/completions", chatBody+" \n\t", nil); code != 200 {
+		t.Errorf("trailing whitespace: %d", code)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("engine saw %d requests", hits.Load())
+	}
+}
+
+// The hit-ratio counters count only requests that reported cache details: without them
+// a hit is unknown, not a miss (rev-1 #4).
+func TestHitRatioCountsOnlyReportedDetails(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101}}`)
+	}, nil)
+	h.do("POST", "/v1/chat/completions", chatBody, nil)
+	h.event(1)
+	_, m := h.do("GET", "/metrics", "", nil)
+	if !strings.Contains(m, "cavp_prompt_tokens_total 0\n") {
+		t.Fatalf("prompt tokens without details counted:\n%s", m)
 	}
 }

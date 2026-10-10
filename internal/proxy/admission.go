@@ -139,20 +139,26 @@ type AdmissionReport struct {
 	DisplaceCostS   float64
 }
 
-// Acquire waits for an LLM execution permit. The returned release function
-// must be called exactly once. queued is false for immediate admission.
-func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (release func(), queued bool, wait time.Duration, snap AdmissionSnapshot, ok bool) {
+// Admitted describes an admission for the request log.
+type Admitted struct {
+	Wait      time.Duration     // time queued (0 when admitted at once)
+	OnArrival AdmissionSnapshot // the queue as the request found it
+}
+
+// Acquire waits for an execution permit until it is granted or ctx ends (ok false).
+// The returned release must be called exactly once.
+func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (release func(), adm Admitted, ok bool) {
 	observe := ar.Observe
 	if observe == nil {
 		observe = func() (CacheObservation, bool) { return CacheObservation{}, false }
 	}
 	w, granted, snap := q.enqueue(ar)
 	if granted {
-		return q.releaseFunc(w, observe), false, 0, snap, true
+		return q.releaseFunc(w, observe), Admitted{OnArrival: snap}, true
 	}
 	select {
 	case <-w.ready:
-		return q.releaseFunc(w, observe), true, q.now().Sub(w.enqueued), snap, true
+		return q.releaseFunc(w, observe), Admitted{q.now().Sub(w.enqueued), snap}, true
 	case <-ctx.Done():
 		q.mu.Lock()
 		if w.granted {
@@ -166,7 +172,7 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 			q.grantLocked()
 			q.mu.Unlock()
 		}
-		return nil, true, q.now().Sub(w.enqueued), snap, false
+		return nil, Admitted{q.now().Sub(w.enqueued), snap}, false
 	}
 }
 

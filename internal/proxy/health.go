@@ -37,20 +37,13 @@ func newReadiness(upstream string, interval time.Duration) *readiness {
 
 // Ready reports the last probe's result.
 func (h *readiness) Ready() bool {
-	if h == nil {
-		return true
-	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.ready
 }
 
 // Wait returns nil once the engine is ready, or ctx's error if it is cancelled first.
-// A nil readiness is always ready.
 func (h *readiness) Wait(ctx context.Context) error {
-	if h == nil {
-		return nil
-	}
 	for {
 		h.mu.Lock()
 		ready, changed := h.ready, h.changed

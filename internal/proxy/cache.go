@@ -82,15 +82,6 @@ func (c CacheConfig) overhead(decoding bool) int {
 	return defaultOverheadBlocks
 }
 
-const (
-	// tokenizeTimeout bounds /tokenize including the wait for a tokenize slot.
-	tokenizeTimeout = 10 * time.Second
-	// Caller-set priorities are clamped to this range.
-	minCallerPriority, maxCallerPriority = -10, 100
-	// fallbackBytesPerToken prices a prompt /tokenize could not measure.
-	fallbackBytesPerToken = 4
-)
-
 // OutputCounter counts a streaming request's output tokens so far for admission. The
 // request path feeds it each streamed chunk: from the chunk's usage when the stream
 // carries one per chunk (stream_options.continuous_usage_stats), else tokens_per_chunk per
@@ -258,9 +249,6 @@ func (q *AdmissionQueue) expectedOutput(s *cacheSession, maxTokens int) int {
 	}
 	return out
 }
-
-// FallbackPrompt estimates prompt tokens when /tokenize failed or was skipped.
-func FallbackPrompt(textBytes int64) int { return int(textBytes / fallbackBytesPerToken) }
 
 func (q *AdmissionQueue) session(key string, now time.Time) *cacheSession {
 	if key == "" {

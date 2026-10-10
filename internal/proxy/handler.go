@@ -38,6 +38,12 @@ const (
 	// writeStallTimeout bounds one write to a client. A client that stops reading
 	// (without disconnecting) would otherwise hold its admission permit forever.
 	writeStallTimeout = 5 * time.Minute
+	// tokenizeTimeout bounds sizing a prompt with /tokenize, including the wait for a slot.
+	tokenizeTimeout = 10 * time.Second
+	// A caller-chosen priority is clamped to this range.
+	minCallerPriority, maxCallerPriority = -10, 100
+	// fallbackBytesPerToken prices a prompt /tokenize could not measure.
+	fallbackBytesPerToken = 4
 )
 
 // Proxy is the HTTP handler. Built once at startup; safe for concurrent use.
@@ -164,9 +170,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch route {
 	case "models":
-		p.forward(w, r, ev, "/v1/models", nil)
+		p.forwardTo(w, r, ev, "/v1/models", nil, nil)
 	case "tokenize":
-		p.forward(w, r, ev, "/tokenize", body)
+		p.forwardTo(w, r, ev, "/tokenize", body, nil)
 	default:
 		p.serveInference(w, r, ev, who, body)
 	}
@@ -212,8 +218,10 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 	var body map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber() // numbers pass through exactly as sent
-	if err := dec.Decode(&body); err != nil || body == nil {
-		ev.Status, ev.Error = http.StatusBadRequest, "request body is not a JSON object"
+	// Exactly one object: anything after it would be dropped by re-encoding, so it is
+	// refused rather than quietly "fixed".
+	if err := dec.Decode(&body); err != nil || body == nil || dec.Decode(&struct{}{}) != io.EOF {
+		ev.Status, ev.Error = http.StatusBadRequest, "request body is not one JSON object"
 		writeError(w, ev.Status, ev.Error)
 		return
 	}
@@ -309,8 +317,9 @@ func (p *Proxy) admit(ctx context.Context, r *http.Request, ev *Event) (func(), 
 	}
 	ev.ReadyWaitMS = time.Since(start).Milliseconds()
 
-	release, _, wait, snap, ok := p.admission.Acquire(ctx, p.admissionRequest(ctx, r, ev))
-	ev.QueueMS = wait.Milliseconds()
+	release, adm, ok := p.admission.Acquire(ctx, p.admissionRequest(ctx, r, ev))
+	ev.QueueMS = adm.Wait.Milliseconds()
+	snap := adm.OnArrival
 	ev.ActiveOnArrival, ev.QueuedOnArrival, ev.CacheUsedOnArrival = snap.Active, snap.Queued, snap.CacheUsed
 	ev.applyAdmissionReport()
 	if !ok {
@@ -365,10 +374,6 @@ func (p *Proxy) upstreamRequest(ctx context.Context, r *http.Request, path strin
 		}
 	}
 	return req, nil
-}
-
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte) {
-	p.forwardTo(w, r, ev, path, body, nil)
 }
 
 // forwardTo sends the request to the engine and relays the response. keep, when set,
@@ -498,7 +503,7 @@ func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event
 		return ar
 	}
 	start := time.Now()
-	tokens, err := p.tokenize(ctx, r.URL.Path, body, tokenizeTimeout)
+	tokens, err := p.tokenize(ctx, r.URL.Path, body)
 	ev.TokenizeMS = time.Since(start).Milliseconds()
 	if err == nil {
 		ar.PromptTokens = len(tokens)
@@ -507,7 +512,7 @@ func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event
 	} else {
 		// Never charge less than the estimate: a 4xx may be a validation failure the
 		// real request repeats, or a changed route that it does not.
-		ar.PromptTokens = FallbackPrompt(ev.textBytes)
+		ar.PromptTokens = int(ev.textBytes / fallbackBytesPerToken)
 		ev.TokenizeError = err.Error()
 	}
 	ev.EstPromptTokens = ar.PromptTokens
@@ -577,7 +582,7 @@ func textBytesOf(v any) int64 {
 // tokenize asks the engine for the prompt's token IDs, rendering the chat template
 // exactly as the real request will (same messages, tools and template kwargs; the
 // engine applies its own defaults in both paths).
-func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any, timeout time.Duration) ([]int64, error) {
+func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any) ([]int64, error) {
 	req := map[string]any{"model": body["model"]}
 	if path == "/v1/chat/completions" {
 		for _, k := range []string{"messages", "tools", "chat_template_kwargs", "mm_processor_kwargs",
@@ -613,7 +618,7 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any, 
 		return nil, err
 	}
 	// The timeout covers waiting for a slot too.
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, tokenizeTimeout)
 	defer cancel()
 	// Bounded: tokenizing runs on the engine's API server, next to every stream.
 	select {

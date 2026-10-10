@@ -73,7 +73,7 @@ func (q *AdmissionQueue) startReq(session string, prio, prompt int, tokens []int
 	q.mu.Unlock()
 	go func() {
 		defer close(tr.done)
-		rel, _, _, _, ok := q.Acquire(context.Background(), ar)
+		rel, _, ok := q.Acquire(context.Background(), ar)
 		if ok {
 			tr.admitted <- rel
 		}
@@ -430,7 +430,7 @@ func TestCacheAdmissionTinyRequestBesideProtectedHolds(t *testing.T) {
 	tb.finish(rb, 250000, 5000)
 	tr := &turn{admitted: make(chan func(), 1), rep: &AdmissionReport{}, done: make(chan struct{})}
 	go func() {
-		rel, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{Session: "chat", PromptTokens: 2000, Report: tr.rep})
+		rel, _, ok := q.Acquire(context.Background(), AdmissionRequest{Session: "chat", PromptTokens: 2000, Report: tr.rep})
 		if ok {
 			tr.admitted <- rel
 		}
@@ -610,7 +610,7 @@ func TestCacheAdmissionTierOrder(t *testing.T) {
 func TestAcquireWithoutSession(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	for i := 0; i < 2; i++ {
-		rel, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{PromptTokens: 2000, MaxTokens: 8, Report: &AdmissionReport{}})
+		rel, _, ok := q.Acquire(context.Background(), AdmissionRequest{PromptTokens: 2000, MaxTokens: 8, Report: &AdmissionReport{}})
 		if !ok {
 			t.Fatalf("acquire %d refused", i)
 		}
@@ -731,7 +731,7 @@ func TestCacheAdmissionAbortedTurnKeepsHold(t *testing.T) {
 	gen := q.NewOutputCounter()
 	done := make(chan func())
 	go func() {
-		rel, _, _, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "t", PromptTokens: 100000, Generated: gen})
+		rel, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "t", PromptTokens: 100000, Generated: gen})
 		done <- rel
 	}()
 	rel := <-done
@@ -886,7 +886,7 @@ func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 	rep := &AdmissionReport{}
 	got := make(chan func(), 1)
 	go func() {
-		rel, _, _, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "a", PromptTokens: len(prompt), Tokens: prompt, Report: rep})
+		rel, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "a", PromptTokens: len(prompt), Tokens: prompt, Report: rep})
 		got <- rel
 	}()
 	waitForQueued(t, q, 1)
