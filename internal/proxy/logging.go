@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"io"
 	"sync"
-	"sync/atomic"
 )
 
 // Event is the wire format of one log line.
@@ -65,7 +64,7 @@ type Event struct {
 	maxTokens             int
 	textBytes             int64
 	admitBody             map[string]any
-	generated             *atomic.Int64 // output tokens streamed so far (upper bound)
+	generated             *OutputCounter // output tokens streamed so far
 	report                *AdmissionReport
 	// Hashed conversation identity (X-Session-Key, else a fingerprint of the opening
 	// and the caller). With cache-aware admission it keys the session's cache hold.

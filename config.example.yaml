@@ -70,6 +70,11 @@ admission:
     # its 75th percentile); output beyond the reserve is charged as it streams.
     default_output_tokens: 2048
 
+    # Output tokens a streamed chunk counts as, when the stream does not report usage per
+    # chunk: 1 without speculative decoding, 1 plus the draft length with it (4 for MTP
+    # with 3 draft tokens). Over-counting only wastes room; under-counting overcommits.
+    tokens_per_chunk: 1
+
     # KV blocks each running request holds beyond its prompt and output (recurrent
     # state, speculative and checkpoint blocks), while prefilling and while decoding.
     # Engine and model specific: measure with `cavp -calibrate` on an idle engine.

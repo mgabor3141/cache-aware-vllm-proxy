@@ -20,7 +20,6 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
-	"sync/atomic"
 )
 
 // tokenUsage is the proxy-internal, decoded form.
@@ -184,8 +183,8 @@ const maxUsagePending = 1 << 20 // 1 MiB
 // read-loop goroutine writes to it (the keepalive goroutine writes
 // keepalive comments straight to the client, never through here).
 type usageScanner struct {
-	// chunks, when set, counts streamed choice chunks (live output for admission).
-	chunks  *atomic.Int64
+	// chunks, when set, counts the streamed output for admission.
+	chunks  *OutputCounter
 	pending []byte
 	last    tokenUsage
 	found   bool
@@ -215,23 +214,23 @@ func (s *usageScanner) scanLine(line []byte) {
 		return
 	}
 	payload := bytes.TrimSpace(line[len("data:"):])
-	if s.chunks != nil && bytes.Contains(payload, []byte(`"choices":[{`)) {
-		s.chunks.Add(tokensPerChunk)
-	}
+	choice := s.chunks != nil && bytes.Contains(payload, []byte(`"choices":[{`))
 	// Cheap pre-filter: the overwhelming majority of chunks carry
 	// "usage": null and we skip the JSON decode for them.
-	if !bytes.Contains(payload, []byte("\"usage\"")) {
-		return
-	}
 	var chunk struct {
 		Usage *usageWire `json:"usage"`
 	}
-	if err := json.Unmarshal(payload, &chunk); err != nil {
-		return
-	}
-	if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+	if bytes.Contains(payload, []byte("\"usage\"")) && json.Unmarshal(payload, &chunk) == nil &&
+		chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
 		s.last = chunk.Usage.decoded()
 		s.found = true
+		if s.chunks != nil && chunk.Usage.CompletionTokens > 0 {
+			s.chunks.Usage(int64(chunk.Usage.CompletionTokens))
+			return
+		}
+	}
+	if choice {
+		s.chunks.Chunk()
 	}
 }
 

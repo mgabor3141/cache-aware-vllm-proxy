@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
@@ -52,6 +53,11 @@ type CacheConfig struct {
 	DecodeInterference     float64 `yaml:"decode_interference"`
 
 	DefaultOutputTokens int `yaml:"default_output_tokens"`
+
+	// TokensPerChunk is how many output tokens a streamed chunk is counted as when the
+	// stream carries no per-chunk usage: 1 without speculative decoding, up to 1 plus the
+	// draft length with it (4 for MTP with 3 draft tokens). Default 1.
+	TokensPerChunk int `yaml:"tokens_per_chunk"`
 
 	// Per running request, the blocks it takes beyond its prompt and output (recurrent
 	// state, speculative and checkpoint blocks), while it prefills and once it decodes.
@@ -85,9 +91,28 @@ const (
 	fallbackBytesPerToken = 4
 )
 
-// tokensPerChunk bounds output tokens per streamed chunk: one plus the MTP draft length
-// (K=3). Counting chunks times this over-counts by at most a block per request.
-const tokensPerChunk = 4
+// OutputCounter counts a streaming request's output tokens so far for admission. The
+// request path feeds it each streamed chunk: from the chunk's usage when the stream
+// carries one per chunk (stream_options.continuous_usage_stats), else tokens_per_chunk per
+// choice chunk.
+type OutputCounter struct {
+	n        atomic.Int64
+	perChunk int64
+}
+
+// NewOutputCounter returns a counter for one request.
+func (q *AdmissionQueue) NewOutputCounter() *OutputCounter {
+	return &OutputCounter{perChunk: int64(q.cfg.Cache.TokensPerChunk)}
+}
+
+// Chunk counts one streamed choice chunk that carried no usage.
+func (c *OutputCounter) Chunk() { c.n.Add(c.perChunk) }
+
+// Usage records the completion tokens a chunk's usage reports (a running total).
+func (c *OutputCounter) Usage(completionTokens int64) { c.n.Store(completionTokens) }
+
+// Load is the output so far.
+func (c *OutputCounter) Load() int64 { return c.n.Load() }
 
 // retryMemory: a session's request that arrives within this long after its previous
 // waiter's client gave up inherits that waiter's start time.
@@ -118,6 +143,9 @@ func (c *CacheConfig) applyDefaults() {
 
 	if c.DefaultOutputTokens <= 0 {
 		c.DefaultOutputTokens = 2048
+	}
+	if c.TokensPerChunk <= 0 {
+		c.TokensPerChunk = 1
 	}
 }
 

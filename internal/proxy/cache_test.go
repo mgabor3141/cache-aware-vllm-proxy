@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -565,12 +564,12 @@ func TestCacheAdmissionLiveCharge(t *testing.T) {
 	q, _ := newCacheQueue(t, func(c *AdmissionConfig) {
 		c.Cache.PrefillOverheadBlocks, c.Cache.DecodeOverheadBlocks = intPtr(28), intPtr(20)
 	})
-	gen := &atomic.Int64{}
+	gen := q.NewOutputCounter()
 	q.mu.Lock()
 	w := &admissionWaiter{prompt: 100000, expOut: 4000, gen: gen}
 	q.running[w] = struct{}{}
 	base := q.runningLocked()
-	gen.Store(20000)
+	gen.Usage(20000)
 	grown := q.runningLocked()
 	q.mu.Unlock()
 	if base != (33+28)*3200 || grown != (38+20)*3200 {
@@ -748,5 +747,33 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 	q.tick()
 	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 2 {
 		t.Fatalf("evicted hold kept: %+v", r)
+	}
+}
+
+// Streamed output is counted from the stream's per-chunk usage when it has one, else as
+// tokens_per_chunk per choice chunk (default 1): a fixed 4 per chunk over-charged every
+// engine without speculative decoding fourfold (reviews cv-51 HIGH-3, cv-54 #6).
+func TestOutputCounter(t *testing.T) {
+	chunk := "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
+	for _, c := range []struct {
+		name     string
+		perChunk int
+		stream   string
+		want     int64
+	}{
+		{"default", 0, strings.Repeat(chunk, 3), 3},
+		{"mtp", 4, strings.Repeat(chunk, 3), 12},
+		{"continuous usage", 4, "data: {\"choices\":[{\"delta\":{\"content\":\"ab\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"cde\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5,\"total_tokens\":14}}\n\n", 5},
+		{"final usage", 4, strings.Repeat(chunk, 3) +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3,\"total_tokens\":12}}\n\ndata: [DONE]\n\n", 3},
+	} {
+		q, _ := newCacheQueue(t, func(a *AdmissionConfig) { a.Cache.TokensPerChunk = c.perChunk })
+		gen := q.NewOutputCounter()
+		s := &usageScanner{chunks: gen}
+		s.Write([]byte(c.stream))
+		if got := gen.Load(); got != c.want {
+			t.Errorf("%s: counted %d, want %d", c.name, got, c.want)
+		}
 	}
 }

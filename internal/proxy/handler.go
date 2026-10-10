@@ -38,7 +38,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/internal/auth"
@@ -882,7 +881,7 @@ func itoa(n int) string {
 // forwarding paths fill the usage fields before their deferred release runs.
 func (p *Proxy) admissionRequest(r *http.Request, ev *Event) AdmissionRequest {
 	report := &AdmissionReport{}
-	ev.generated = &atomic.Int64{}
+	ev.generated = p.admission.NewOutputCounter()
 	ar := AdmissionRequest{
 		Generated: ev.generated,
 		Priority:  ev.Priority,

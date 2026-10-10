@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
@@ -43,7 +42,7 @@ type admissionWaiter struct {
 	blocks  kvmirror.PromptKeys // mirror keys of the prompt
 	maxOut  int                 // the request's output cap (0: none)
 	expOut  int                 // expected output tokens, fixed at admission
-	gen     *atomic.Int64
+	gen     *OutputCounter
 	report  *AdmissionReport
 }
 
@@ -128,7 +127,7 @@ type AdmissionRequest struct {
 	MaxTokens    int
 	// Generated, when set, counts output tokens so far; the request's charge grows with
 	// it once it passes the expected output.
-	Generated *atomic.Int64
+	Generated *OutputCounter
 	// Observe is called at release and reports the engine's usage for the request.
 	Observe func() (CacheObservation, bool)
 	// Report, when set, is filled at admission time for the request log.
