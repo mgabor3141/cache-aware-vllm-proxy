@@ -45,27 +45,35 @@ In live runs the prediction matched the engine's reported `cached_tokens` on ove
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
 attention blocks: a hit at position p also needs a saved recurrent state at exactly p. The mirror
-tracks each KV group separately and only counts a hit where every group has it. Engines that
-checkpoint the recurrent state at a finer unit than the block (`--prefix-match-unit` in halt95's
-vLLM fork; not an upstream vLLM flag at the time of writing) announce
-the tail checkpoint and the span after it as small entries whose parents are never announced; the
-mirror indexes those by token content.
+tracks each KV group separately and only counts a hit where every group has it. It tracks full
+blocks only.
+
+The mirror is only as good as the stream. On every (re)subscription it starts empty and rebuilds
+from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
+replay that fails ends the subscription so it is retried. A sequence number that goes backwards
+outside the replay overlap means the engine restarted, and the mirror starts over. Holds are
+judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
+a restart, or older than the replay buffer reaches) is released.
 
 ## Admission
 
-**Budget.** The engine's KV pool, read from `vllm:cache_config_info`. Until it is known, only
-`max_active` applies.
+**Budget.** The engine's KV pool, read from `vllm:cache_config_info`. Until it is known, nothing
+is admitted: requests wait. `max_active` caps concurrency on top.
 
 **What a running request costs.** Its prompt, its output so far or its expected output
 (whichever is larger; the expectation is the conversation's 75th percentile, else a default),
-and a fixed per-request overhead in blocks for state the engine keeps beyond the tokens. The
-charge updates as output streams.
+and a fixed per-request overhead in blocks for state the engine keeps beyond the tokens. A
+waiter is priced when it is granted, so a raised overhead reaches the queue too. The charge
+updates as output streams: from the stream's own token counts when it reports usage per chunk,
+else a configured number of tokens per chunk (1 plus the draft length under speculative
+decoding). A non-streaming request is charged its expected output until it finishes.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
 admitted on top of it. A hold is firm (cannot be displaced by work of the same or lower
 priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
 that prefill would slow, and at least 5 s so a quick tool call always comes back warm. After that
-it is expendable: it stays while nothing needs the room.
+it is expendable: it stays while nothing needs the room. A hold has the priority of the turn that
+left it; a turn that ends without usage (client gone, engine error) keeps the previous hold.
 
 **Order.** Priority first (lower runs first, as in vLLM). Then a waiter whose prompt is at least
 half cached, or whose own conversation holds its context; then small prompts; then cold ones; each
@@ -98,9 +106,11 @@ The figure is configuration, measured with `cavp -calibrate` on an idle engine. 
 learn it continuously: an engine that keeps finished turns pinned for their next turn reports most
 of its pool in use while nothing runs, and does not export how much of that is pinned.
 
-The overcommit guard covers a figure that is too low. It raises a margin on two signals: the
-engine preempting a request, and the engine evicting a held context while the proxy's accounting
-was near its budget. The engine's waiting queue is not a signal: it counts every request not yet
+The overcommit guard covers a figure that is too low. Its one signal is the engine preempting a
+request; each preemption raises a margin added to every request's overhead, which decays after
+a quiet spell. The engine evicting a held context is not a signal: the engine drops cached
+prefixes for its own reasons too, and near the budget idle holds alone made it fire with nothing
+running. Neither is the engine's waiting queue: it counts every request not yet
 scheduled, including ones waiting for the next step's prefill token budget, and is non-zero in
 normal operation. Using it raised the margin by 8 blocks in five minutes of normal load.
 
@@ -108,7 +118,8 @@ normal operation. Using it raised the margin by 8 blocks in five minutes of norm
 
 - With `mamba_cache_mode=align`, recurrent checkpoints were written only where a prefill step
   ended on a block boundary (3,200-4,096 tokens), so a turn adding less than a block missed
-  entirely. A finer prefix-match unit fixed it.
+  entirely. A finer checkpoint unit in halt95's fork fixed it at the time; the proxy no
+  longer models it.
 - On one engine version a prompt's tail checkpoint was released early and aged out of the cache
   before the agent returned (fixed in halt95's vLLM fork, v2.5.1).
 - Each was found by tracing KV events against real misses, not by aggregate hit rates.

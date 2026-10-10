@@ -6,12 +6,13 @@ package proxy
 //
 // Inputs, all measured rather than guessed:
 //   - every request is tokenized with the engine's /tokenize (exact size and token IDs);
-//   - the KV event mirror (kvmirror.go) says how many of those tokens are cached now;
-//   - prefill speed and its slowdown of decoding streams are measured constants;
-//   - the chance an idle session returns is a measured curve of tool gaps.
+//   - the KV event mirror (kvmirror) says how many of those tokens are cached now;
+//   - the engine's KV pool and block size come from its /metrics (enginepool.go);
+//   - prefill speed and its slowdown of decoding streams are measured constants.
 //
-// Space, in tokens against cache_tokens:
-//   running request  its prompt plus expected output, in whole blocks. Never overcommitted.
+// Space, in tokens against the engine's pool:
+//   running request  its prompt plus the larger of its output so far and its expected
+//                    output, in whole blocks, plus a per-request overhead (guard.go).
 //   idle session     its last prompt, held until displaced. Displacing it is all
 //                    or nothing: with speculative decoding the engine drops a prompt's last
 //                    cached block before matching, so losing the tail loses the whole hit.
@@ -19,48 +20,45 @@ package proxy
 // Order: priority (lower first), then a request whose prefix is cached, then small
 // prompts, then cold ones, each by arrival.
 //
-// Releasing an idle session: a thread that got in cold keeps its cache for entryQuantum
-// times its entry prefill. After that its hold is kept while its chance of returning per
-// second, times its re-prefill (tokens / prefill speed, times the decoding it stalls),
-// outweighs the pressure of the waiters it blocks (fitLocked). A waiter that outranks the
-// holder displaces it at once. Nothing else forces a release: waiting long does not, so
-// many waiters cannot start thrashing together.
+// Releasing an idle session: its hold is firm for as long as re-prefilling it would take
+// (with the decoding that prefill stalls), at least minHold, and while its own thread
+// waits (holdFor, firm). After that it is expendable: an equal-priority waiter may
+// displace it while fewer than evictBelowRunning requests run. A higher-priority waiter
+// may displace any lower-priority hold (fitLocked). Waiting long forces nothing, so many
+// waiters cannot start thrashing together.
 //
 // Holds steer admission only. The engine evicts free blocks least recently used first,
 // whatever the proxy holds, so the mirror is checked each pass and a hold whose blocks
 // are gone is dropped.
 //
-// Failure modes fall back conservatively: no mirror means nothing counts as cached; no
-// /tokenize means a size estimate from text bytes.
-// cache_tokens: 0 turns all of this off, leaving plain slot admission.
+// Until the pool is known, nothing is admitted. While the mirror resyncs, nothing counts
+// as cached; without /tokenize the prompt size is estimated from text bytes.
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
 type CacheConfig struct {
-	// Enabled turns on cache-aware admission; off is plain slot admission.
-	Enabled bool `yaml:"enabled"`
-	// Tokens is the engine's block pool in tokens. The proxy reads it from the engine's
-	// /metrics (enginePool); this is only the value used before that (tests set it).
-	Tokens int `yaml:"-"`
-	// BlockTokens is the engine block size. The mirror reads it from the event stream;
-	// this is only the value used before that (tests set it).
-	BlockTokens int `yaml:"-"`
-
-	// KVEventsEndpoint is the engine's KV event publisher; empty runs without a mirror.
-	// Its replay service, which rebuilds the mirror on (re)subscribe, is on the next port.
+	// KVEventsEndpoint is the engine's KV event publisher (required). Its replay
+	// service, which rebuilds the mirror on (re)subscribe, is on the next port.
 	KVEventsEndpoint string `yaml:"kv_events_endpoint"`
 
 	PrefillTokensPerSecond float64 `yaml:"prefill_tokens_per_s"`
 	DecodeInterference     float64 `yaml:"decode_interference"`
 
 	DefaultOutputTokens int `yaml:"default_output_tokens"`
+
+	// TokensPerChunk is how many output tokens a streamed chunk is counted as when the
+	// stream carries no per-chunk usage: 1 without speculative decoding, up to 1 plus the
+	// draft length with it (4 for MTP with 3 draft tokens). Default 1.
+	TokensPerChunk int `yaml:"tokens_per_chunk"`
 
 	// Per running request, the blocks it takes beyond its prompt and output (recurrent
 	// state, speculative and checkpoint blocks), while it prefills and once it decodes.
@@ -94,9 +92,28 @@ const (
 	fallbackBytesPerToken = 4
 )
 
-// tokensPerChunk bounds output tokens per streamed chunk: one plus the MTP draft length
-// (K=3). Counting chunks times this over-counts by at most a block per request.
-const tokensPerChunk = 4
+// OutputCounter counts a streaming request's output tokens so far for admission. The
+// request path feeds it each streamed chunk: from the chunk's usage when the stream
+// carries one per chunk (stream_options.continuous_usage_stats), else tokens_per_chunk per
+// choice chunk.
+type OutputCounter struct {
+	n        atomic.Int64
+	perChunk int64
+}
+
+// NewOutputCounter returns a counter for one request.
+func (q *AdmissionQueue) NewOutputCounter() *OutputCounter {
+	return &OutputCounter{perChunk: int64(q.cfg.Cache.TokensPerChunk)}
+}
+
+// Chunk counts one streamed choice chunk that carried no usage.
+func (c *OutputCounter) Chunk() { c.n.Add(c.perChunk) }
+
+// Usage records the completion tokens a chunk's usage reports (a running total).
+func (c *OutputCounter) Usage(completionTokens int64) { c.n.Store(completionTokens) }
+
+// Load is the output so far.
+func (c *OutputCounter) Load() int64 { return c.n.Load() }
 
 // retryMemory: a session's request that arrives within this long after its previous
 // waiter's client gave up inherits that waiter's start time.
@@ -118,10 +135,6 @@ const smallPrompt = 16000
 const evictBelowRunning = 4
 
 func (c *CacheConfig) applyDefaults() {
-	if c.BlockTokens <= 0 {
-		c.BlockTokens = 1
-	}
-
 	if c.PrefillTokensPerSecond <= 0 {
 		c.PrefillTokensPerSecond = 4200
 	}
@@ -132,10 +145,18 @@ func (c *CacheConfig) applyDefaults() {
 	if c.DefaultOutputTokens <= 0 {
 		c.DefaultOutputTokens = 2048
 	}
-
+	if c.TokensPerChunk <= 0 {
+		c.TokensPerChunk = 1
+	}
 }
 
 func (c CacheConfig) validate() error {
+	if c.KVEventsEndpoint == "" {
+		return fmt.Errorf("admission.cache.kv_events_endpoint is required (the engine's --kv-events-config ZMQ publisher)")
+	}
+	if kvmirror.ReplayEndpoint(c.KVEventsEndpoint) == "" {
+		return fmt.Errorf("admission.cache.kv_events_endpoint %q: want host:port (the replay service is on the next port)", c.KVEventsEndpoint)
+	}
 	if c.DecodeInterference > 1 {
 		return fmt.Errorf("admission.cache.decode_interference %g: want 0-1 (the share of decode speed a prefill takes)", c.DecodeInterference)
 	}
@@ -147,40 +168,29 @@ func (c CacheConfig) validate() error {
 	return nil
 }
 
-func (c CacheConfig) enabled() bool { return c.Enabled }
+// block is the engine block size; 0 until known.
+func (q *AdmissionQueue) block() int { return q.blockSize }
 
-// block is the engine block size: from the mirror once known, else the configured fallback.
-func (q *AdmissionQueue) block() int {
-	if q.mirror != nil {
-		if b := q.mirror.BlockSize(); b > 0 {
-			return b
-		}
-	}
-	return q.cfg.Cache.BlockTokens
-}
-
-// budget is the engine's block pool in tokens; 0 until known, which means slot admission.
+// budget is the engine's block pool in tokens; 0 until known, and nothing is admitted until then.
 func (q *AdmissionQueue) budget() int { return q.roundDown(q.pool) }
 
 // SetPool records the engine's block pool (vllm:cache_config_info num_gpu_blocks x
 // block_size). One block is the engine's reserved null block.
-func (q *AdmissionQueue) SetPool(blocks, blockSize, unit int) {
+func (q *AdmissionQueue) SetPool(blocks, blockSize int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.mirror != nil {
-		q.mirror.SetGeometry(blockSize, unit)
-	}
+	q.mirror.SetBlockSize(blockSize)
 	q.pool = max(blocks-1, 0) * blockSize
-	q.cfg.Cache.BlockTokens = blockSize // until the mirror has seen an event
+	q.blockSize = blockSize
 	q.grantLocked()
 }
 
 func (q *AdmissionQueue) roundUp(tokens int) int {
-	b := q.block()
+	b := max(q.block(), 1)
 	return (tokens + b - 1) / b * b
 }
 
-func (q *AdmissionQueue) roundDown(tokens int) int { return tokens / q.block() * q.block() }
+func (q *AdmissionQueue) roundDown(tokens int) int { b := max(q.block(), 1); return tokens / b * b }
 
 func (c CacheConfig) prefillSeconds(tokens int) float64 {
 	return float64(max(tokens, 0)) / c.PrefillTokensPerSecond
@@ -193,20 +203,21 @@ const (
 )
 
 type cacheSession struct {
-	priority   int
+	priority   int // of its hold: the request that left it
 	footprint  int // prompt + completion of the last completed turn
 	lastPrompt int // prompt tokens of the last completed turn
 	outputs    []int
 
 	running int
 	// Largest observation of the current busy period (overlapping requests).
-	busyFootprint, busyPrompt int
-	busyBlocks                kvmirror.PromptKeys
-	lastDone                  time.Time
-	held                      int                 // prompt tokens protected while idle (whole blocks); 0 when not holding
-	heldBlocks                kvmirror.PromptKeys // mirror keys of the held prompt
-	heldVisible               bool                // the mirror saw the hold cached when it began
-	heldEpoch                 uint64              // mirror subscription it was seen under
+	busyFootprint, busyPrompt, busyPriority int
+	busyBlocks                              kvmirror.PromptKeys
+	lastDone                                time.Time
+	held                                    int                 // prompt tokens protected while idle (whole blocks); 0 when not holding
+	heldBlocks                              kvmirror.PromptKeys // mirror keys of the held prompt
+	// heldSeen is what the mirror saw cached of the hold: -1 until the mirror is healthy to
+	// ask, 0 when it saw nothing (the hold cannot be verified).
+	heldSeen int
 
 	gaveUpSince, gaveUpAt time.Time // a waiter whose client left: since when it waited, and when it left
 	waiting               int       // requests of this session in the queue
@@ -266,23 +277,45 @@ func (q *AdmissionQueue) session(key string, now time.Time) *cacheSession {
 	return s
 }
 
+// pruneSessionsLocked forgets sessions idle past sessionRetention. With force (the table
+// is full), it also forgets the least recently seen idle sessions, those holding nothing
+// first, down to sessionCap less a sixteenth, so a full table is not scanned for every
+// new session. A session with running or queued requests is never forgotten; a hold
+// forgotten that way counts as displaced, and is logged.
 func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
-	var oldestKey string
-	var oldest time.Time
+	var idle []string
 	for k, s := range q.sessions {
-		if s.running > 0 {
+		if s.running > 0 || s.waiting > 0 {
 			continue
 		}
 		if now.Sub(s.lastSeen) > sessionRetention {
 			delete(q.sessions, k)
-			continue
-		}
-		if oldestKey == "" || s.lastSeen.Before(oldest) {
-			oldestKey, oldest = k, s.lastSeen
+		} else if force {
+			idle = append(idle, k)
 		}
 	}
-	if force && len(q.sessions) >= sessionCap && oldestKey != "" {
-		delete(q.sessions, oldestKey)
+	excess := len(q.sessions) - (sessionCap - sessionCap/16)
+	if !force || excess <= 0 {
+		return
+	}
+	sort.Slice(idle, func(i, j int) bool {
+		a, b := q.sessions[idle[i]], q.sessions[idle[j]]
+		if (a.held > 0) != (b.held > 0) {
+			return a.held == 0
+		}
+		return a.lastSeen.Before(b.lastSeen)
+	})
+	forgotten, held := 0, 0
+	for _, k := range idle[:min(excess, len(idle))] {
+		if h := q.sessions[k].held; h > 0 {
+			forgotten++
+			held += h
+		}
+		delete(q.sessions, k)
+	}
+	if forgotten > 0 {
+		q.displaced += held
+		log.Printf("level=warn msg=\"session table full: forgot idle holds\" holds=%d tokens=%d sessions=%d", forgotten, held, len(q.sessions))
 	}
 }
 
@@ -311,11 +344,18 @@ func (q *AdmissionQueue) liveCharge(w *admissionWaiter) int {
 	return q.roundUp(w.prompt+max(g, w.expOut)) + q.overheadLocked(g > 0)*q.block()
 }
 
+// chargeLocked is what a waiter would occupy if admitted now: priced at the current block
+// size, guard margin and session history, not frozen at arrival.
+func (q *AdmissionQueue) chargeLocked(w *admissionWaiter) int {
+	w.expOut = q.expectedOutput(q.sessions[w.session], w.maxOut)
+	return q.liveCharge(w)
+}
+
 // runningLocked is the cache running requests occupy: the sum of their live charges.
 // The engine's kv_cache_usage_perc is not a floor: since v2.5.1 it also counts finished
 // turns' prefixes the engine keeps referenced until it needs the room (grace holds, which
 // yield before any preemption), so it reads high with nothing running. It stays in
-// /debug/residency for comparison, and a preemption is logged (runEngineUsage).
+// the residency snapshot for comparison.
 func (q *AdmissionQueue) runningLocked() int {
 	model := 0
 	for w := range q.running {
@@ -350,7 +390,7 @@ func (q *AdmissionQueue) cacheUsedLocked(now time.Time) int {
 
 // cachedLocked is the waiter's prefix the engine holds now, per the mirror.
 func (q *AdmissionQueue) cachedLocked(w *admissionWaiter) int {
-	if q.mirror == nil || w.blocks.Empty() || !q.mirror.Healthy() {
+	if w.blocks.Empty() || !q.mirror.Healthy() {
 		return 0
 	}
 	return min(q.mirror.Cached(w.blocks), w.prompt)
@@ -368,10 +408,10 @@ type displacement struct {
 }
 
 // needLocked is how many held tokens w would have to displace to run now; <= 0 when it
-// fits beside running work and holds (including the small hold overcommit).
+// fits beside running work and holds.
 func (q *AdmissionQueue) needLocked(w *admissionWaiter, now time.Time) int {
 	budget := q.budget()
-	charge := min(w.charge, budget)
+	charge := min(q.chargeLocked(w), budget)
 	own := q.sessions[w.session]
 	free := budget - q.cacheUsedLocked(now)
 	if own != nil && own.holding(now) {
@@ -397,11 +437,11 @@ func (q *AdmissionQueue) firm(s *cacheSession, now time.Time) bool {
 
 // tier orders waiters within a priority: a thread whose prefix is cached first (nothing
 // may evict it before it runs), then small requests, then cold work.
-func (q *AdmissionQueue) tier(w *admissionWaiter, cached int) int {
+func (q *AdmissionQueue) tier(w *admissionWaiter, cached int, now time.Time) int {
 	own := q.sessions[w.session]
 	switch {
 	case cached > 0 && cached*2 >= w.prompt,
-		own != nil && own.holding(q.now()) && own.held*2 >= w.prompt:
+		own != nil && own.holding(now) && own.held*2 >= w.prompt:
 		return 0
 	case w.prompt < smallPrompt:
 		return 1
@@ -455,11 +495,15 @@ func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved i
 	return plan, true
 }
 
-// grantCacheLocked admits waiters in order: priority, then tier, then longest wait. All
-// queueing happens here; the engine is never sent more than it can run. A waiter that
+// grantLocked admits waiters in order: priority, then tier, then longest wait. All
+// queueing happens here; the engine is never sent more than it can run, and nothing
+// until its pool is known. A waiter that
 // does not fit reserves the room it still needs, so later waiters use only what is left
 // beyond it and cannot starve it.
-func (q *AdmissionQueue) grantCacheLocked() {
+func (q *AdmissionQueue) grantLocked() {
+	if q.budget() == 0 {
+		return
+	}
 	now := q.now()
 	q.syncHoldsLocked(now)
 	type scored struct {
@@ -470,7 +514,7 @@ func (q *AdmissionQueue) grantCacheLocked() {
 	order := make([]scored, 0, len(q.waiters))
 	for _, w := range q.waiters {
 		cached := q.cachedLocked(w)
-		order = append(order, scored{w, cached, q.tier(w, cached)})
+		order = append(order, scored{w, cached, q.tier(w, cached, now)})
 	}
 	sort.SliceStable(order, func(i, j int) bool {
 		a, b := order[i], order[j]
@@ -504,6 +548,7 @@ func (q *AdmissionQueue) grantCacheLocked() {
 			q.displaced += d.tokens
 		}
 		if w.report != nil {
+			w.report.ChargeTokens = q.liveCharge(w)
 			w.report.PredictedCached = o.cached
 			w.report.PrefillCostS = q.ownCost(w, o.cached)
 			w.report.DisplacedTokens = displaced
@@ -518,25 +563,28 @@ func (q *AdmissionQueue) grantCacheLocked() {
 func (q *AdmissionQueue) dropHoldLocked(s *cacheSession) {
 	s.held = 0
 	s.heldBlocks = kvmirror.PromptKeys{}
-	s.heldVisible = false
 }
 
-// syncHoldsLocked drops holds the engine evicted. Only on evidence: the mirror must have
-// seen most of the hold cached when it began (heldVisible), and then see it gone. Holds
-// it never saw (image blocks carry extra hash keys; threads older than a resubscribe's
-// replay window) are unknown, not evicted.
+// syncHoldsLocked drops holds the engine no longer has, judged by the mirror while it is
+// healthy (subscribed, and its replay complete). The first healthy look at a hold records
+// how much of it is cached; a hold that later falls below half of that is gone: evicted,
+// or lost to an engine restart or to a resync whose replay did not reach it. A hold the
+// mirror saw nothing of (image blocks carry extra hash keys; a prompt of a block or two,
+// which the engine never serves whole) cannot be judged, and stays until displaced.
 func (q *AdmissionQueue) syncHoldsLocked(now time.Time) {
-	if q.mirror == nil || !q.mirror.Healthy() {
+	if !q.mirror.Healthy() {
 		return
 	}
 	for _, s := range q.sessions {
-		if !s.holding(now) || !s.heldVisible || s.heldEpoch != q.mirror.Epoch() {
-			continue // never seen, or seen before a resubscribe whose replay may not reach it
+		if !s.holding(now) || s.heldSeen == 0 {
+			continue
 		}
-		if q.mirror.Cached(s.heldBlocks) < s.held/2 {
-			if q.firm(s, now) {
-				q.guardEvictionLocked(now, s.held)
-			}
+		cached := q.mirror.Cached(s.heldBlocks)
+		if s.heldSeen < 0 {
+			s.heldSeen = cached
+			continue
+		}
+		if cached < s.heldSeen/2 {
 			q.dropHoldLocked(s)
 			q.evictedHolds++
 		}
@@ -546,41 +594,36 @@ func (q *AdmissionQueue) syncHoldsLocked(now time.Time) {
 func (q *AdmissionQueue) admitLocked(w *admissionWaiter, now time.Time) {
 	q.active++
 	w.granted = true
-	if !q.cfg.Cache.enabled() {
-		return
-	}
 	q.running[w] = struct{}{}
 	if s := q.sessions[w.session]; s != nil {
-		s.running++
-		s.held = 0
-		s.heldBlocks = kvmirror.PromptKeys{}
-		s.heldVisible = false
-		s.priority = w.priority
+		s.running++ // a session with a running request holds nothing (holding)
 	}
 }
 
 // finishLocked returns a request's charge and records what the engine reported. While
 // a session has overlapping requests, the largest observation wins: a side call does not
-// shrink what the main thread left cached. A busy period with no usage at all (upstream
-// error, client gone) leaves no hold, since nothing says anything was cached.
+// shrink what the main thread left cached, nor lend the hold its priority. Without usage
+// (client gone mid-stream, upstream error), a request that streamed output had its prompt
+// prefilled, and the size the proxy measured stands in. A busy period with nothing to
+// show keeps the session's previous hold, whose prefix a retry resends; a session
+// without one holds nothing.
 func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObservation, bool)) {
-	if !q.cfg.Cache.enabled() {
-		return
-	}
 	now := q.now()
 	delete(q.running, w)
 	s := q.sessions[w.session]
 	if s == nil {
 		return
 	}
-	if o, ok := obs(); ok && o.PromptTokens > 0 {
-		if fp := o.PromptTokens + o.CompletionTokens; fp > s.busyFootprint {
-			s.busyFootprint = fp
-			s.busyPrompt = o.PromptTokens
-
-			s.busyBlocks = w.blocks
-		}
+	o, ok := obs()
+	if ok && o.PromptTokens > 0 {
 		s.outputs = pushInt(s.outputs, o.CompletionTokens)
+	} else if g := w.generated(); g > 0 && w.prompt > 0 {
+		o, ok = CacheObservation{PromptTokens: w.prompt, CompletionTokens: g}, true
+	} else {
+		ok = false
+	}
+	if fp := o.PromptTokens + o.CompletionTokens; ok && fp > s.busyFootprint {
+		s.busyFootprint, s.busyPrompt, s.busyBlocks, s.busyPriority = fp, o.PromptTokens, w.blocks, w.priority
 	}
 	if s.running > 0 {
 		s.running--
@@ -589,18 +632,14 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 		return
 	}
 	s.lastDone = now
-	s.held, s.heldBlocks = 0, kvmirror.PromptKeys{}
 	if s.busyFootprint > 0 {
 		s.footprint, s.lastPrompt = s.busyFootprint, s.busyPrompt
 		// The next turn resends the prompt, not the completion (thinking is dropped), so
 		// the prompt is what stays useful in the cache.
-		s.held = q.roundUp(s.lastPrompt) // with tail hits its partial last block is kept too
+		s.held = q.roundUp(s.lastPrompt)
 		s.heldBlocks = s.busyBlocks
-		s.heldVisible = q.mirror != nil && q.mirror.Healthy() && !s.heldBlocks.Empty() &&
-			q.mirror.Cached(s.heldBlocks) >= s.held/2
-		if q.mirror != nil {
-			s.heldEpoch = q.mirror.Epoch()
-		}
+		s.heldSeen = -1 // judged on the next pass (syncHoldsLocked)
+		s.priority = s.busyPriority
 	}
 	s.busyFootprint, s.busyPrompt, s.busyBlocks = 0, 0, kvmirror.PromptKeys{}
 }
@@ -632,11 +671,10 @@ type ResidencyWaiter struct {
 }
 
 type ResidencySnapshot struct {
-	Enabled       bool `json:"enabled"`
-	BudgetTokens  int  `json:"budget_tokens"`
-	UsedTokens    int  `json:"used_tokens"`
-	RunningTokens int  `json:"running_tokens"`
-	HeldTokens    int  `json:"held_tokens"`
+	BudgetTokens  int `json:"budget_tokens"`
+	UsedTokens    int `json:"used_tokens"`
+	RunningTokens int `json:"running_tokens"`
+	HeldTokens    int `json:"held_tokens"`
 	// The engine's count of running requests' blocks against the model's estimate of the
 	// same (output so far, no reserve): their gap is the accounting error.
 	EngineUsedTokens  int                `json:"engine_used_tokens"`
@@ -656,18 +694,15 @@ func (q *AdmissionQueue) Residency() ResidencySnapshot {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	now := q.now()
-	cc := q.cfg.Cache
 	out := ResidencySnapshot{
-		Enabled: cc.enabled(), BudgetTokens: q.budget(), UsedTokens: q.cacheUsedLocked(now),
+		BudgetTokens: q.budget(), UsedTokens: q.cacheUsedLocked(now),
 		RunningTokens: q.runningLocked(), HeldTokens: q.heldLocked(now),
 		EngineUsedTokens: q.engineUsed, ModelActualTokens: q.modelActualLocked(),
 		Active: q.active, Queued: len(q.waiters), Displaced: q.displaced, EvictedHolds: q.evictedHolds,
 		MarginBlocks: q.margin, MarginRaises: q.marginRaises,
 	}
-	if q.mirror != nil {
-		st := q.mirror.Status()
-		out.Mirror = &st
-	}
+	st := q.mirror.Status()
+	out.Mirror = &st
 	for k, s := range q.sessions {
 		if s.running == 0 && !s.holding(now) {
 			continue
@@ -685,7 +720,7 @@ func (q *AdmissionQueue) Residency() ResidencySnapshot {
 		cached := q.cachedLocked(w)
 		out.Waiters = append(out.Waiters, ResidencyWaiter{
 			Session: w.session, Priority: w.priority, WaitS: int(now.Sub(w.enqueued).Seconds()),
-			Prompt: w.prompt, Cached: cached, Charge: w.charge,
+			Prompt: w.prompt, Cached: cached, Charge: q.chargeLocked(w),
 			PrefillS: math.Round(q.ownCost(w, cached)*10) / 10,
 		})
 	}

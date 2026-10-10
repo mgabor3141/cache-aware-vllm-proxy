@@ -11,48 +11,29 @@ import (
 // decode_overhead_blocks): recurrent state, speculative and checkpoint blocks the engine
 // allocates beyond the prompt and output. The right figure depends on the model and the engine
 // version, and the engine's own usage cannot measure it once the engine keeps finished turns'
-// blocks pinned (grace pins in halt95's vLLM fork, v2.5 hold most of the pool while nothing runs). So the
-// configured figure is the source of truth (measure it with `cavp -calibrate`), and this guard
-// is a safety net for when it is too low.
+// blocks pinned. So the configured figure is the source of truth (measure it with
+// `cavp -calibrate`), and this guard is a safety net for when it is too low.
 //
-// Two signals mean the proxy let in more than the engine could hold:
+// Its one signal is the engine preempting a request (vllm:num_preemptions_total rising): the
+// proxy let in more than the engine could hold. Each raises a margin added to every running
+// and waiting request's overhead, by guardStepBlocks, at most once per guardCooldown and up to
+// guardMaxMarginBlocks. After guardDecayAfter without a signal the margin falls by one step,
+// back to zero (the configured figure). Every change is logged.
 //
-//	early  the engine evicted a hold the proxy still counted as firm (seen through KV events)
-//	       while the proxy's own accounting was near the budget. An eviction with plenty of
-//	       modelled room is not counted: the engine also drops cached prefixes for its own
-//	       reasons (halt95's vLLM fork, v2.5, pins at most 16 finished turns), and a low overhead would show
-//	       up near the budget first.
-//	late   the engine preempted a request (num_preemptions_total).
-//
-// Each raises a margin added to every running request's overhead, by guardStepBlocks, at most
-// once per guardCooldown and up to guardMaxMarginBlocks. After guardDecayAfter without a
-// signal the margin falls by one step, back to zero (the configured figure).
-//
-// Not a signal: the engine's waiting queue (num_requests_waiting, or its "capacity" reason).
-// It counts every request not yet scheduled, including one admitted a moment ago and one
-// waiting behind another's prefill for the step's token budget, so it is non-zero in normal
-// operation and says nothing about KV space.
+// Not signals: the engine evicting a held context (it also drops cached prefixes for its own
+// reasons, and a hold is only a reservation), and the engine's waiting queue, which counts
+// every request not yet scheduled, including one admitted a moment ago and one waiting behind
+// another's prefill for the step's token budget.
 //
 // The guard cannot tell overhead from other causes: a request that outruns its expected
 // output, or traffic that reaches the engine without passing through the proxy, look the
-// same. It treats them all as margin, and logs each adjustment with its reason.
+// same. It treats them all as margin.
 const (
 	guardStepBlocks      = 2
 	guardMaxMarginBlocks = 32
 	guardCooldown        = time.Minute
 	guardDecayAfter      = 15 * time.Minute
-	// guardPressure: the early signal counts only when modelled use is at least this share
-	// of the budget.
-	guardPressure = 0.85
 )
-
-// guardEvictionLocked is the early signal: the engine evicted a hold the proxy counted as firm.
-// evicted is the hold's size, which the accounting still includes.
-func (q *AdmissionQueue) guardEvictionLocked(now time.Time, evicted int) {
-	if b := q.budget(); b > 0 && float64(q.cacheUsedLocked(now)-evicted) >= guardPressure*float64(b) {
-		q.guardRaiseLocked("engine evicted a firm hold near the budget", now)
-	}
-}
 
 // overheadLocked is the per-request overhead in blocks, including the guard's margin.
 func (q *AdmissionQueue) overheadLocked(decoding bool) int {
@@ -84,12 +65,30 @@ func (q *AdmissionQueue) guardDecayLocked(now time.Time) {
 	log.Printf("level=info msg=\"overcommit guard lowered the margin\" margin_blocks=%d", q.margin)
 }
 
-// EngineSignals reports the engine's preemption counter.
-func (q *AdmissionQueue) EngineSignals(preemptions float64) {
+// EngineSignals reports the engine's preemption counters, one per metric series (its
+// label set; a data-parallel engine has one per engine). A series counts when it rises
+// from its last value; a new series, or one that went down (the engine restarted), only
+// sets its baseline. A read without any series means the guard is blind: that is logged
+// once until a series appears, which then starts from a new baseline.
+func (q *AdmissionQueue) EngineSignals(preemptions map[string]float64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.lastPreempt >= 0 && preemptions > q.lastPreempt {
-		q.guardRaiseLocked("engine preempted", q.now())
+	rose := false
+	for series, v := range preemptions {
+		if last, ok := q.lastPreempt[series]; ok && v > last {
+			rose = true
+		}
 	}
 	q.lastPreempt = preemptions
+	if len(preemptions) == 0 {
+		if !q.preemptBlind {
+			q.preemptBlind = true
+			log.Printf("level=warn msg=\"engine metrics have no vllm:num_preemptions_total: the overcommit guard cannot see preemptions\"")
+		}
+		return
+	}
+	q.preemptBlind = false
+	if rose {
+		q.guardRaiseLocked("engine preempted", q.now())
+	}
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,14 +23,18 @@ func (c *fakeClock) add(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// Production-shaped config: 30m queue timeout, 10m max wait.
+// newCacheQueue is a queue on a known pool of 3200-token blocks: 222 usable blocks (200 of
+// a hybrid model, plus room for 28-block runners) unless mutate sets another size.
 func newCacheQueue(t *testing.T, mutate func(*AdmissionConfig)) (*AdmissionQueue, *fakeClock) {
+	return newCacheQueuePool(t, 710400, mutate)
+}
+
+func newCacheQueuePool(t *testing.T, pool int, mutate func(*AdmissionConfig)) (*AdmissionQueue, *fakeClock) {
 	t.Helper()
 	cfg := AdmissionConfig{
 		MaxActive: 8,
 		Cache: CacheConfig{
-			Enabled: true, Tokens: 710400, BlockTokens: 3200, // 200 usable blocks of a hybrid model, plus room for 28-block runners
-			PrefillTokensPerSecond: 4200, DecodeInterference: 0.94, DefaultOutputTokens: 4000,
+			KVEventsEndpoint: "tcp://vllm:5557", PrefillTokensPerSecond: 4200, DecodeInterference: 0.94, DefaultOutputTokens: 4000,
 		},
 	}
 	if mutate != nil {
@@ -41,6 +44,7 @@ func newCacheQueue(t *testing.T, mutate func(*AdmissionConfig)) (*AdmissionQueue
 	if err := q.cfg.validate(); err != nil {
 		t.Fatal(err)
 	}
+	q.SetPool(pool/3200+1, 3200)
 	clk := &fakeClock{t: time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)}
 	q.now = clk.now
 	return q, clk
@@ -57,7 +61,7 @@ type turn struct {
 func (q *AdmissionQueue) startReq(session string, prio, prompt int, blocks []kvmirror.BlockKey) *turn {
 	tr := &turn{admitted: make(chan func(), 1), rep: &AdmissionReport{}, done: make(chan struct{})}
 	ar := AdmissionRequest{
-		Priority: prio, Session: session, PromptTokens: prompt, MaxTokens: 4000, Blocks: kvmirror.PromptKeys{Blocks: blocks}, Report: tr.rep,
+		Priority: prio, Session: session, PromptTokens: prompt, MaxTokens: 4000, Blocks: kvmirror.PromptKeys{BlockSize: 3200, Blocks: blocks}, Report: tr.rep,
 		Observe: func() (CacheObservation, bool) {
 			tr.mu.Lock()
 			defer tr.mu.Unlock()
@@ -299,8 +303,7 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 // A request whose prefix the mirror reports cached costs less and goes first.
 func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
-	m := kvmirror.New()
-	q.SetMirror(m)
+	m := q.mirror
 	m.SetConnected(true)
 	prompt := make([]int64, 3200*30+10)
 	for i := range prompt {
@@ -317,7 +320,7 @@ func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	m.Apply(-1, evs)
 	keys := kvmirror.PromptBlockKeys(prompt, 3200)
 	// 30 contiguous blocks, minus the speculative-decoding drop.
-	if got := m.CachedBlockKeys(keys); got != 92800 {
+	if got := m.Cached(kvmirror.PromptKeys{BlockSize: 3200, Blocks: keys}); got != 92800 {
 		t.Fatalf("mirror says %d cached, want 92800", got)
 	}
 
@@ -344,8 +347,8 @@ func TestShippedConfigValidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.yaml: %v", err)
 	}
-	if !cfg.Admission.Cache.enabled() {
-		t.Fatal("shipped config has cache admission off")
+	if cfg.Admission.Cache.KVEventsEndpoint == "" {
+		t.Fatal("shipped config has no kv_events_endpoint")
 	}
 }
 
@@ -460,7 +463,7 @@ func TestCacheAdmissionTinyRequestBesideProtectedHolds(t *testing.T) {
 func TestCacheAdmissionPriorityDisplacesBestFit(t *testing.T) {
 	// 200 blocks: big and small leave holds of 63 and 18, busy runs 59, so the claw
 	// (61) does not fit in the 59-60 left without displacing one.
-	q, _ := newCacheQueue(t, func(c *AdmissionConfig) { c.Cache.Tokens = 640000 })
+	q, _ := newCacheQueuePool(t, 640000, nil)
 	big := q.start("big", 10, 200000)
 	rbig := mustAdmit(t, big, "big")
 	small := q.start("small", 10, 57600)
@@ -478,18 +481,18 @@ func TestCacheAdmissionPriorityDisplacesBestFit(t *testing.T) {
 func TestParseEnginePool(t *testing.T) {
 	m := "# HELP x\nvllm:num_requests_running{engine=\"0\"} 0.0\n" +
 		`vllm:cache_config_info{_block_size_resolved="True",block_size="3200",mamba_block_size="16",num_gpu_blocks="201",num_gpu_blocks_override="None",prefix_match_unit="64"} 1.0` + "\n"
-	b, s, u, err := parseEnginePool(strings.NewReader(m))
-	if err != nil || b != 201 || s != 3200 || u != 64 {
-		t.Fatalf("got %d x %d unit %d, %v", b, s, u, err)
+	b, s, err := parseEnginePool(strings.NewReader(m))
+	if err != nil || b != 201 || s != 3200 {
+		t.Fatalf("got %d x %d, %v", b, s, err)
 	}
-	if _, _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
+	if _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
 		t.Fatal("want an error without cache_config_info")
 	}
-	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{Enabled: true}})
+	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8})
 	if q.budget() != 0 {
 		t.Fatal("pool should be unknown before SetPool")
 	}
-	q.SetPool(201, 3200, 64)
+	q.SetPool(201, 3200)
 	if q.budget() != 640000 {
 		t.Fatalf("budget %d, want 200 blocks x 3200", q.budget())
 	}
@@ -527,12 +530,12 @@ func TestCacheAdmissionLiveCharge(t *testing.T) {
 	q, _ := newCacheQueue(t, func(c *AdmissionConfig) {
 		c.Cache.PrefillOverheadBlocks, c.Cache.DecodeOverheadBlocks = intPtr(28), intPtr(20)
 	})
-	gen := &atomic.Int64{}
+	gen := q.NewOutputCounter()
 	q.mu.Lock()
 	w := &admissionWaiter{prompt: 100000, expOut: 4000, gen: gen}
 	q.running[w] = struct{}{}
 	base := q.runningLocked()
-	gen.Store(20000)
+	gen.Usage(20000)
 	grown := q.runningLocked()
 	q.mu.Unlock()
 	if base != (33+28)*3200 || grown != (38+20)*3200 {
@@ -619,9 +622,6 @@ func TestCacheAdmissionTierOrder(t *testing.T) {
 	cold := q.start("cold", 0, 100000)
 	clk.add(time.Minute)
 	small := q.start("small", 0, 5000)
-	q.mu.Lock()
-	q.mirror = nil
-	q.mu.Unlock()
 	ta.finish(ra, 100000, 1000)
 	mustAdmit(t, small, "small ahead of an older cold waiter")
 	mustWait(t, cold, "cold behind small")
@@ -648,5 +648,190 @@ func TestAcquireWithoutSession(t *testing.T) {
 			t.Fatalf("acquire %d refused", i)
 		}
 		rel()
+	}
+}
+
+// storePrompt announces a prompt's full blocks to the mirror, as one attention group.
+func storePrompt(m *kvmirror.Mirror, seq int64, prompt []int64, firstHash uint64) {
+	g := 5
+	var evs []kvmirror.Event
+	var parent any
+	for i := 0; (i+1)*3200 <= len(prompt); i++ {
+		h := firstHash + uint64(i)
+		evs = append(evs, kvmirror.Event{Type: "BlockStored", BlockHashes: []any{h}, ParentBlockHash: parent,
+			TokenIDs: prompt[i*3200 : (i+1)*3200], BlockSize: 3200, GroupIdx: &g, Kind: "full_attention"})
+		parent = h
+	}
+	m.Apply(seq, evs)
+}
+
+func testPrompt(blocks int, salt int64) []int64 {
+	p := make([]int64, 3200*blocks+1)
+	for i := range p {
+		p[i] = int64(i%5000) + 1 + salt*100000
+	}
+	return p
+}
+
+// A hold is judged against the mirror whenever the mirror is healthy, including after an
+// engine restart or a resubscribe rebuilt it: there is no exemption for holds seen
+// before (reviews cv-51 MED-3, cv-52 #11, cv-60 F4). A hold made while the mirror was
+// resyncing is judged once it is healthy again.
+func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	m := q.mirror
+	m.SetConnected(true)
+	prompt := testPrompt(20, 0)
+	storePrompt(m, 1, prompt, 1)
+	tr := q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
+	q.tick()
+	if r := q.Residency(); r.HeldTokens == 0 {
+		t.Fatal("no hold after the turn")
+	}
+	m.Apply(2, nil)
+	m.Apply(0, nil) // the engine restarted: the mirror starts over
+	q.tick()
+	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 1 {
+		t.Fatalf("hold survived an engine restart: %+v", r)
+	}
+
+	// A hold made while the mirror is resyncing is judged once it is healthy.
+	m.SetConnected(false)
+	storePrompt(m, 1, prompt, 1)
+	tr = q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
+	q.tick()
+	m.SetConnected(true)
+	q.tick()
+	g := 5
+	var rm []any
+	for i := 0; i < 20; i++ {
+		rm = append(rm, uint64(i+1))
+	}
+	m.Apply(2, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: rm, GroupIdx: &g}})
+	q.tick()
+	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 2 {
+		t.Fatalf("evicted hold kept: %+v", r)
+	}
+}
+
+// Streamed output is counted from the stream's per-chunk usage when it has one, else as
+// tokens_per_chunk per choice chunk (default 1): a fixed 4 per chunk over-charged every
+// engine without speculative decoding fourfold (reviews cv-51 HIGH-3, cv-54 #6).
+func TestOutputCounter(t *testing.T) {
+	chunk := "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
+	for _, c := range []struct {
+		name     string
+		perChunk int
+		stream   string
+		want     int64
+	}{
+		{"default", 0, strings.Repeat(chunk, 3), 3},
+		{"mtp", 4, strings.Repeat(chunk, 3), 12},
+		{"continuous usage", 4, "data: {\"choices\":[{\"delta\":{\"content\":\"ab\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"cde\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5,\"total_tokens\":14}}\n\n", 5},
+		{"final usage", 4, strings.Repeat(chunk, 3) +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3,\"total_tokens\":12}}\n\ndata: [DONE]\n\n", 3},
+	} {
+		q, _ := newCacheQueue(t, func(a *AdmissionConfig) { a.Cache.TokensPerChunk = c.perChunk })
+		gen := q.NewOutputCounter()
+		s := &usageScanner{chunks: gen}
+		s.Write([]byte(c.stream))
+		if got := gen.Load(); got != c.want {
+			t.Errorf("%s: counted %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// A turn that ends without usage (client gone, upstream error) keeps the hold the previous
+// turn left: its prefix is what a retry resends (review cv-51 MED-4). One that streamed
+// output before it ended is held at the prompt size the proxy measured (review cv-54 #2).
+func TestCacheAdmissionAbortedTurnKeepsHold(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	t1 := q.start("s", 0, 200000)
+	t1.finish(mustAdmit(t, t1, "turn 1"), 200000, 3000)
+	before := q.Residency().HeldTokens
+	if before == 0 {
+		t.Fatal("turn 1 left no hold")
+	}
+	t2 := q.start("s", 0, 203000)
+	mustAdmit(t, t2, "turn 2")() // released without usage
+	if got := q.Residency().HeldTokens; got != before {
+		t.Fatalf("held %d after an aborted turn, want the previous %d", got, before)
+	}
+
+	gen := q.NewOutputCounter()
+	done := make(chan func())
+	go func() {
+		rel, _, _, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "t", PromptTokens: 100000, Generated: gen})
+		done <- rel
+	}()
+	rel := <-done
+	gen.Chunk()
+	rel() // the client left mid-stream: no usage, but output streamed
+	if h := q.sessions["t"].held; h != 32*3200 {
+		t.Fatalf("held %d, want the measured prompt in whole blocks", h)
+	}
+}
+
+// A session's hold has the priority of the request that left it, not of the last one
+// admitted: a deferred side call does not make the conversation displaceable by everyone
+// (review cv-51 MED-6).
+func TestCacheAdmissionHoldPriorityFromItsTurn(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	ta := q.start("a", 0, 10000)
+	ra := mustAdmit(t, ta, "a")
+	mustAdmit(t, q.start("b", 0, 300000), "b keeps the engine busy")
+	side := q.start("a", 100, 3000)
+	rs := mustAdmit(t, side, "deferred side call")
+	ta.finish(ra, 10000, 500)
+	side.finish(rs, 3000, 50)
+	if p := q.sessions["a"].priority; p != 0 {
+		t.Fatalf("hold priority %d, want the main turn's 0", p)
+	}
+	mustWait(t, q.start("c", 0, 220000), "c may not displace a's firm hold")
+}
+
+// A full session table forgets idle sessions that hold nothing first, never a session
+// with queued requests, and accounts for any hold it forgets (reviews cv-51 MED-12,
+// cv-53 #8, cv-58 #15). It prunes below the cap, so it does not rescan per new session.
+func TestCacheAdmissionSessionCapSparesHolds(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := clk.now()
+	holder := q.session("holder", now.Add(-time.Hour))
+	holder.held = 201600
+	waiter := q.session("waiter", now.Add(-2*time.Hour))
+	waiter.waiting = 1
+	for i := 0; len(q.sessions) < sessionCap; i++ {
+		q.sessions[fmt.Sprintf("k%05d", i)] = &cacheSession{lastSeen: now.Add(time.Duration(i) * time.Millisecond)}
+	}
+	q.session("newcomer", now)
+	if _, ok := q.sessions["holder"]; !ok {
+		t.Fatal("forgot a hold while idle sessions holding nothing remained")
+	}
+	if _, ok := q.sessions["waiter"]; !ok {
+		t.Fatal("forgot a session with a queued request")
+	}
+	if n := len(q.sessions); n > sessionCap-sessionCap/16+1 {
+		t.Fatalf("%d sessions after pruning", n)
+	}
+	// With only holders left to forget, the forgotten hold counts as displaced.
+	for k, s := range q.sessions {
+		if k != "waiter" && k != "holder" {
+			s.held = 3200
+		}
+	}
+	for i := 0; len(q.sessions) < sessionCap; i++ {
+		q.sessions[fmt.Sprintf("m%05d", i)] = &cacheSession{lastSeen: now, held: 3200}
+	}
+	q.session("newcomer2", now)
+	if q.displaced == 0 {
+		t.Fatal("forgotten holds not accounted")
+	}
+	if _, ok := q.sessions["waiter"]; !ok {
+		t.Fatal("forgot a session with a queued request")
 	}
 }

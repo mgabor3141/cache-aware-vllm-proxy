@@ -16,7 +16,7 @@ func loadYAML(t *testing.T, yaml string) (*Config, error) {
 	return LoadConfig(f)
 }
 
-const minimalYAML = "upstream: http://x\nauth:\n  mode: none\n"
+const minimalYAML = "upstream: http://x\nauth:\n  mode: none\nadmission:\n  cache:\n    kv_events_endpoint: tcp://vllm:5557\n"
 
 // The example config must load: it is what new users start from.
 func TestShippedConfigParses(t *testing.T) {
@@ -76,6 +76,8 @@ func TestEnvExpansionIsValueOnly(t *testing.T) {
 	cfg, err := loadYAML(t, `upstream: http://x
 admission:
   max_active: ${MAX_ACTIVE}
+  cache:
+    kv_events_endpoint: tcp://vllm:5557
 auth:
   mode: static
   keys:
@@ -100,7 +102,7 @@ auth:
 		t.Fatalf("max_active %d", cfg.Admission.MaxActive)
 	}
 	// An unset variable is empty, which validation then refuses where it matters.
-	if _, err := loadYAML(t, "upstream: http://x\nauth:\n  mode: static\n  keys:\n    - key: ${CAVP_UNSET_FOR_TEST}\n      user: u\n"); err == nil {
+	if _, err := loadYAML(t, "upstream: http://x\nauth:\n  mode: static\n  keys:\n    - key: ${CAVP_UNSET_FOR_TEST}\n      user: u\nadmission:\n  cache:\n    kv_events_endpoint: tcp://vllm:5557\n"); err == nil {
 		t.Fatal("empty key accepted")
 	}
 }
@@ -115,8 +117,15 @@ func TestCacheConfigValidation(t *testing.T) {
 		{"    prefill_overhead_blocks: 0\n", "", 0},
 		{"    prefill_overhead_blocks: -1\n", "prefill_overhead_blocks", 0},
 		{"    decode_interference: 1.5\n", "decode_interference", 0},
+		{"    enabled: true\n", "enabled", 0}, // cache admission is always on
+		{"    kv_events_endpoint: \"\"\n", "kv_events_endpoint is required", 0},
+		{"    kv_events_endpoint: tcp://vllm\n", "host:port", 0},
 	} {
-		cfg, err := loadYAML(t, minimalYAML+"admission:\n  cache:\n    enabled: true\n"+c.yaml)
+		ep := "    kv_events_endpoint: tcp://vllm:5557\n"
+		if strings.Contains(c.yaml, "kv_events_endpoint") {
+			ep = ""
+		}
+		cfg, err := loadYAML(t, "upstream: http://x\nauth:\n  mode: none\nadmission:\n  cache:\n"+ep+c.yaml)
 		if c.bad != "" {
 			if err == nil || !strings.Contains(err.Error(), c.bad) {
 				t.Errorf("%q: err %v, want one naming %s", c.yaml, err, c.bad)

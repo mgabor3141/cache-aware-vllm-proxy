@@ -24,7 +24,9 @@ func tokenizeProxy(t *testing.T, tokenize http.HandlerFunc) (*Proxy, *atomic.Val
 		tokenize(w, r)
 	}))
 	u, _ := url.Parse(up.URL)
-	return &Proxy{upstream: u, tokenizeClient: &http.Client{}, tokenizeSem: make(chan struct{}, 4)}, seen
+	q := NewAdmissionQueue(AdmissionConfig{Cache: CacheConfig{KVEventsEndpoint: "tcp://127.0.0.1:1"}})
+	q.SetPool(1000, 4)
+	return &Proxy{upstream: u, admission: q, tokenizeClient: &http.Client{}, tokenizeSem: make(chan struct{}, 4)}, seen
 }
 
 // parsedEvent runs a body through the same parsing serveInference does.
@@ -64,9 +66,9 @@ func TestAdmissionRequestTokenizesWithTemplateKwargs(t *testing.T) {
 	if ev.body != nil {
 		t.Error("body kept after tokenizing")
 	}
-	// Without a mirror nothing can read block keys, so none are built (cv-57 #5).
-	if len(ar.Blocks.Blocks) != 0 {
-		t.Errorf("%d block keys built without a mirror", len(ar.Blocks.Blocks))
+	// Keys are built at the engine's block size (4 here), never one per token (cv-57 #5).
+	if ar.Blocks.BlockSize != 4 || len(ar.Blocks.Blocks) != 2 {
+		t.Errorf("keys %+v, want 2 blocks of 4", ar.Blocks)
 	}
 }
 

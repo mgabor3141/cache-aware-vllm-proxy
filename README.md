@@ -41,6 +41,11 @@ cp config.example.yaml config.yaml   # set upstream and kv_events_endpoint
 go run ./cmd/cavp -config config.yaml
 ```
 
+The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
+engine's cache from the replay whenever it (re)subscribes, and treats every prompt as uncached
+until that replay completes. Requests wait until the engine's metrics have been read once (that
+is where the KV pool size comes from).
+
 Clients need no changes: a conversation is identified by its first two messages.
 
 ## Requests
@@ -109,6 +114,10 @@ admission:
     decode_overhead_blocks: 10    # while it decodes
 ```
 
+Output is charged as it streams: from the stream's own token counts when it reports usage on
+every chunk, else as `tokens_per_chunk` tokens per chunk (default 1; with speculative decoding
+set 1 plus the draft length, e.g. 4 for MTP with 3 draft tokens).
+
 ### Measuring it
 
 ```sh
@@ -119,7 +128,9 @@ This sends 1, 2 and 4 concurrent requests straight to the engine and reads its K
 prints the two values with a margin of 2 blocks. It needs the engine to itself: stop the proxy
 (its guard would also react to the calibration traffic) and run it when nothing else reaches the
 engine, ideally right after the engine starts. A round aborts rather than report a
-wrong figure if other requests run or the engine frees pinned blocks during it. Rerun it when
+wrong figure if other requests run or the engine frees pinned blocks during it, and calibration
+refuses an engine it cannot check: a data-parallel one (more than one series per gauge), metrics
+without the KV usage, running or waiting gauge, or a usage gauge that never moved. Rerun it when
 the model or the engine changes. It sends `VLLM_API_KEY` if set; the proxy itself sends no key.
 
 Its prompts span two blocks (at most 16K tokens), and the prefill figure comes from a single
@@ -134,22 +145,19 @@ runs, and it does not export how much of that is pinned.
 ### The overcommit guard
 
 The guard is a safety net for a configured figure that is too low, or for anything else that
-makes the engine hold more than admission expected. Two signals raise a margin that is added to
-every running request's overhead:
+makes the engine hold more than admission expected. Its one signal is the engine preempting a
+request (`vllm:num_preemptions_total` rising, per series). Each preemption raises a margin that
+is added to the overhead of every running and waiting request, by 2 blocks, at most once a
+minute and up to 32 blocks. After 15 minutes without a signal the margin falls by one step, back
+to zero. Every change is logged (`overcommit guard raised the margin`, with its reason), and so
+is an engine whose metrics have no preemption counter.
 
-- **early:** the engine evicted a cached context the proxy was still protecting (seen through
-  KV events) while the proxy's accounting was near its budget. Evictions with plenty of room
-  left are the engine's own policy (it may keep only so many finished turns) and do not count;
-- **late:** the engine preempted a request.
+Not signals: the engine evicting a context the proxy was holding (it drops cached prefixes for
+its own reasons too; the hold is simply released), and the engine's waiting queue: vLLM counts
+every request it has not scheduled yet, including one admitted a moment ago and one waiting
+behind another's prefill for the step's token budget, so it is non-zero in normal operation.
 
-Each raises the margin by 2 blocks, at most once a minute and up to 32 blocks. After 15
-minutes without a signal the margin falls by one step, back to zero. Every change is logged
-(`overcommit guard raised the margin`, with its reason), and `/metrics` shows
-`cavp_guard_margin_blocks` and `cavp_guard_raises_total`.
-
-The engine's waiting queue is deliberately not a signal: vLLM counts every request it has not
-scheduled yet, including one admitted a moment ago and one waiting behind another's prefill
-for the step's token budget, so it is non-zero in normal operation.
+`/metrics` shows `cavp_guard_margin_blocks` and `cavp_guard_raises_total`.
 
 The guard cannot tell a low overhead from other causes: a request that outruns its expected
 output, or traffic that reaches the engine without going through the proxy, look the same. If

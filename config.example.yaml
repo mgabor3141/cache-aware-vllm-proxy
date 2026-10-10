@@ -35,13 +35,13 @@ admission:
   max_active: 8
 
   cache:
-    # Cache-aware admission: admit only what fits the engine's KV pool, keep returning
-    # conversations' contexts resident, run mostly-cached work first. Off: max_active only.
-    enabled: true
+    # Admission is cache-aware: it admits only what fits the engine's KV pool (read from
+    # its /metrics; until then requests wait), keeps returning conversations' contexts
+    # resident, and runs mostly-cached work first.
 
-    # vLLM's KV cache event stream (--kv-events-config, ZMQ publisher). The replay socket
-    # is expected on the next port. Without it the proxy cannot see what is cached and
-    # treats every prompt as cold.
+    # vLLM's KV cache event stream (--kv-events-config, ZMQ publisher). Required. The
+    # replay socket (replay_endpoint) is expected on the next port: the mirror of the
+    # engine's cache is rebuilt from it on every (re)subscribe.
     kv_events_endpoint: "tcp://vllm:5557"
 
     # Prefill speed of your engine in tokens per second. With decode_interference (how
@@ -53,6 +53,11 @@ admission:
     # Output tokens reserved for a request until its conversation has history (then
     # its 75th percentile); output beyond the reserve is charged as it streams.
     default_output_tokens: 2048
+
+    # Output tokens a streamed chunk counts as, when the stream does not report usage per
+    # chunk: 1 without speculative decoding, 1 plus the draft length with it (4 for MTP
+    # with 3 draft tokens). Over-counting only wastes room; under-counting overcommits.
+    tokens_per_chunk: 1
 
     # KV blocks each running request holds beyond its prompt and output (recurrent
     # state, speculative and checkpoint blocks), while prefilling and while decoding.

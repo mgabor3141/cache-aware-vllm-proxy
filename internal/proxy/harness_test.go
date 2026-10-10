@@ -92,7 +92,7 @@ func newHarnessEngine(t *testing.T, engine http.Handler, mutate func(*Config)) *
 	cfg := &Config{
 		Upstream:  eng.URL,
 		Auth:      auth.Config{Mode: "static", Keys: []auth.StaticKey{{Key: testKey, User: "alice"}}},
-		Admission: AdmissionConfig{MaxActive: 2},
+		Admission: AdmissionConfig{MaxActive: 2, Cache: CacheConfig{KVEventsEndpoint: "tcp://127.0.0.1:1"}},
 	}
 	if mutate != nil {
 		mutate(cfg)
@@ -106,6 +106,7 @@ func newHarnessEngine(t *testing.T, engine http.Handler, mutate func(*Config)) *
 		t.Fatal(err)
 	}
 	p.ready.set(true, "")
+	p.admission.SetPool(1000, 16) // as the engine pool loop would; until then nothing is admitted
 	srv := httptest.NewServer(p)
 	t.Cleanup(srv.Close)
 	return &harness{t: t, p: p, srv: srv, eng: eng, logs: logs}

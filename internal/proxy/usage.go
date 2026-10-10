@@ -15,7 +15,6 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
-	"sync/atomic"
 )
 
 // maxUsageBodyBytes bounds the copy of a non-streaming response kept to read its
@@ -70,11 +69,11 @@ func parseResponseUsage(body []byte) (tokenUsage, bool) {
 // from the stream): no usage or [DONE] line is anywhere near this long.
 const maxSSELine = 1 << 20
 
-// usageScanner watches a passing SSE stream: it counts output chunks (live output for
-// admission), keeps the last usage object and notes the [DONE] marker. Used by the one
+// usageScanner watches a passing SSE stream: it counts output (live output for
+// admission: a chunk's usage when the stream reports it per chunk, else per choice chunk), keeps the last usage object and notes the [DONE] marker. Used by the one
 // goroutine that copies the stream.
 type usageScanner struct {
-	chunks  *atomic.Int64 // when set, grows by tokensPerChunk per choice chunk
+	chunks  *OutputCounter // when set, counts the output so far
 	pending []byte
 	skip    bool // pending is the tail of an over-long line
 	usage   tokenUsage
@@ -125,11 +124,15 @@ func (s *usageScanner) scanLine(line []byte) {
 	if json.Unmarshal(payload, &chunk) != nil {
 		return
 	}
-	if s.chunks != nil && len(chunk.Choices) > 0 {
-		s.chunks.Add(tokensPerChunk)
-	}
 	if u, ok := chunk.Usage.decoded(); ok {
 		s.usage, s.found = u, true
+		if s.chunks != nil && u.Completion > 0 {
+			s.chunks.Usage(int64(u.Completion))
+			return
+		}
+	}
+	if s.chunks != nil && len(chunk.Choices) > 0 {
+		s.chunks.Chunk()
 	}
 }
 

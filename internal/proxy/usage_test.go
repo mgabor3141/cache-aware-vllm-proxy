@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/json"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
@@ -47,20 +46,24 @@ func TestUsageDetailsSeparateMissFromBlindSpot(t *testing.T) {
 }
 
 func TestUsageScanner(t *testing.T) {
-	var chunks atomic.Int64
-	s := &usageScanner{chunks: &chunks}
+	chunks := (&AdmissionQueue{cfg: AdmissionConfig{Cache: CacheConfig{TokensPerChunk: 4}}}).NewOutputCounter()
+	s := &usageScanner{chunks: chunks}
 	stream := sseChunk + ": keepalive\n\n" +
 		// Spacing must not matter for chunk counting (cv-59 #13).
-		`data: { "choices" : [ {"index":0,"delta":{"content":"y"}} ], "usage": null }` + "\n\n" +
-		sseUsage + sseDone
+		`data: { "choices" : [ {"index":0,"delta":{"content":"y"}} ], "usage": null }` + "\n\n"
 	// Byte by byte: lines split across writes.
 	for i := 0; i < len(stream); i++ {
 		s.Write([]byte{stream[i]})
 	}
+	if chunks.Load() != 8 {
+		t.Fatalf("two choice chunks counted %d, want 2x4", chunks.Load())
+	}
+	s.Write([]byte(sseUsage + sseDone))
 	if !s.found || s.usage.Prompt != 40 || s.usage.Cached != 32 || !s.done {
 		t.Fatalf("%+v", s)
 	}
-	if chunks.Load() != 2*tokensPerChunk {
+	// A usage chunk replaces the estimate with the engine's count.
+	if chunks.Load() != 2 {
 		t.Fatalf("counted %d", chunks.Load())
 	}
 }

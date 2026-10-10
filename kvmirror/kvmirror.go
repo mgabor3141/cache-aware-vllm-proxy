@@ -15,7 +15,8 @@
 // hash is mapped to a key through blocks the mirror has already seen; a block whose
 // parent is unknown (stored before the proxy subscribed) is skipped, which only makes the
 // mirror under-report hits. Blocks with extra_keys (images, LoRA, cache salt) hash with
-// those keys too, so token IDs alone never match them.
+// those keys too, so token IDs alone never match them. Only full blocks are tracked: a
+// prompt's keys are built at one block size and match only blocks stored at that size.
 //
 // Hybrid models (measured on Qwen3.8 Flash-Next, 2026-10-07): attention groups store a block as soon
 // as it is prefilled; each recurrent (mamba) group keeps a state checkpoint at about one
@@ -23,15 +24,6 @@
 // find_longest_cache_hit) takes the contiguous attention blocks, drops the last one when
 // speculative decoding is on (the EAGLE drop; MTP flags every group), then
 // the newest block at or below that where every mamba group holds a checkpoint.
-//
-// Fine-grained hits (--prefix-match-unit, 2026-10-08): the engine also hashes every
-// unit-token span (64) and, at each prompt's tail, stores a recurrent checkpoint ending at
-// position p (event block_size = unit) plus an attention entry for the span [p, p+unit)
-// whose parent is that checkpoint. Their own parents are spans the engine never
-// announces, so they cannot be chained: the mirror indexes them by the hash of their own
-// tokens instead. A prompt hits at p when every full block before p's block is cached,
-// a checkpoint entry matches its tokens [p-unit, p), and an attention entry matching
-// [p, p+unit) names that checkpoint as its parent (the last-span drop leaves p).
 package kvmirror
 
 import (
@@ -62,90 +54,57 @@ type mirrorBlock struct {
 
 type Mirror struct {
 	mu        sync.Mutex
-	blockSize int
+	blockSize int                     // set by SetBlockSize, else learned from the first stored block
 	byEngine  map[uint64]*mirrorBlock // engine block hash -> block
 	byKey     map[BlockKey]*mirrorBlock
 	attnMask  uint64 // groups that are attention (need a contiguous prefix)
 	mambaMask uint64 // groups that are recurrent state (need the hit block only)
 	lastSeq   int64
-	lastEvent time.Time
-	connected bool
+	// After a replay, live delivery repeats the batches the replay already applied, once
+	// and in order: up to replayedTo, each above liveSeq, is a duplicate. Any other
+	// sequence at or below lastSeq means the engine restarted.
+	replayedTo, liveSeq int64
+	lastEvent           time.Time
+	connected           bool
 	// dropLast applies the EAGLE last-block drop (speculative decoding on).
 	dropLast bool
 	stats    Stats
-
-	// epoch counts subscriptions; state seen under an older one may be missing now
-	// without having been evicted (the replay window is finite).
-	epoch uint64
-
-	unit          int // prefix-match unit; < blockSize when fine-grained hits are on
-	fineByEngine  map[uint64]*fineEntry
-	fineByContent map[uint64][]*fineEntry
 }
 
-// fineEntry is one announced unit-sized span: a tail checkpoint or the attention span
-// after it.
-type fineEntry struct {
-	engine, parent uint64
-	content        uint64 // unitHash of its tokens
-	groups         uint64
-	copies         map[uint]int32
-}
-
-// PromptKeys are a prompt's precomputed mirror keys: chained full-block keys, and the
-// content hash of every full unit-token span.
+// PromptKeys are a prompt's mirror keys: one chained key per full block, at the block
+// size they were built with. Keys built at another size than the mirror's match nothing.
 type PromptKeys struct {
-	Blocks []BlockKey
-	Units  []uint64
-	Unit   int
+	BlockSize int
+	Blocks    []BlockKey
 }
 
-func (k PromptKeys) Empty() bool { return len(k.Blocks) == 0 && len(k.Units) == 0 }
+func (k PromptKeys) Empty() bool { return len(k.Blocks) == 0 }
 
-func unitHash(tokens []int64) uint64 {
-	h := sha256.New()
-	var b [8]byte
-	for _, t := range tokens {
-		binary.LittleEndian.PutUint64(b[:], uint64(t))
-		h.Write(b[:])
-	}
-	return binary.LittleEndian.Uint64(h.Sum(nil))
-}
-
-// NewPromptKeys computes a prompt's keys for the current geometry.
+// NewPromptKeys computes a prompt's keys at the mirror's block size (none while it is
+// unknown).
 func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
-	m.mu.Lock()
-	bs, unit := m.blockSize, m.unit
-	m.mu.Unlock()
-	k := PromptKeys{Blocks: PromptBlockKeys(prompt, bs)}
-	if unit > 0 && unit < bs {
-		k.Unit = unit
-		k.Units = make([]uint64, len(prompt)/unit)
-		for i := range k.Units {
-			k.Units[i] = unitHash(prompt[i*unit : (i+1)*unit])
-		}
-	}
-	return k
+	bs := m.BlockSize()
+	return PromptKeys{BlockSize: bs, Blocks: PromptBlockKeys(prompt, bs)}
 }
 
-// SetGeometry presets the block size and prefix-match unit (from the engine's metrics),
-// so events are classified correctly from the first one.
-func (m *Mirror) SetGeometry(blockSize, unit int) {
+// SetBlockSize sets the engine's block size (from its metrics), so prompt keys are built
+// at the right size before the first event shows it.
+func (m *Mirror) SetBlockSize(blockSize int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.blockSize = max(m.blockSize, blockSize)
-	if unit > 0 {
-		m.unit = unit
+	if blockSize > 0 {
+		m.blockSize = blockSize
 	}
 }
 
 type Stats struct {
-	Stored, Removed, Cleared, SkippedOrphan, SkippedEmpty, Batches, SeqGaps uint64
+	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps uint64
 }
 
 func New() *Mirror {
-	return &Mirror{byEngine: map[uint64]*mirrorBlock{}, byKey: map[BlockKey]*mirrorBlock{}, lastSeq: -1, dropLast: true,
-		fineByEngine: map[uint64]*fineEntry{}, fineByContent: map[uint64][]*fineEntry{}}
+	m := &Mirror{dropLast: true}
+	m.resetLocked()
+	return m
 }
 
 // errSeqGap ends a subscription so it restarts with a replay.
@@ -228,19 +187,25 @@ func decodeBatch(payload []byte) ([]Event, error) {
 	return events, nil
 }
 
-// Apply ingests one batch. seq is the publisher's sequence number (-1: unknown). A
-// batch already applied (replay overlapping live delivery) is skipped; a much lower
-// number means the engine restarted, so the mirror starts over. It returns false on a
+// Apply ingests one batch. seq is the publisher's sequence number (-1: unknown). Live
+// delivery repeating what a replay applied is skipped; any other sequence that goes
+// backwards means the engine restarted, so the mirror starts over. It returns false on a
 // gap: batches were lost and the mirror can no longer be trusted until it resyncs.
 func (m *Mirror) Apply(seq int64, events []Event) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if seq >= 0 && m.lastSeq >= 0 {
+		if seq <= m.replayedTo && seq > m.liveSeq {
+			m.liveSeq = seq
+			m.stats.Duplicates++
+			return true
+		}
+		m.replayedTo = -1
 		switch {
-		case seq <= m.lastSeq && m.lastSeq-seq < replayOverlap:
-			return true // duplicate
 		case seq <= m.lastSeq:
-			m.clearLocked() // engine restarted
+			log.Printf("level=warn msg=\"kv events sequence went back: engine restarted, mirror cleared\" seq=%d last=%d", seq, m.lastSeq)
+			m.resetLocked()
+			m.stats.Restarts++
 		case seq > m.lastSeq+1:
 			m.stats.SeqGaps++
 			m.lastSeq = seq
@@ -258,16 +223,13 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 	return true
 }
 
-// replayOverlap bounds how far behind the last applied sequence a batch may be and still
-// count as a duplicate rather than an engine restart.
-const replayOverlap = 4096
-
-func (m *Mirror) clearLocked() {
+// resetLocked forgets every block and what the groups are (a restarted engine may serve
+// another model); the block size set from metrics stays.
+func (m *Mirror) resetLocked() {
 	m.byEngine = map[uint64]*mirrorBlock{}
 	m.byKey = map[BlockKey]*mirrorBlock{}
-	m.fineByEngine = map[uint64]*fineEntry{}
-	m.fineByContent = map[uint64][]*fineEntry{}
-	m.stats.Cleared++
+	m.attnMask, m.mambaMask = 0, 0
+	m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1
 }
 
 func (m *Mirror) applyLocked(e *Event) {
@@ -276,33 +238,28 @@ func (m *Mirror) applyLocked(e *Event) {
 	}
 	switch e.Type {
 	case "AllBlocksCleared":
-		m.clearLocked()
+		m.byEngine = map[uint64]*mirrorBlock{}
+		m.byKey = map[BlockKey]*mirrorBlock{}
+		m.stats.Cleared++
 	case "BlockRemoved":
 		if e.GroupIdx == nil {
 			return
 		}
-		bit := uint64(1) << uint(*e.GroupIdx)
+		g := uint(*e.GroupIdx)
 		for _, h := range e.BlockHashes {
 			u, ok := hashToUint(h)
-			if !ok {
-				continue
-			}
 			b := m.byEngine[u]
-			if b == nil {
-				m.removeFineLocked(u, uint(*e.GroupIdx))
+			if !ok || b == nil {
 				continue
 			}
-			g := uint(*e.GroupIdx)
+			m.stats.Removed++
 			if b.copies[g] > 1 {
 				b.copies[g]--
-				m.stats.Removed++
 				continue
 			}
 			delete(b.copies, g)
-			b.groups &^= bit
-			m.stats.Removed++
+			b.groups &^= 1 << g
 			if b.groups == 0 {
-
 				delete(m.byEngine, u)
 				if m.byKey[b.key] == b {
 					delete(m.byKey, b.key)
@@ -320,13 +277,11 @@ func (m *Mirror) applyLocked(e *Event) {
 		} else {
 			m.attnMask |= bit
 		}
-		m.blockSize = max(m.blockSize, e.BlockSize)
+		if m.blockSize == 0 {
+			m.blockSize = e.BlockSize
+		}
 		if len(e.BlockHashes) == 0 {
 			m.stats.SkippedEmpty++
-			return
-		}
-		if e.BlockSize < m.blockSize {
-			m.storeFineLocked(e, g, bit)
 			return
 		}
 		parent := rootKey
@@ -334,6 +289,8 @@ func (m *Mirror) applyLocked(e *Event) {
 			pu, ok := hashToUint(e.ParentBlockHash)
 			pb := m.byEngine[pu]
 			if !ok || pb == nil {
+				// The rest of this event chains from the unknown parent; the batch's other
+				// events are applied as usual.
 				m.stats.SkippedOrphan++
 				return
 			}
@@ -341,8 +298,7 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		bs := e.BlockSize
 		for i, h := range e.BlockHashes {
-			u, ok := hashToUint(h)
-			if !ok || (i+1)*bs > len(e.TokenIDs) {
+			if (i+1)*bs > len(e.TokenIDs) {
 				return
 			}
 			var extra []byte
@@ -350,23 +306,20 @@ func (m *Mirror) applyLocked(e *Event) {
 				extra, _ = msgpack.Marshal(e.ExtraKeys[i])
 			}
 			key := chainKey(parent, e.TokenIDs[i*bs:(i+1)*bs], extra)
-			b := m.byEngine[u]
+			parent = key
+			u, ok := hashToUint(h)
+			if !ok {
+				continue // its key still chains the blocks after it
+			}
+			b := m.byKey[key]
 			if b == nil {
-				if kb := m.byKey[key]; kb != nil {
-					b = kb
-				} else {
-					b = &mirrorBlock{key: key}
-					m.byKey[key] = b
-				}
-				m.byEngine[u] = b
+				b = &mirrorBlock{key: key, copies: map[uint]int32{}}
+				m.byKey[key] = b
 			}
-			if b.copies == nil {
-				b.copies = map[uint]int32{}
-			}
+			m.byEngine[u] = b
 			b.copies[g]++
 			b.groups |= bit
 			m.stats.Stored++
-			parent = key
 		}
 	}
 }
@@ -388,16 +341,17 @@ func PromptBlockKeys(prompt []int64, blockSize int) []BlockKey {
 	return keys
 }
 
-// CachedBlockKeys is CachedTokens over precomputed keys.
-func (m *Mirror) CachedBlockKeys(keys []BlockKey) int {
+// Cached returns how many leading tokens of a prompt the engine would serve from its
+// prefix cache now.
+func (m *Mirror) Cached(k PromptKeys) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.blockSize <= 0 || m.attnMask == 0 {
+	if k.BlockSize <= 0 || k.BlockSize != m.blockSize || m.attnMask == 0 {
 		return 0
 	}
 	contiguous := 0
-	for _, k := range keys {
-		b := m.byKey[k]
+	for _, key := range k.Blocks {
+		b := m.byKey[key]
 		if b == nil || b.groups&m.attnMask != m.attnMask {
 			break
 		}
@@ -407,21 +361,14 @@ func (m *Mirror) CachedBlockKeys(keys []BlockKey) int {
 		contiguous--
 	}
 	for n := contiguous; n > 0; n-- {
-		if m.mambaMask == 0 || m.byKey[keys[n-1]].groups&m.mambaMask == m.mambaMask {
-			return n * m.blockSize
+		if m.mambaMask == 0 || m.byKey[k.Blocks[n-1]].groups&m.mambaMask == m.mambaMask {
+			return n * k.BlockSize
 		}
 	}
 	return 0
 }
 
-// Epoch identifies the current subscription.
-func (m *Mirror) Epoch() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.epoch
-}
-
-// BlockSize is the engine's block size once an event has shown it, else 0.
+// BlockSize is the engine's block size once set or shown by an event, else 0.
 func (m *Mirror) BlockSize() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -452,8 +399,8 @@ func (m *Mirror) Status() Status {
 	return s
 }
 
-// Healthy reports whether the mirror is subscribed. An idle engine sends no events, so
-// silence alone is not a failure.
+// Healthy reports whether the mirror is subscribed and its replay completed. An idle
+// engine sends no events, so silence alone is not a failure.
 func (m *Mirror) Healthy() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -469,6 +416,8 @@ func (m *Mirror) SetConnected(v bool) {
 }
 
 // Run subscribes to endpoint and applies batches until ctx ends, reconnecting on error.
+// With a replay endpoint, each subscription starts from an empty mirror rebuilt from the
+// publisher's replay buffer, and the mirror is healthy only once that replay completed.
 func (m *Mirror) Run(ctx context.Context, endpoint, replay string) {
 	for ctx.Err() == nil {
 		err := m.subscribe(ctx, endpoint, replay)
@@ -495,20 +444,22 @@ func (m *Mirror) subscribe(ctx context.Context, endpoint, replay string) error {
 		return err
 	}
 	m.mu.Lock()
-	m.clearLocked()
-	m.lastSeq = -1
-	m.epoch++
+	m.resetLocked()
 	m.mu.Unlock()
-	// Live delivery starts now; the replay buffer (the publisher's last buffer_steps
-	// batches) rebuilds what was stored before, and overlapping batches are skipped.
+	// Live delivery starts now and queues while the replay buffer (the publisher's last
+	// buffer_steps batches) rebuilds what was stored before; the queued batches the replay
+	// already covered are then skipped.
 	if replay != "" {
-		if n, err := m.replay(ctx, replay); err != nil {
-			log.Printf("level=warn msg=\"kv events replay failed\" err=%v", err)
-		} else {
-			log.Printf("level=info msg=\"kv events replayed\" batches=%d blocks=%d", n, m.Status().Blocks)
+		n, err := m.replay(ctx, replay)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
 		}
+		log.Printf("level=info msg=\"kv events replayed\" batches=%d blocks=%d", n, m.Status().Blocks)
 	}
-	m.SetConnected(true)
+	m.mu.Lock()
+	m.replayedTo, m.liveSeq = m.lastSeq, -1
+	m.connected = true
+	m.mu.Unlock()
 	log.Printf("level=info msg=\"kv events subscribed\" endpoint=%q", endpoint)
 	for {
 		msg, err := sub.Recv()
@@ -547,7 +498,8 @@ func parseFrames(frames [][]byte) (int64, []Event, bool) {
 // buffer_steps batches). The publisher's ROUTER queues at most ~1,000 messages for a
 // reader and drops the rest silently, so a replay is read in rounds: each takes the
 // batches that arrive in sequence, stops at the first gap or a quiet second, and asks
-// again from the next missing sequence, until the end-of-sequence marker (seq -1).
+// again from the next missing sequence, until the end-of-sequence marker (seq -1). A
+// replay that does not reach the marker is an error.
 func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 	total := 0
 	from := int64(0)
@@ -596,7 +548,7 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 		}
 	}()
 	next = from
-	idle := time.NewTimer(5 * time.Second) // the first batch can take a moment
+	idle := time.NewTimer(replayFirstWait)
 	defer idle.Stop()
 	for {
 		select {
@@ -644,98 +596,5 @@ func ReplayEndpoint(endpoint string) string {
 	return endpoint[:i+1] + strconv.Itoa(port+1)
 }
 
-func (m *Mirror) storeFineLocked(e *Event, g uint, bit uint64) {
-	if m.unit == 0 {
-		m.unit = e.BlockSize
-	}
-	bs := e.BlockSize
-	parent, _ := hashToUint(e.ParentBlockHash)
-	for i, h := range e.BlockHashes {
-		u, ok := hashToUint(h)
-		if !ok || (i+1)*bs > len(e.TokenIDs) {
-			return
-		}
-		if i < len(e.ExtraKeys) && e.ExtraKeys[i] != nil {
-			return // media or salt: tokens alone never match it
-		}
-		f := m.fineByEngine[u]
-		if f == nil {
-			f = &fineEntry{engine: u, parent: parent, content: unitHash(e.TokenIDs[i*bs : (i+1)*bs]), copies: map[uint]int32{}}
-			m.fineByEngine[u] = f
-			m.fineByContent[f.content] = append(m.fineByContent[f.content], f)
-		}
-		f.copies[g]++
-		f.groups |= bit
-		m.stats.Stored++
-		parent = u
-	}
-}
-
-func (m *Mirror) removeFineLocked(u uint64, g uint) {
-	f := m.fineByEngine[u]
-	if f == nil {
-		return
-	}
-	m.stats.Removed++
-	if f.copies[g] > 1 {
-		f.copies[g]--
-		return
-	}
-	delete(f.copies, g)
-	f.groups &^= 1 << g
-	if f.groups != 0 {
-		return
-	}
-	delete(m.fineByEngine, u)
-	list := m.fineByContent[f.content]
-	for i, x := range list {
-		if x == f {
-			list = append(list[:i], list[i+1:]...)
-			break
-		}
-	}
-	if len(list) == 0 {
-		delete(m.fineByContent, f.content)
-	} else {
-		m.fineByContent[f.content] = list
-	}
-}
-
-// Cached returns how many leading tokens of a prompt the engine would serve from its
-// prefix cache now: the better of the block-level and the fine-grained tail hit.
-func (m *Mirror) Cached(k PromptKeys) int {
-	base := m.CachedBlockKeys(k.Blocks)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if k.Unit == 0 || len(m.fineByEngine) == 0 || m.attnMask == 0 {
-		return base
-	}
-	full := 0 // contiguous full blocks every attention group holds
-	for _, key := range k.Blocks {
-		b := m.byKey[key]
-		if b == nil || b.groups&m.attnMask != m.attnMask {
-			break
-		}
-		full++
-	}
-	for j := len(k.Units) - 1; j >= 1; j-- {
-		p := j * k.Unit
-		if p <= base {
-			break
-		}
-		if p/m.blockSize > full {
-			continue
-		}
-		for _, ck := range m.fineByContent[k.Units[j-1]] {
-			if m.mambaMask != 0 && ck.groups&m.mambaMask != m.mambaMask {
-				continue
-			}
-			for _, at := range m.fineByContent[k.Units[j]] {
-				if at.parent == ck.engine && at.groups&m.attnMask == m.attnMask {
-					return p
-				}
-			}
-		}
-	}
-	return base
-}
+// replayFirstWait bounds the wait for a replay round's first batch.
+var replayFirstWait = 5 * time.Second

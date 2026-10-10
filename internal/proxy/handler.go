@@ -26,11 +26,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/internal/auth"
-	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
 const (
@@ -50,7 +48,6 @@ type Proxy struct {
 	logger    *EventLogger
 	auth      auth.Authenticator
 	admission *AdmissionQueue
-	mirror    *kvmirror.Mirror
 	ready     *readiness
 	metrics   requestMetrics
 
@@ -484,7 +481,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // path recorded the status and usage.
 func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event) AdmissionRequest {
 	ev.report = &AdmissionReport{}
-	ev.generated = &atomic.Int64{}
+	ev.generated = p.admission.NewOutputCounter()
 	ar := AdmissionRequest{
 		Priority: ev.Priority, Session: ev.Session, MaxTokens: ev.maxTokens,
 		Generated: ev.generated, Report: ev.report,
@@ -505,9 +502,7 @@ func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event
 	ev.TokenizeMS = time.Since(start).Milliseconds()
 	if err == nil {
 		ar.PromptTokens = len(tokens)
-		if p.mirror != nil {
-			ar.Blocks = p.mirror.NewPromptKeys(tokens)
-		}
+		ar.Blocks = p.admission.PromptKeys(tokens)
 		ev.Tokenized = true
 	} else {
 		// Never charge less than the estimate: a 4xx may be a validation failure the

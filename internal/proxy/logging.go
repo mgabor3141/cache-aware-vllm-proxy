@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"io"
 	"sync"
-	"sync/atomic"
 )
 
 // Status codes that exist only in the log: the client got no response, or not this one.
@@ -73,7 +72,7 @@ type Event struct {
 	maxTokens int
 	textBytes int64
 	body      map[string]any
-	generated *atomic.Int64 // output tokens streamed so far (an upper bound)
+	generated *OutputCounter // output tokens streamed so far
 	report    *AdmissionReport
 }
 

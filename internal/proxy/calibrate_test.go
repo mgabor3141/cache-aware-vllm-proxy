@@ -19,6 +19,11 @@ type fakeEngine struct {
 	bs, blocks, base, ovh int
 	reqs                  map[int]*fakeReq
 	next                  int
+
+	unlabelled bool // gauges without labels
+	dp         bool // a second engine's series
+	noRunning  bool // no num_requests_running gauge
+	frozen     bool // the usage gauge never moves
 }
 
 type fakeReq struct{ prompt, gen int }
@@ -38,8 +43,24 @@ func (e *fakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/metrics":
 		e.mu.Lock()
 		fmt.Fprintf(w, "vllm:cache_config_info{block_size=\"%d\",num_gpu_blocks=\"%d\"} 1.0\n", e.bs, e.blocks)
-		fmt.Fprintf(w, "vllm:kv_cache_usage_perc{engine=\"0\"} %g\n", float64(e.used())/float64(e.blocks-1))
-		fmt.Fprintf(w, "vllm:num_requests_running{engine=\"0\"} %d\nvllm:num_requests_waiting{engine=\"0\"} 0\n", len(e.reqs))
+		used := e.used()
+		if e.frozen {
+			used = e.base
+		}
+		labels := []string{`{engine="0"}`}
+		if e.unlabelled {
+			labels = []string{""}
+		}
+		if e.dp {
+			labels = append(labels, `{engine="1"}`)
+		}
+		for _, l := range labels {
+			fmt.Fprintf(w, "vllm:kv_cache_usage_perc%s %g\n", l, float64(used)/float64(e.blocks-1))
+			if !e.noRunning {
+				fmt.Fprintf(w, "vllm:num_requests_running%s %d\n", l, len(e.reqs))
+			}
+			fmt.Fprintf(w, "vllm:num_requests_waiting%s 0\n", l)
+		}
 		e.mu.Unlock()
 	case "/v1/completions":
 		var body struct {
@@ -85,5 +106,46 @@ func TestCalibrateMeasuresOverhead(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("want %q (overhead 5, +2) in:\n%s", want, out.String())
 		}
+	}
+}
+
+// Unlabelled gauges are read like labelled ones, so every check still runs.
+func TestCalibrateUnlabelledMetrics(t *testing.T) {
+	e := &fakeEngine{bs: 16, blocks: 4000, base: 300, ovh: 5, reqs: map[int]*fakeReq{}, unlabelled: true}
+	srv := httptest.NewServer(e)
+	defer srv.Close()
+	var out bytes.Buffer
+	if err := calibrate(&Config{Upstream: srv.URL}, &out); err != nil || !strings.Contains(out.String(), "decode_overhead_blocks: 7") {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+}
+
+// Calibrate refuses rather than report a figure it could not check: a data-parallel
+// engine, metrics its checks cannot read, a usage gauge that never moved (review cv-60
+// F6, F7, F8).
+func TestCalibrateRefuses(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(*fakeEngine)
+		want string
+	}{
+		{"data-parallel", func(e *fakeEngine) { e.dp = true }, "data-parallel"},
+		{"no running gauge", func(e *fakeEngine) { e.noRunning = true }, "vllm:num_requests_running"},
+		{"frozen gauge", func(e *fakeEngine) { e.frozen = true }, "never rose"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := &fakeEngine{bs: 16, blocks: 4000, base: 300, ovh: 5, reqs: map[int]*fakeReq{}}
+			c.set(e)
+			srv := httptest.NewServer(e)
+			defer srv.Close()
+			var out bytes.Buffer
+			err := calibrate(&Config{Upstream: srv.URL}, &out)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err %v, want one mentioning %q\n%s", err, c.want, out.String())
+			}
+			if strings.Contains(out.String(), "overhead_blocks:") {
+				t.Fatalf("reported a figure:\n%s", out.String())
+			}
+		})
 	}
 }

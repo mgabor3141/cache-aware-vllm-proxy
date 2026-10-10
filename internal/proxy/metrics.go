@@ -56,9 +56,7 @@ func (q *AdmissionQueue) metrics() admissionMetrics {
 	}
 	mirror := q.mirror
 	q.mu.Unlock()
-	if mirror != nil {
-		m.mirrorConnected = mirror.Healthy()
-	}
+	m.mirrorConnected = mirror.Healthy()
 	return m
 }
 
@@ -79,7 +77,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	gauge("cavp_cache_held_tokens", "Tokens held for idle conversations.", a.held)
 	gauge("cavp_guard_margin_blocks", "Overcommit guard margin added to each running request.", a.marginBlocks)
 	counter("cavp_guard_raises_total", "Times the overcommit guard raised its margin.", uint64(a.marginRaises))
-	gauge("cavp_kv_mirror_connected", "1 while the KV event mirror is subscribed.", b2i(a.mirrorConnected))
+	gauge("cavp_kv_mirror_connected", "1 while the KV event mirror is subscribed and caught up.", b2i(a.mirrorConnected))
 
 	p.metrics.mu.Lock()
 	keys := make([]routeStatus, 0, len(p.metrics.requests))
