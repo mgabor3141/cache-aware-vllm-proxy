@@ -777,3 +777,95 @@ func TestOutputCounter(t *testing.T) {
 		}
 	}
 }
+
+// A turn that ends without usage (client gone, upstream error) keeps the hold the previous
+// turn left: its prefix is what a retry resends (review cv-51 MED-4). One that streamed
+// output before it ended is held at the prompt size the proxy measured (review cv-54 #2).
+func TestCacheAdmissionAbortedTurnKeepsHold(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	t1 := q.start("s", 0, 200000)
+	t1.finish(mustAdmit(t, t1, "turn 1"), 200000, 3000)
+	before := q.Residency().HeldTokens
+	if before == 0 {
+		t.Fatal("turn 1 left no hold")
+	}
+	t2 := q.start("s", 0, 203000)
+	mustAdmit(t, t2, "turn 2")() // released without usage
+	if got := q.Residency().HeldTokens; got != before {
+		t.Fatalf("held %d after an aborted turn, want the previous %d", got, before)
+	}
+
+	gen := q.NewOutputCounter()
+	done := make(chan func())
+	go func() {
+		rel, _, _, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "t", PromptTokens: 100000, Generated: gen})
+		done <- rel
+	}()
+	rel := <-done
+	gen.Chunk()
+	rel() // the client left mid-stream: no usage, but output streamed
+	if h := q.sessions["t"].held; h != 32*3200 {
+		t.Fatalf("held %d, want the measured prompt in whole blocks", h)
+	}
+}
+
+// A session's hold has the priority of the request that left it, not of the last one
+// admitted: a deferred side call does not make the conversation displaceable by everyone
+// (review cv-51 MED-6).
+func TestCacheAdmissionHoldPriorityFromItsTurn(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	ta := q.start("a", 0, 10000)
+	ra := mustAdmit(t, ta, "a")
+	mustAdmit(t, q.start("b", 0, 300000), "b keeps the engine busy")
+	side := q.start("a", 100, 3000)
+	rs := mustAdmit(t, side, "deferred side call")
+	ta.finish(ra, 10000, 500)
+	side.finish(rs, 3000, 50)
+	if p := q.sessions["a"].priority; p != 0 {
+		t.Fatalf("hold priority %d, want the main turn's 0", p)
+	}
+	mustWait(t, q.start("c", 0, 220000), "c may not displace a's firm hold")
+}
+
+// A full session table forgets idle sessions that hold nothing first, never a session
+// with queued requests, and accounts for any hold it forgets (reviews cv-51 MED-12,
+// cv-53 #8, cv-58 #15). It prunes below the cap, so it does not rescan per new session.
+func TestCacheAdmissionSessionCapSparesHolds(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := clk.now()
+	holder := q.session("holder", now.Add(-time.Hour))
+	holder.held = 201600
+	waiter := q.session("waiter", now.Add(-2*time.Hour))
+	waiter.waiting = 1
+	for i := 0; len(q.sessions) < sessionCap; i++ {
+		q.sessions[fmt.Sprintf("k%05d", i)] = &cacheSession{lastSeen: now.Add(time.Duration(i) * time.Millisecond)}
+	}
+	q.session("newcomer", now)
+	if _, ok := q.sessions["holder"]; !ok {
+		t.Fatal("forgot a hold while idle sessions holding nothing remained")
+	}
+	if _, ok := q.sessions["waiter"]; !ok {
+		t.Fatal("forgot a session with a queued request")
+	}
+	if n := len(q.sessions); n > sessionCap-sessionCap/16+1 {
+		t.Fatalf("%d sessions after pruning", n)
+	}
+	// With only holders left to forget, the forgotten hold counts as displaced.
+	for k, s := range q.sessions {
+		if k != "waiter" && k != "holder" {
+			s.held = 3200
+		}
+	}
+	for i := 0; len(q.sessions) < sessionCap; i++ {
+		q.sessions[fmt.Sprintf("m%05d", i)] = &cacheSession{lastSeen: now, held: 3200}
+	}
+	q.session("newcomer2", now)
+	if q.displaced == 0 {
+		t.Fatal("forgotten holds not accounted")
+	}
+	if _, ok := q.sessions["waiter"]; !ok {
+		t.Fatal("forgot a session with a queued request")
+	}
+}

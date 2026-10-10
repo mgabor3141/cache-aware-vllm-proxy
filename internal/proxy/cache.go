@@ -36,6 +36,7 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"sync/atomic"
@@ -202,18 +203,18 @@ const (
 )
 
 type cacheSession struct {
-	priority   int
+	priority   int // of its hold: the request that left it
 	footprint  int // prompt + completion of the last completed turn
 	lastPrompt int // prompt tokens of the last completed turn
 	outputs    []int
 
 	running int
 	// Largest observation of the current busy period (overlapping requests).
-	busyFootprint, busyPrompt int
-	busyBlocks                kvmirror.PromptKeys
-	lastDone                  time.Time
-	held                      int                 // prompt tokens protected while idle (whole blocks); 0 when not holding
-	heldBlocks                kvmirror.PromptKeys // mirror keys of the held prompt
+	busyFootprint, busyPrompt, busyPriority int
+	busyBlocks                              kvmirror.PromptKeys
+	lastDone                                time.Time
+	held                                    int                 // prompt tokens protected while idle (whole blocks); 0 when not holding
+	heldBlocks                              kvmirror.PromptKeys // mirror keys of the held prompt
 	// heldSeen is what the mirror saw cached of the hold: -1 until the mirror is healthy to
 	// ask, 0 when it saw nothing (the hold cannot be verified).
 	heldSeen int
@@ -276,23 +277,45 @@ func (q *AdmissionQueue) session(key string, now time.Time) *cacheSession {
 	return s
 }
 
+// pruneSessionsLocked forgets sessions idle past sessionRetention. With force (the table
+// is full), it also forgets the least recently seen idle sessions, those holding nothing
+// first, down to sessionCap less a sixteenth, so a full table is not scanned for every
+// new session. A session with running or queued requests is never forgotten; a hold
+// forgotten that way counts as displaced, and is logged.
 func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
-	var oldestKey string
-	var oldest time.Time
+	var idle []string
 	for k, s := range q.sessions {
-		if s.running > 0 {
+		if s.running > 0 || s.waiting > 0 {
 			continue
 		}
 		if now.Sub(s.lastSeen) > sessionRetention {
 			delete(q.sessions, k)
-			continue
-		}
-		if oldestKey == "" || s.lastSeen.Before(oldest) {
-			oldestKey, oldest = k, s.lastSeen
+		} else if force {
+			idle = append(idle, k)
 		}
 	}
-	if force && len(q.sessions) >= sessionCap && oldestKey != "" {
-		delete(q.sessions, oldestKey)
+	excess := len(q.sessions) - (sessionCap - sessionCap/16)
+	if !force || excess <= 0 {
+		return
+	}
+	sort.Slice(idle, func(i, j int) bool {
+		a, b := q.sessions[idle[i]], q.sessions[idle[j]]
+		if (a.held > 0) != (b.held > 0) {
+			return a.held == 0
+		}
+		return a.lastSeen.Before(b.lastSeen)
+	})
+	forgotten, held := 0, 0
+	for _, k := range idle[:min(excess, len(idle))] {
+		if h := q.sessions[k].held; h > 0 {
+			forgotten++
+			held += h
+		}
+		delete(q.sessions, k)
+	}
+	if forgotten > 0 {
+		q.displaced += held
+		log.Printf("level=warn msg=\"session table full: forgot idle holds\" holds=%d tokens=%d sessions=%d", forgotten, held, len(q.sessions))
 	}
 }
 
@@ -573,17 +596,17 @@ func (q *AdmissionQueue) admitLocked(w *admissionWaiter, now time.Time) {
 	w.granted = true
 	q.running[w] = struct{}{}
 	if s := q.sessions[w.session]; s != nil {
-		s.running++
-		s.held = 0
-		s.heldBlocks = kvmirror.PromptKeys{}
-		s.priority = w.priority
+		s.running++ // a session with a running request holds nothing (holding)
 	}
 }
 
 // finishLocked returns a request's charge and records what the engine reported. While
 // a session has overlapping requests, the largest observation wins: a side call does not
-// shrink what the main thread left cached. A busy period with no usage at all (upstream
-// error, client gone) leaves no hold, since nothing says anything was cached.
+// shrink what the main thread left cached, nor lend the hold its priority. Without usage
+// (client gone mid-stream, upstream error), a request that streamed output had its prompt
+// prefilled, and the size the proxy measured stands in. A busy period with nothing to
+// show keeps the session's previous hold, whose prefix a retry resends; a session
+// without one holds nothing.
 func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObservation, bool)) {
 	now := q.now()
 	delete(q.running, w)
@@ -591,14 +614,16 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 	if s == nil {
 		return
 	}
-	if o, ok := obs(); ok && o.PromptTokens > 0 {
-		if fp := o.PromptTokens + o.CompletionTokens; fp > s.busyFootprint {
-			s.busyFootprint = fp
-			s.busyPrompt = o.PromptTokens
-
-			s.busyBlocks = w.blocks
-		}
+	o, ok := obs()
+	if ok && o.PromptTokens > 0 {
 		s.outputs = pushInt(s.outputs, o.CompletionTokens)
+	} else if g := w.generated(); g > 0 && w.prompt > 0 {
+		o, ok = CacheObservation{PromptTokens: w.prompt, CompletionTokens: g}, true
+	} else {
+		ok = false
+	}
+	if fp := o.PromptTokens + o.CompletionTokens; ok && fp > s.busyFootprint {
+		s.busyFootprint, s.busyPrompt, s.busyBlocks, s.busyPriority = fp, o.PromptTokens, w.blocks, w.priority
 	}
 	if s.running > 0 {
 		s.running--
@@ -607,14 +632,14 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 		return
 	}
 	s.lastDone = now
-	s.held, s.heldBlocks = 0, kvmirror.PromptKeys{}
 	if s.busyFootprint > 0 {
 		s.footprint, s.lastPrompt = s.busyFootprint, s.busyPrompt
 		// The next turn resends the prompt, not the completion (thinking is dropped), so
 		// the prompt is what stays useful in the cache.
-		s.held = q.roundUp(s.lastPrompt) // with tail hits its partial last block is kept too
+		s.held = q.roundUp(s.lastPrompt)
 		s.heldBlocks = s.busyBlocks
 		s.heldSeen = -1 // judged on the next pass (syncHoldsLocked)
+		s.priority = s.busyPriority
 	}
 	s.busyFootprint, s.busyPrompt, s.busyBlocks = 0, 0, kvmirror.PromptKeys{}
 }
