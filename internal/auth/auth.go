@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
@@ -16,11 +15,15 @@ import (
 //	none      every request is accepted as user "anonymous" at priority 0. For a
 //	          proxy reachable only from trusted hosts.
 //	static    bearer keys listed in the config, each with a user and a priority.
-//	external  each bearer is validated by POST <url>/validate (see externalAuth).
+//	external        each bearer is validated by POST <url>/validate (see externalAuth).
+//	trusted_header  a gateway in front has authenticated the caller and names it in
+//	                X-Cavp-User and X-Cavp-Priority, proving itself with X-Cavp-Secret
+//	                (see trustedHeaderAuth). cavp must be reachable only from that gateway.
 type Config struct {
-	Mode string      `yaml:"mode"`
-	URL  string      `yaml:"url"`
-	Keys []StaticKey `yaml:"keys"`
+	Mode   string      `yaml:"mode"`
+	URL    string      `yaml:"url"`
+	Keys   []StaticKey `yaml:"keys"`
+	Secret string      `yaml:"secret"`
 }
 
 // StaticKey is one accepted bearer. Key usually comes from the environment
@@ -40,12 +43,27 @@ type Result struct {
 	Sub      string // stable subject id when the backend has one
 }
 
-// Authenticator resolves a bearer token (empty when the request has none).
-// It returns (nil, nil) for an unknown or missing token, and a *RateLimitedError
-// when the backend rate-limited the caller.
+// Authenticator identifies the caller of a request. It returns (nil, nil) for an
+// unknown or missing credential, and a *RateLimitedError when the backend
+// rate-limited the caller.
 type Authenticator interface {
-	Authenticate(ctx context.Context, token string) (*Result, error)
+	Authenticate(r *http.Request) (*Result, error)
 }
+
+// Bearer returns the request's bearer token, or "".
+func Bearer(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimSpace(h[len("Bearer "):])
+	}
+	return ""
+}
+
+// Header names of the trusted_header mode.
+const (
+	HeaderUser     = "X-Cavp-User"
+	HeaderPriority = "X-Cavp-Priority"
+	HeaderSecret   = "X-Cavp-Secret"
+)
 
 // RateLimitedError is returned verbatim to the client (status and Retry-After).
 type RateLimitedError struct {
@@ -78,10 +96,14 @@ func (c Config) Validate() error {
 		if c.URL == "" {
 			return fmt.Errorf("auth.mode external needs auth.url")
 		}
+	case "trusted_header":
+		if len(c.Secret) < 16 {
+			return fmt.Errorf("auth.mode trusted_header needs auth.secret of at least 16 characters (an unset ${VAR} expands to empty)")
+		}
 	case "":
-		return fmt.Errorf("auth.mode is required: none, static or external")
+		return fmt.Errorf("auth.mode is required: none, static, external or trusted_header")
 	default:
-		return fmt.Errorf("auth.mode %q: want none, static or external", c.Mode)
+		return fmt.Errorf("auth.mode %q: want none, static, external or trusted_header", c.Mode)
 	}
 	return nil
 }
@@ -93,6 +115,8 @@ func New(c Config) Authenticator {
 		return newStaticAuth(c.Keys)
 	case "external":
 		return newExternalAuth(c.URL)
+	case "trusted_header":
+		return &trustedHeaderAuth{secret: sha256.Sum256([]byte(c.Secret))}
 	default:
 		return noAuth{}
 	}
@@ -100,7 +124,7 @@ func New(c Config) Authenticator {
 
 type noAuth struct{}
 
-func (noAuth) Authenticate(context.Context, string) (*Result, error) {
+func (noAuth) Authenticate(*http.Request) (*Result, error) {
 	return &Result{User: "anonymous", Source: "none"}, nil
 }
 
@@ -124,7 +148,8 @@ func newStaticAuth(keys []StaticKey) *staticAuth {
 	return a
 }
 
-func (a *staticAuth) Authenticate(_ context.Context, token string) (*Result, error) {
+func (a *staticAuth) Authenticate(r *http.Request) (*Result, error) {
+	token := Bearer(r)
 	if token == "" {
 		return nil, nil
 	}
@@ -161,11 +186,12 @@ func newExternalAuth(baseURL string) *externalAuth {
 	}
 }
 
-func (c *externalAuth) Authenticate(ctx context.Context, token string) (*Result, error) {
+func (c *externalAuth) Authenticate(r *http.Request) (*Result, error) {
+	token := Bearer(r)
 	if token == "" {
 		return nil, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/validate", nil)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, c.baseURL+"/validate", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -209,4 +235,31 @@ func (c *externalAuth) Authenticate(ctx context.Context, token string) (*Result,
 	default:
 		return nil, fmt.Errorf("auth: unexpected status %d", resp.StatusCode)
 	}
+}
+
+// trustedHeaderAuth accepts the identity a gateway put in the request headers. The
+// secret (compared by hash, in constant time) shows the headers came from the gateway
+// and not from a caller who reached cavp directly; without it, or without a user, the
+// request is refused. The priority header is optional (0) but must be an integer.
+type trustedHeaderAuth struct {
+	secret [32]byte
+}
+
+func (a *trustedHeaderAuth) Authenticate(r *http.Request) (*Result, error) {
+	sum := sha256.Sum256([]byte(r.Header.Get(HeaderSecret)))
+	if subtle.ConstantTimeCompare(sum[:], a.secret[:]) != 1 {
+		return nil, nil
+	}
+	user := r.Header.Get(HeaderUser)
+	if user == "" {
+		return nil, fmt.Errorf("auth: trusted request without %s", HeaderUser)
+	}
+	priority := 0
+	if p := r.Header.Get(HeaderPriority); p != "" {
+		var err error
+		if priority, err = strconv.Atoi(p); err != nil {
+			return nil, fmt.Errorf("auth: %s %q is not a number", HeaderPriority, p)
+		}
+	}
+	return &Result{User: user, Priority: priority, Source: "trusted_header"}, nil
 }

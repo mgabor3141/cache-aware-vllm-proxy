@@ -10,11 +10,14 @@ listen: ":4001"
 # The vLLM OpenAI-compatible server.
 upstream: "http://vllm:8000"
 
-# Who may call the proxy (auth.go). Pick one mode:
-#   static    keys listed here, values from the environment
-#   external  POST <url>/validate decides (contract in auth.go)
-#   none      everyone, as user "anonymous": only for a proxy reachable from
-#             trusted hosts alone
+# Who may call the proxy (internal/auth). Pick one mode:
+#   static          keys listed here, values from the environment
+#   external        POST <url>/validate decides (contract in auth.go)
+#   trusted_header  a gateway in front authenticates callers and sends X-Cavp-User,
+#                   X-Cavp-Priority and X-Cavp-Secret (= secret). Make cavp reachable
+#                   from the gateway alone, or anyone can claim any identity.
+#   none            everyone, as user "anonymous": only for a proxy reachable from
+#                   trusted hosts alone
 # A key's priority is the most urgent its caller can be (lower runs first, as in vLLM);
 # a caller may ask to run later with an X-Priority header or a "priority" body field.
 auth:
@@ -25,6 +28,8 @@ auth:
       priority: 0
   # mode: external
   # url: http://auth-service:4001
+  # mode: trusted_header
+  # secret: ${CAVP_GATEWAY_SECRET}
 
 # Model names clients may use. "<auto>" resolves to whatever the upstream serves, so
 # clients survive a model swap. priority_override makes every request through that alias

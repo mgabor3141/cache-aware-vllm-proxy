@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -487,5 +488,42 @@ func TestReadyzNeedsNoBearer(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/readyz unauthenticated: got %d, want 200", rec.Code)
+	}
+}
+
+// In trusted_header mode the gateway's secret and identity headers must not reach the
+// engine.
+func TestTrustedHeadersNotForwarded(t *testing.T) {
+	var got http.Header
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer up.Close()
+	f := t.TempDir() + "/c.yaml"
+	os.WriteFile(f, []byte("upstream: "+up.URL+"\nauth:\n  mode: trusted_header\n  secret: 0123456789abcdef-secret\n"), 0o600)
+	cfg, err := LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewProxy(cfg, NewModelResolver(up.URL, http.DefaultClient), NewEventLogger(io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.health.recordSuccess("test")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set(auth.HeaderSecret, "0123456789abcdef-secret")
+	req.Header.Set(auth.HeaderUser, "alice")
+	req.Header.Set(auth.HeaderPriority, "5")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	for _, k := range []string{auth.HeaderSecret, auth.HeaderUser, auth.HeaderPriority} {
+		if got.Get(k) != "" {
+			t.Errorf("%s forwarded to the engine", k)
+		}
 	}
 }

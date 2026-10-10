@@ -164,6 +164,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Auth required for everything, including /v1/models (see below).
 	who, authErr := p.checkAuth(r)
+	// Credentials stop here: neither the gateway secret nor the identity headers reach
+	// the engine.
+	for _, h := range []string{auth.HeaderSecret, auth.HeaderUser, auth.HeaderPriority} {
+		r.Header.Del(h)
+	}
 	if authErr != nil {
 		// Only a rate limit from the auth backend arrives here; it is
 		// returned verbatim.
@@ -328,11 +333,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // A backend failure (unreachable, unexpected status) is logged and also
 // answered 401, so an auth outage fails closed but stays visible.
 func (p *Proxy) checkAuth(r *http.Request) (*auth.Result, error) {
-	token := ""
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		token = strings.TrimSpace(h[len("Bearer "):])
-	}
-	result, err := p.auth.Authenticate(r.Context(), token)
+	result, err := p.auth.Authenticate(r)
 	if err != nil {
 		var kerr *auth.RateLimitedError
 		if errors.As(err, &kerr) {
