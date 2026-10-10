@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -434,39 +433,6 @@ func TestCacheAdmissionFifteenThreadsAllProgress(t *testing.T) {
 		}
 	}
 	t.Fatal("threads did not all finish")
-}
-
-func TestCallerPriorityHeaderThenBody(t *testing.T) {
-	r, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
-	if _, ok := callerPriority(r, map[string]any{}); ok {
-		t.Fatal("priority from nothing")
-	}
-	if v, ok := callerPriority(r, map[string]any{"priority": float64(-5)}); !ok || v != -5 {
-		t.Fatalf("body priority = %d %v", v, ok)
-	}
-	r.Header.Set("X-Priority", "3")
-	if v, ok := callerPriority(r, map[string]any{"priority": float64(-5)}); !ok || v != 3 {
-		t.Fatalf("header priority = %d %v, want header to win", v, ok)
-	}
-}
-
-func TestMaxTokensOf(t *testing.T) {
-	if n := maxTokensOf(map[string]any{"max_tokens": float64(900)}); n != 900 {
-		t.Fatal(n)
-	}
-	if n := maxTokensOf(map[string]any{"max_completion_tokens": float64(50), "max_tokens": float64(900)}); n != 50 {
-		t.Fatal(n)
-	}
-}
-
-func TestTextBytesSkipsInlineMedia(t *testing.T) {
-	body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{
-		map[string]any{"type": "text", "text": "hello"},
-		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + string(make([]byte, 100000))}},
-	}}}}
-	if n := textBytesOf(body); n > 200 {
-		t.Fatalf("text bytes %d counts the image", n)
-	}
 }
 
 // Review 3 finding 1: two protected 250K holds fill the cache and nothing runs; a 2K

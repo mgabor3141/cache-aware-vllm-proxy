@@ -1,9 +1,9 @@
 // Package proxy is cache-aware-vllm-proxy: an OpenAI-compatible reverse proxy that
 // admits requests to one vLLM engine by what its prefix cache holds (docs/design.md).
 //
-// Main parses flags, loads the config, starts the background loops (model resolver,
-// readiness probe, admission, KV event mirror, engine pool and usage), listens on
-// cfg.Listen, and on SIGTERM/SIGINT drains for 10 s.
+// Main parses flags, loads the config, starts the background loops (readiness probe,
+// admission, KV event mirror, engine pool and usage), and serves on cfg.Listen. On
+// SIGTERM/SIGINT, waiting requests are answered 503 and running ones get 10 s to finish.
 package proxy
 
 import (
@@ -42,17 +42,10 @@ func Main() {
 		return
 	}
 
-	// Single HTTP client shared by the resolver and the reverse proxy's
-	// internal Transport. The resolver doesn't need streaming semantics
-	// so a default client is fine.
-	resolver := NewModelResolver(cfg.Upstream, &http.Client{Timeout: 15 * time.Second})
-
-	logger := NewEventLogger(os.Stdout)
-
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 
-	prx, err := NewProxy(cfg, resolver, logger)
+	prx, err := NewProxy(cfg, NewEventLogger(os.Stdout))
 	if err != nil {
 		fatal("proxy init: %v", err)
 	}
@@ -67,45 +60,19 @@ func Main() {
 		go runEnginePool(rootCtx, cfg.Upstream, prx.admission)
 		go runEngineUsage(rootCtx, cfg.Upstream, prx.admission)
 	}
-
-	go resolver.RunRefreshLoop(rootCtx, cfg.ModelsRefreshInterval, func(err error) {
-		// Operator-visible but not noisy. The next successful refresh
-		// will silently restore service; only the gap is worth reporting.
-		log.Printf("level=warn msg=\"models refresh failed\" err=%q", err.Error())
-	})
-	go prx.health.Run(rootCtx)
-
-	mux := http.NewServeMux()
-	mux.Handle("/", prx)
-	// Tiny liveness for compose healthchecks. Doesn't touch upstream;
-	// returning 200 only proves the proxy process is alive and serving.
-	// Readiness (upstream reachable + model resolved) lives at /readyz
-	// for future use; not wired into compose yet.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !prx.health.Ready() {
-			http.Error(w, "inference upstream is not ready", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
+	go prx.ready.Run(rootCtx)
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
-		Handler: mux,
-		// No request deadline: a request lasts until it finishes or its
-		// client disconnects (agents retry on their own timeouts).
+		Handler: prx,
+		// No request deadline: a request lasts until it finishes or its client leaves.
+		// Writes are bounded per write (writeStallTimeout), headers here.
 		ReadHeaderTimeout: 10 * time.Second,
-		// No WriteTimeout: streaming responses can legitimately last
-		// minutes; the request-scoped context handles cancellation.
+		IdleTimeout:       5 * time.Minute,
 	}
 
-	log.Printf("level=info msg=\"cavp listening\" addr=%q upstream=%q aliases=%d auth=%q",
-		cfg.Listen, cfg.Upstream, len(cfg.Aliases), cfg.Auth.Mode)
+	log.Printf("level=info msg=\"cavp listening\" addr=%q upstream=%q auth=%q max_active=%d kv_events=%q",
+		cfg.Listen, cfg.Upstream, cfg.Auth.Mode, cfg.Admission.MaxActive, cfg.Admission.Cache.KVEventsEndpoint)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
@@ -120,8 +87,12 @@ func Main() {
 		}
 	case sig := <-sigCh:
 		log.Printf("level=info msg=\"shutting down\" signal=%q", sig)
+		prx.Close() // waiting requests answer 503 and leave
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = srv.Shutdown(shutCtx)
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Printf("level=warn msg=\"requests still running at shutdown were cut\" err=%q", err.Error())
+			srv.Close()
+		}
 		cancel()
 		rootCancel()
 	}

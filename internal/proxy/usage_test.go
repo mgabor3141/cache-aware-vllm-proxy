@@ -1,199 +1,108 @@
 package proxy
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
 
-func TestParseResponseUsage_NonStreaming(t *testing.T) {
-	body := []byte(`{"id":"x","choices":[{"message":{"content":"hi"}}],
-		"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}`)
-	u, ok := parseResponseUsage(body)
-	if !ok {
-		t.Fatal("expected usage found")
+func TestParseResponseUsage(t *testing.T) {
+	u, ok := parseResponseUsage([]byte(realVLLMChatResponse))
+	if !ok || u.Prompt != 78 || u.Completion != 5 || u.Total != 83 || u.Cached != 64 || !u.Details {
+		t.Fatalf("%+v %v", u, ok)
 	}
-	if u.Prompt != 12 || u.Completion != 34 || u.Total != 46 {
-		t.Errorf("got %+v, want {12 34 46}", u)
+	// /v1/completions puts kv_transfer_params after usage too.
+	u, ok = parseResponseUsage([]byte(`{"choices":[{"text":"391"}],"usage":{"prompt_tokens":78,"total_tokens":83,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0}},"kv_transfer_params":null}`))
+	if !ok || u.Prompt != 78 || u.Cached != 0 || !u.Details {
+		t.Fatalf("completions: %+v %v", u, ok)
 	}
-}
-
-func TestParseResponseUsage_Missing(t *testing.T) {
-	for _, body := range [][]byte{
-		[]byte(`{"id":"x","choices":[]}`),      // no usage
-		[]byte(`{"usage":null}`),               // null usage
-		[]byte(`{"usage":{"total_tokens":0}}`), // zero total -> not usable
-		[]byte(`not json at all`),              // garbage
-		[]byte(``),                             // empty
+	for _, body := range []string{
+		`{"choices":[]}`, `{"usage":null}`, `{"usage":{"total_tokens":0}}`, `not json`,
+		// A model writing a usage object as text is not usage.
+		`{"choices":[{"message":{"content":"\"usage\":{\"prompt_tokens\":5,\"total_tokens\":9}"}}]}`,
 	} {
-		if _, ok := parseResponseUsage(body); ok {
-			t.Errorf("expected no usage for %q", body)
+		if u, ok := parseResponseUsage([]byte(body)); ok {
+			t.Errorf("%s: %+v", body, u)
 		}
 	}
 }
 
-func TestUsageScanner_FindsFinalChunk(t *testing.T) {
+// A real miss (details, 0 cached) and a blind spot (no details) log differently.
+func TestUsageDetailsSeparateMissFromBlindSpot(t *testing.T) {
+	miss, _ := parseResponseUsage([]byte(`{"usage":{"prompt_tokens":9,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}`))
+	blind, _ := parseResponseUsage([]byte(`{"usage":{"prompt_tokens":9,"total_tokens":10}}`))
+	line := func(u tokenUsage) string {
+		ev := &Event{}
+		ev.setUsage(u)
+		b, _ := json.Marshal(ev)
+		return string(b)
+	}
+	if l := line(miss); !strings.Contains(l, `"usage_details":true`) || strings.Contains(l, "cached_prompt_tokens") {
+		t.Errorf("miss: %s", l)
+	}
+	if l := line(blind); strings.Contains(l, "usage_details") {
+		t.Errorf("blind spot: %s", l)
+	}
+}
+
+func TestUsageScanner(t *testing.T) {
+	var chunks atomic.Int64
+	s := &usageScanner{chunks: &chunks}
+	stream := sseChunk + ": keepalive\n\n" +
+		// Spacing must not matter for chunk counting (cv-59 #13).
+		`data: { "choices" : [ {"index":0,"delta":{"content":"y"}} ], "usage": null }` + "\n\n" +
+		sseUsage + sseDone
+	// Byte by byte: lines split across writes.
+	for i := 0; i < len(stream); i++ {
+		s.Write([]byte{stream[i]})
+	}
+	if !s.found || s.usage.Prompt != 40 || s.usage.Cached != 32 || !s.done {
+		t.Fatalf("%+v", s)
+	}
+	if chunks.Load() != 2*tokensPerChunk {
+		t.Fatalf("counted %d", chunks.Load())
+	}
+}
+
+func TestUsageScannerNoUsageNoDone(t *testing.T) {
 	s := &usageScanner{}
-	// Typical vLLM include_usage stream: content chunks with usage:null,
-	// then a final empty-choices chunk carrying usage, then [DONE].
-	s.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}],\"usage\":null}\n\n"))
-	s.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}],\"usage\":null}\n\n"))
-	s.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"total_tokens\":107}}\n\n"))
-	s.Write([]byte("data: [DONE]\n\n"))
-	u, ok := s.Usage()
-	if !ok {
-		t.Fatal("expected usage found")
-	}
-	if u.Prompt != 100 || u.Completion != 7 || u.Total != 107 {
-		t.Errorf("got %+v, want {100 7 107}", u)
+	s.Write([]byte(sseChunk + sseChunk))
+	if s.found || s.done {
+		t.Fatalf("%+v", s)
 	}
 }
 
-func TestUsageScanner_SplitAcrossWrites(t *testing.T) {
+// An over-long line is skipped, not buffered without bound, and scanning resumes after it.
+func TestUsageScannerSkipsOverlongLine(t *testing.T) {
 	s := &usageScanner{}
-	full := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n"
-	// Feed one byte at a time to prove line reassembly across Write calls.
-	for i := 0; i < len(full); i++ {
-		s.Write([]byte{full[i]})
+	long := "data: " + strings.Repeat("x", maxSSELine+10)
+	for i := 0; i < len(long); i += 4096 {
+		s.Write([]byte(long[i:min(i+4096, len(long))]))
 	}
-	u, ok := s.Usage()
-	if !ok || u.Total != 8 {
-		t.Fatalf("got %+v ok=%v, want total 8", u, ok)
+	if len(s.pending) > maxSSELine {
+		t.Fatalf("pending grew to %d", len(s.pending))
 	}
-}
-
-func TestUsageScanner_NoUsageInStream(t *testing.T) {
-	s := &usageScanner{}
-	s.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
-	s.Write([]byte("data: [DONE]\n\n"))
-	if _, ok := s.Usage(); ok {
-		t.Error("expected no usage when stream omits it")
+	s.Write([]byte("\n\n" + sseUsage + sseDone))
+	if !s.found || !s.done {
+		t.Fatalf("%+v", s.usage)
 	}
 }
 
-func TestEnsureStreamUsage_InjectsWhenMissing(t *testing.T) {
-	body := map[string]any{"model": "x", "stream": true}
-	ensureStreamUsage(body)
-	so, ok := body["stream_options"].(map[string]any)
-	if !ok {
-		t.Fatal("stream_options not created")
-	}
-	if so["include_usage"] != true {
-		t.Errorf("include_usage=%v, want true", so["include_usage"])
-	}
-}
-
-func TestEnsureStreamUsage_RespectsCallerValue(t *testing.T) {
-	// Caller explicitly disabled it: do not override.
-	body := map[string]any{
-		"stream_options": map[string]any{"include_usage": false},
-	}
-	ensureStreamUsage(body)
-	so := body["stream_options"].(map[string]any)
-	if so["include_usage"] != false {
-		t.Errorf("include_usage=%v, want false (caller wins)", so["include_usage"])
-	}
-}
-
-func TestEnsureStreamUsage_PreservesOtherStreamOptions(t *testing.T) {
-	body := map[string]any{
-		"stream_options": map[string]any{"foo": "bar"},
-	}
-	ensureStreamUsage(body)
-	so := body["stream_options"].(map[string]any)
-	if so["foo"] != "bar" {
-		t.Error("existing stream_options dropped")
-	}
-	if so["include_usage"] != true {
-		t.Error("include_usage not added alongside existing options")
-	}
-}
-
-// The prefix-cache hit is the number the whole KV-thrash question turns on, so
-// its decoding is worth pinning to the shapes the engine actually emits. These
-// payloads are copied from the live vLLM chat completion response, not invented:
-// details present with a real hit, and details absent on paths that do not
-// report them. "Not reported" must not be turned into a confident zero-by-magic;
-// it arrives as 0 with ok=true and is distinguishable from a hit only because the
-// wire field is a pointer, so the distinction lives in usage.go where it belongs.
-func TestParseResponseUsage_ReadsCachedPromptTokens(t *testing.T) {
-	body := []byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"qwen3.8-flash-next-w4",
-		"choices":[{"index":0,"message":{"role":"assistant","content":"391"}}],"usage":{"prompt_tokens":48211,
-		"total_tokens":48266,"completion_tokens":55,"prompt_tokens_details":{"cached_tokens":45056}}}`)
-
-	u, ok := parseResponseUsage(body)
-	if !ok {
-		t.Fatalf("expected usage to parse from a chat completion carrying usage")
-	}
-	if got, want := u.Prompt, 48211; got != want {
-		t.Errorf("Prompt = %d, want %d", got, want)
-	}
-	if got, want := u.Cached, 45056; got != want {
-		t.Errorf("Cached = %d, want %d", got, want)
-	}
-	// The recompute bill for the turn. This arithmetic is the measurement, so it
-	// is asserted rather than left to the dashboard query.
-	if got, want := u.Prompt-u.Cached, 3155; got != want {
-		t.Errorf("recomputed prompt tokens = %d, want %d", got, want)
-	}
-}
-
-// Renamed on 2026-10-02. It used to be TestParseResponseUsage_NoDetailsMeansZeroCached, which
-// asserted the same false equivalence that produced a wrong conclusion: Cached stays 0 when the
-// engine reports no details because there is nothing to fill it in with, but 0 is also what a real
-// full miss looks like, so "no details" never means "measured zero". The parser behaviour is
-// unchanged and correct; the name was the bug, and Details is what keeps it from being read that way
-// again.
-func TestParseResponseUsage_NoDetailsIsABlindSpotNotAMeasuredZero(t *testing.T) {
-	body := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],
-		"usage":{"prompt_tokens":100,"total_tokens":120,"completion_tokens":20}}`)
-
-	u, ok := parseResponseUsage(body)
-	if !ok {
-		t.Fatalf("expected usage to parse when prompt_tokens_details is absent")
-	}
-	if u.Cached != 0 {
-		t.Errorf("Cached = %d, want 0 when the engine reported no details", u.Cached)
-	}
-	if u.Details {
-		t.Error("Details = true with no prompt_tokens_details; a blind spot must not look measured")
-	}
-	if u.Prompt != 100 {
-		t.Errorf("Prompt = %d, want 100", u.Prompt)
-	}
-}
-
-func TestParseUsageFromTail_JSONCompletion(t *testing.T) {
-	// vLLM puts usage after choices, so it is exactly what survives at the end.
-	tail := []byte(`{"id":"chatcmpl-9","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"391"},"finish_reason":"stop"}],"usage":{"prompt_tokens":48211,"total_tokens":48266,"completion_tokens":55,"prompt_tokens_details":{"cached_tokens":45056}}}`)
-	u, ok := parseUsageFromTail(tail)
-	if !ok {
-		t.Fatalf("no usage parsed from a completion whose tail carries it")
-	}
-	if u.Prompt != 48211 || u.Completion != 55 || u.Cached != 45056 {
-		t.Errorf("parsed %+v, want prompt 48211 completion 55 cached 45056", u)
-	}
-}
-
-func TestParseUsageFromTail_StreamFinalChunk(t *testing.T) {
-	tail := []byte("data: {\"id\":\"chatcmpl-2\",\"choices\":[],\"usage\":{\"prompt_tokens\":912,\"total_tokens\":940,\"completion_tokens\":28,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n")
-	u, ok := parseUsageFromTail(tail)
-	if !ok {
-		t.Fatalf("no usage parsed from a final SSE chunk")
-	}
-	if u.Prompt != 912 || u.Cached != 0 {
-		t.Errorf("parsed %+v, want prompt 912 cached 0", u)
-	}
-}
-
-func TestParseUsageFromTail_IgnoresUsageWrittenByTheModel(t *testing.T) {
-	// The reason the guards exist: a model explaining token accounting in prose can
-	// emit the literal text. It appears inside a string and is followed by more
-	// text, so neither the position nor the value is credible.
-	tail := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"the field looks like \"usage\":{\"prompt_tokens\":999999,\"total_tokens\":1000000,\"completion_tokens\":1} and means"}}]}`)
-	if u, ok := parseUsageFromTail(tail); ok {
-		t.Errorf("parsed %+v from prose that only mentions usage; want no match", u)
-	}
-}
-
-func TestParseUsageFromTail_NoUsageNoMatch(t *testing.T) {
-	if _, ok := parseUsageFromTail([]byte(`{"data":[{"id":"tok-1","tokens":[1,2,3]}]}`)); ok {
-		t.Error("parsed usage from a /tokenize response that has none")
+func TestEnsureStreamUsage(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want string
+	}{
+		{`{}`, `{"stream_options":{"include_usage":true}}`},
+		{`{"stream_options":{"include_usage":false}}`, `{"stream_options":{"include_usage":false}}`},
+		{`{"stream_options":{"continuous_usage_stats":true}}`, `{"stream_options":{"continuous_usage_stats":true,"include_usage":true}}`},
+	} {
+		var b map[string]any
+		json.Unmarshal([]byte(c.in), &b)
+		ensureStreamUsage(b)
+		if out, _ := json.Marshal(b); string(out) != c.want {
+			t.Errorf("%s: %s, want %s", c.in, out, c.want)
+		}
 	}
 }

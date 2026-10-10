@@ -1,517 +1,519 @@
 package proxy
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
-	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/internal/auth"
 )
 
-// makeModelsProxy builds a minimal Proxy for testing serveModels.
-func makeModelsProxy(t *testing.T, upstreamModel string) *Proxy {
-	t.Helper()
-	cfg := &Config{
-		Aliases: map[string]AliasEntry{
-			"default": {Target: "<auto>", Description: "default alias"},
-			"batch":   {Target: "<auto>", PriorityOverride: intPtr(10), Description: "batch alias"},
-		},
-		SamplingDefaults: SamplingDefaults{
-			"my-model": ModelSamplingDefaults{
-				NoThinking: map[string]any{"temperature": 0.7, "top_p": 0.95},
-			},
-		},
-	}
-	resolver := &ModelResolver{}
-	if upstreamModel != "" {
-		resolver.maxModelLen.Store(196608)
-		resolver.current.Store(&upstreamModel)
-	}
-	p := &Proxy{
-		cfg:      cfg,
-		resolver: resolver,
-	}
-	return p
-}
-
-func intPtr(i int) *int { return &i }
-
-// modelIDs extracts the list of model IDs from a /v1/models response.
-func modelIDs(t *testing.T, body []byte) []string {
-	t.Helper()
-	var resp struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		t.Fatalf("unmarshal /v1/models response: %v", err)
-	}
-	ids := make([]string, len(resp.Data))
-	for i, m := range resp.Data {
-		ids[i] = m.ID
-	}
-	return ids
-}
-
-func modelContextWindows(t *testing.T, body []byte) map[string]int64 {
-	t.Helper()
-	var resp struct {
-		Data []struct {
-			ID          string `json:"id"`
-			MaxModelLen int64  `json:"max_model_len"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		t.Fatalf("unmarshal /v1/models response: %v", err)
-	}
-	windows := make(map[string]int64, len(resp.Data))
-	for _, model := range resp.Data {
-		windows[model.ID] = model.MaxModelLen
-	}
-	return windows
-}
-
-func containsID(ids []string, want string) bool {
-	for _, id := range ids {
-		if id == want {
-			return true
-		}
-	}
-	return false
-}
-
-func TestServeModels_ListsAliasesAndUpstream(t *testing.T) {
-	p := makeModelsProxy(t, "my-model")
-	rec := httptest.NewRecorder()
-	p.serveModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-	ids := modelIDs(t, rec.Body.Bytes())
-	if len(ids) != 3 {
-		t.Errorf("got %v, want default, batch and the upstream model", ids)
-	}
-	windows := modelContextWindows(t, rec.Body.Bytes())
-	for _, model := range []string{"default", "batch", "my-model"} {
-		if windows[model] != 196608 {
-			t.Errorf("%s max_model_len = %d, want 196608", model, windows[model])
-		}
-	}
-}
-
-func TestServeModels_NoUpstreamModel(t *testing.T) {
-	// Before the resolver's first refresh only the aliases are listed.
-	p := makeModelsProxy(t, "")
-	rec := httptest.NewRecorder()
-	p.serveModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-	ids := modelIDs(t, rec.Body.Bytes())
-	if len(ids) != 2 || !containsID(ids, "default") || !containsID(ids, "batch") {
-		t.Errorf("got %v, want only the aliases", ids)
-	}
-}
-
-func TestRewriteBody_SamplingPrecedence(t *testing.T) {
-	p := &Proxy{
-		cfg: &Config{
-			Aliases: map[string]AliasEntry{"default": {Target: "my-model"}},
-			SamplingDefaults: SamplingDefaults{
-				"my-model": {NoThinking: map[string]any{"temperature": 0.7, "top_p": 0.95}},
-			},
-		},
-	}
-	tests := []struct {
-		name string
-		body string
-		want map[string]any
-	}{
-		{
-			name: "alias overrides explicit values",
-			body: `{"model":"default","temperature":0.2,"top_p":0.3}`,
-			want: map[string]any{"model": "my-model", "temperature": 0.7, "top_p": 0.95},
-		},
-		{
-			name: "literal preserves explicit and fills missing",
-			body: `{"model":"my-model","temperature":0.2}`,
-			want: map[string]any{"model": "my-model", "temperature": 0.2, "top_p": 0.95},
-		},
-		{
-			name: "unknown literal passes through",
-			body: `{"model":"unknown","temperature":0.2}`,
-			want: map[string]any{"model": "unknown", "temperature": 0.2},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
-			rec := httptest.NewRecorder()
-			ok, _ := p.rewriteBody(rec, req, &auth.Result{}, &Event{})
-			if !ok {
-				t.Fatalf("rewrite failed: %s", rec.Body.String())
-			}
-			var body map[string]any
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			for key, want := range tc.want {
-				if got := body[key]; got != want {
-					t.Errorf("%s=%v, want %v; body=%v", key, got, want, body)
-				}
-			}
-			if tc.name == "unknown literal passes through" {
-				if _, exists := body["top_p"]; exists {
-					t.Fatalf("unknown model received policy: %v", body)
-				}
-			}
-		})
-	}
-}
-
-// Reasoning policy is exercised through rewriteBody rather than the helpers so
-// that route scoping, alias resolution and step ordering are pinned too. The
-// helper-level tests in sampling_defaults_test.go cannot catch a miswired call
-// site, which is the failure this policy is most exposed to.
-func TestRewriteBody_ReasoningEffortPolicy(t *testing.T) {
-	newProxy := func() *Proxy {
-		return &Proxy{
-			cfg: &Config{
-				Aliases: map[string]AliasEntry{"default": {Target: "qwen3.8-27b-fp8"}},
-				ReasoningEffortMappings: map[string]map[string]string{
-					"qwen3.8-27b-fp8": {"minimal": "low", "high": "xhigh"},
-				},
-				ReasoningEffortDefaults: map[string]string{"qwen3.8-27b-fp8": "medium"},
-			},
-		}
-	}
-	tests := []struct {
-		name   string
-		path   string
-		body   string
-		want   any
-		absent bool
-	}{
-		{name: "alias absent effort gets service default", path: "/v1/chat/completions",
-			body: `{"model":"default"}`, want: "medium"},
-		{name: "literal absent effort gets service default", path: "/v1/chat/completions",
-			body: `{"model":"qwen3.8-27b-fp8"}`, want: "medium"},
-		{name: "alias translates high", path: "/v1/chat/completions",
-			body: `{"model":"default","reasoning_effort":"high"}`, want: "xhigh"},
-		{name: "literal translates minimal", path: "/v1/chat/completions",
-			body: `{"model":"qwen3.8-27b-fp8","reasoning_effort":"minimal"}`, want: "low"},
-		{name: "adaptive medium is not rewritten", path: "/v1/chat/completions",
-			body: `{"model":"default","reasoning_effort":"medium"}`, want: "medium"},
-		{name: "thinking off survives", path: "/v1/chat/completions",
-			body: `{"model":"default","reasoning_effort":"none"}`, want: "none"},
-		{name: "explicit enable_thinking false gets no default", path: "/v1/chat/completions",
-			body: `{"model":"default","chat_template_kwargs":{"enable_thinking":false}}`, absent: true},
-		{name: "explicit enable_thinking true still gets default", path: "/v1/chat/completions",
-			body: `{"model":"default","chat_template_kwargs":{"enable_thinking":true}}`, want: "medium"},
-		{name: "raw completions gets no default", path: "/v1/completions",
-			body: `{"model":"default","prompt":"hi"}`, absent: true},
-		{name: "raw completions is not translated", path: "/v1/completions",
-			body: `{"model":"default","prompt":"hi","reasoning_effort":"high"}`, want: "high"},
-		{name: "unknown model gets no reasoning policy", path: "/v1/chat/completions",
-			body: `{"model":"some-other-model"}`, absent: true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
-			rec := httptest.NewRecorder()
-			ok, _ := newProxy().rewriteBody(rec, req, &auth.Result{}, &Event{})
-			if !ok {
-				t.Fatalf("rewrite failed: %s", rec.Body.String())
-			}
-			var body map[string]any
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			got, exists := body["reasoning_effort"]
-			if tc.absent {
-				if exists {
-					t.Fatalf("reasoning_effort=%v, want absent; body=%v", got, body)
-				}
-				return
-			}
-			if got != tc.want {
-				t.Errorf("reasoning_effort=%v, want %v; body=%v", got, tc.want, body)
-			}
-		})
-	}
-}
-
-func TestRewriteBody_NormalizesDeveloperRoleOnChatOnly(t *testing.T) {
-	p := &Proxy{cfg: &Config{}}
-	input := `{"model":"my-model","messages":[{"role":"developer","content":"Be concise","name":"policy"},{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"}]}`
-
-	for _, tc := range []struct {
-		path     string
-		wantRole string
-	}{
-		{path: "/v1/chat/completions", wantRole: "system"},
-		{path: "/v1/tokenize", wantRole: "developer"},
+// Only the allowlisted routes reach the engine; everything else is 404 without a byte
+// sent upstream, including engine control routes and paths that only look like an
+// allowed one (cv-56 #1, #8).
+func TestUnknownRoutesAre404(t *testing.T) {
+	var hits atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }, nil)
+	for _, c := range []struct{ method, path string }{
+		{"POST", "/v1/embeddings"}, {"POST", "/v1/responses"}, {"GET", "/health"},
+		{"POST", "/sleep"}, {"POST", "/collective_rpc"}, {"GET", "/v1/chat/completions"},
+		{"DELETE", "/v1/models/x"}, {"POST", "/v1/load_lora_adapter"}, {"GET", "/debug/residency"},
+		{"POST", "/%2e/v1/chat/completions"}, {"OPTIONS", "/v1/chat/completions"},
 	} {
-		t.Run(tc.path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(input))
-			rec := httptest.NewRecorder()
-			ok, _ := p.rewriteBody(rec, req, &auth.Result{}, &Event{})
-			if !ok {
-				t.Fatalf("rewrite failed: %s", rec.Body.String())
-			}
-			var body struct {
-				Messages []map[string]any `json:"messages"`
-			}
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			if got := body.Messages[0]["role"]; got != tc.wantRole {
-				t.Errorf("developer role=%v, want %q", got, tc.wantRole)
-			}
-			if got := body.Messages[0]["content"]; got != "Be concise" {
-				t.Errorf("developer content changed: %v", got)
-			}
-			if got := body.Messages[0]["name"]; got != "policy" {
-				t.Errorf("developer extra field changed: %v", got)
-			}
-			if got := body.Messages[1]["role"]; got != "user" {
-				t.Errorf("user role changed: %v", got)
-			}
-			if got := body.Messages[2]["role"]; got != "assistant" {
-				t.Errorf("assistant role changed: %v", got)
-			}
-		})
-	}
-}
-
-func TestRewriteBody_NonGenerationRoutesSkipSamplingPolicy(t *testing.T) {
-	p := &Proxy{
-		cfg: &Config{
-			Aliases: map[string]AliasEntry{"default": {Target: "my-model"}},
-			SamplingDefaults: SamplingDefaults{
-				"my-model": {NoThinking: map[string]any{"temperature": 0.7, "top_p": 0.95}},
-			},
-		},
-	}
-	for _, path := range []string{"/v1/embeddings", "/v1/tokenize"} {
-		t.Run(path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"default","input":"test"}`))
-			rec := httptest.NewRecorder()
-			ok, _ := p.rewriteBody(rec, req, &auth.Result{Priority: 3}, &Event{})
-			if !ok {
-				t.Fatalf("rewrite failed: %s", rec.Body.String())
-			}
-			var body map[string]any
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			if got := body["model"]; got != "my-model" {
-				t.Errorf("model=%v, want resolved literal model", got)
-			}
-			if got := body["priority"]; got != float64(3) {
-				t.Errorf("priority=%v, want 3", got)
-			}
-			for _, key := range []string{"temperature", "top_p"} {
-				if _, exists := body[key]; exists {
-					t.Errorf("%s was injected on non-generation route: %v", key, body)
-				}
-			}
-		})
-	}
-}
-
-// Session fingerprinting provides passive request correlation; pin the wiring,
-// not just the hash helper. Turns of the same conversation must collide, different
-// conversations and different targets must not, and raw completions must stay
-// ephemeral.
-func TestRewriteBody_SessionKeyWiring(t *testing.T) {
-	p := &Proxy{cfg: &Config{Aliases: map[string]AliasEntry{"default": {Target: "qwen3.8-27b-fp8"}}}}
-	rewrite := func(path, body string) *Event {
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-		rec := httptest.NewRecorder()
-		ev := &Event{}
-		if ok, _ := p.rewriteBody(rec, req, &auth.Result{}, ev); !ok {
-			t.Fatalf("rewrite failed: %s", rec.Body.String())
+		if code, _ := h.do(c.method, c.path, chatBody, nil); code != http.StatusNotFound {
+			t.Errorf("%s %s: %d, want 404", c.method, c.path, code)
 		}
-		return ev
 	}
-
-	turn1 := rewrite("/v1/chat/completions",
-		`{"model":"default","messages":[{"role":"system","content":"sys"},{"role":"user","content":"review A"}]}`)
-	turn2 := rewrite("/v1/chat/completions",
-		`{"model":"default","messages":[{"role":"system","content":"sys"},{"role":"user","content":"review A"},{"role":"assistant","content":"done"},{"role":"user","content":"next"}]}`)
-	other := rewrite("/v1/chat/completions",
-		`{"model":"default","messages":[{"role":"system","content":"sys"},{"role":"user","content":"review B"}]}`)
-	literal := rewrite("/v1/chat/completions",
-		`{"model":"qwen3.8-27b-fp8","messages":[{"role":"system","content":"sys"},{"role":"user","content":"review A"}]}`)
-	otherModel := rewrite("/v1/chat/completions",
-		`{"model":"some-other-model","messages":[{"role":"system","content":"sys"},{"role":"user","content":"review A"}]}`)
-	raw := rewrite("/v1/completions", `{"model":"default","prompt":"hi"}`)
-
-	if turn1.Session == "" {
-		t.Fatal("chat request got no session key")
+	if hits.Load() != 0 {
+		t.Fatalf("the engine saw %d requests", hits.Load())
 	}
-	if turn1.Session != turn2.Session {
-		t.Errorf("turns of one conversation diverged: %q vs %q", turn1.Session, turn2.Session)
-	}
-	if turn1.Session != literal.Session {
-		t.Errorf("alias and literal for same target diverged: %q vs %q", turn1.Session, literal.Session)
-	}
-	if turn1.Session == other.Session {
-		t.Error("different conversations collided")
-	}
-	if turn1.Session == otherModel.Session {
-		t.Error("different targets collided")
-	}
-	if raw.Session != "" {
-		t.Errorf("raw completions got session %q, want empty", raw.Session)
+	if ev := h.event(1); num(ev["status"]) != 404 {
+		t.Fatalf("404 not logged: %v", ev)
 	}
 }
 
-func TestRewriteBody_SessionKeyHeaderOverride(t *testing.T) {
-	p := &Proxy{cfg: &Config{Aliases: map[string]AliasEntry{"default": {Target: "qwen3.8-27b-fp8"}}}}
-	rewrite := func(header, body string) *Event {
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-		if header != "" {
-			req.Header.Set("X-Session-Key", header)
+func TestAPIRoutesNeedCredentials(t *testing.T) {
+	var hits atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }, nil)
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/v1/models"}, {"POST", "/v1/chat/completions"}, {"POST", "/v1/completions"},
+		{"POST", "/v1/tokenize"}, {"POST", "/tokenize"},
+	} {
+		for _, bearer := range []string{"", "Bearer wrong"} {
+			if code, _ := h.do(c.method, c.path, chatBody, map[string]string{"Authorization": bearer}); code != http.StatusUnauthorized {
+				t.Errorf("%s %s with %q: %d, want 401", c.method, c.path, bearer, code)
+			}
 		}
-		rec := httptest.NewRecorder()
-		ev := &Event{}
-		if ok, _ := p.rewriteBody(rec, req, &auth.Result{}, ev); !ok {
-			t.Fatalf("rewrite failed: %s", rec.Body.String())
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("the engine saw %d requests", hits.Load())
+	}
+}
+
+// /healthz, /readyz and /metrics need no key and name nothing about callers.
+func TestKeylessEndpoints(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	none := map[string]string{"Authorization": ""}
+	if code, _ := h.do("GET", "/healthz", "", none); code != 200 {
+		t.Errorf("/healthz %d", code)
+	}
+	if code, _ := h.do("GET", "/readyz", "", none); code != 200 {
+		t.Errorf("/readyz %d while ready", code)
+	}
+	h.p.ready.set(false, "test")
+	if code, _ := h.do("GET", "/readyz", "", none); code != 503 {
+		t.Errorf("/readyz %d while not ready", code)
+	}
+	if code, body := h.do("GET", "/metrics", "", none); code != 200 || !strings.Contains(body, "cavp_engine_ready 0") {
+		t.Errorf("/metrics %d: %s", code, body)
+	}
+}
+
+// The readiness probe follows the engine's /v1/models: ready only while it lists a model.
+func TestReadinessProbe(t *testing.T) {
+	var models atomic.Value
+	models.Store(`{"data":[]}`)
+	eng := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, models.Load().(string)) })
+	srv := newTestServer(t, eng)
+	rd := newReadiness(srv.URL, 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.Run(ctx)
+	time.Sleep(50 * time.Millisecond)
+	if rd.Ready() {
+		t.Fatal("ready with an empty model list")
+	}
+	models.Store(`{"data":[{"id":"m"}]}`)
+	waitFor(t, "ready", rd.Ready)
+	srv.Close()
+	waitFor(t, "not ready after the engine went away", func() bool { return !rd.Ready() })
+}
+
+// /v1/models is the engine's own list, unchanged.
+func TestModelsPassThrough(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	code, body := h.do("GET", "/v1/models", "", nil)
+	if code != 200 || body != `{"object":"list","data":[{"id":"served-model","max_model_len":1000}]}` {
+		t.Fatalf("%d %s", code, body)
+	}
+}
+
+// /v1/tokenize reaches the engine's /tokenize with the body as sent, without waiting for
+// admission.
+func TestTokenizeForwardedUnadmitted(t *testing.T) {
+	var seen atomic.Value
+	h := newHarnessEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		seen.Store(r.URL.Path + " " + string(b))
+		w.Write([]byte(`{"tokens":[9]}`))
+	}), func(c *Config) { c.Admission.MaxActive = 1 })
+	rel, _, _, _, _ := h.p.admission.Acquire(context.Background(), AdmissionRequest{})
+	defer rel()
+	for _, path := range []string{"/v1/tokenize", "/tokenize"} {
+		code, body := h.do("POST", path, `{"model":"m","prompt":"x"}`, nil)
+		if code != 200 || body != `{"tokens":[9]}` {
+			t.Fatalf("%s: %d %s", path, code, body)
 		}
-		return ev
-	}
-	body := `{"model":"default","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`
-	withA := rewrite("conv-a", body)
-	withA2 := rewrite("conv-a", body)
-	withB := rewrite("conv-b", body)
-	hashed := rewrite("", body)
-	if withA.Session != withA2.Session {
-		t.Error("same header diverged")
-	}
-	if withA.Session == withB.Session {
-		t.Error("different headers collided")
-	}
-	if withA.Session == hashed.Session {
-		t.Error("header key equals content-hash key; identical conversations with and without headers must not merge")
-	}
-	if withA.Session == "conv-a" {
-		t.Error("raw header value leaked as session key")
-	}
-}
-
-func TestSessionKeyHeaderIsNamespacedByIdentity(t *testing.T) {
-	p := &Proxy{cfg: &Config{Aliases: map[string]AliasEntry{"default": {Target: "qwen3.8-27b-fp8"}}}}
-	rewrite := func(user string) *Event {
-		body := `{"model":"default","messages":[{"role":"user","content":"hi"}]}`
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-		req.Header.Set("X-Session-Key", "conv-1")
-		rec := httptest.NewRecorder()
-		ev := &Event{}
-		if ok, _ := p.rewriteBody(rec, req, &auth.Result{User: user, Source: "key"}, ev); !ok {
-			t.Fatalf("rewrite failed: %s", rec.Body.String())
+		if got := seen.Load(); got != `/tokenize {"model":"m","prompt":"x"}` {
+			t.Fatalf("%s: engine saw %v", path, got)
 		}
-		return ev
-	}
-	if rewrite("alice").Session == rewrite("bob").Session {
-		t.Error("same X-Session-Key from different identities merged")
-	}
-	if rewrite("alice").Session != rewrite("alice").Session {
-		t.Error("same identity and key diverged")
 	}
 }
 
-// /v1/models requires a bearer, like every other path.
-//
-// Keyless liveness is /readyz, which names no model; the model menu is not
-// world-readable. This test keeps it that way.
-func TestModelsRequiresBearer(t *testing.T) {
-	const goodKey = "good-key"
-	p := makeModelsProxy(t, "my-model")
-	p.auth, _ = auth.New(auth.Config{Mode: "static", Keys: []auth.StaticKey{{Key: goodKey, User: "tester"}}})
-	p.logger = NewEventLogger(io.Discard)
-
-	// main.go mounts the handler at "/", so paths arrive with /v1 intact.
-	noKey := httptest.NewRecorder()
-	p.ServeHTTP(noKey, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-	if noKey.Code != http.StatusUnauthorized {
-		t.Fatalf("GET /v1/models with no bearer: got %d, want 401 (body: %s)", noKey.Code, noKey.Body.String())
-	}
-
-	// A bearer the auth service does not know must not be a way in either.
-	badKey := httptest.NewRecorder()
-	bad := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	bad.Header.Set("Authorization", "Bearer wrong-key")
-	p.ServeHTTP(badKey, bad)
-	if badKey.Code != http.StatusUnauthorized {
-		t.Fatalf("GET /v1/models with an unknown bearer: got %d, want 401 (body: %s)", badKey.Code, badKey.Body.String())
-	}
-
-	ok := httptest.NewRecorder()
-	good := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	good.Header.Set("Authorization", "Bearer "+goodKey)
-	p.ServeHTTP(ok, good)
-	if ok.Code != http.StatusOK {
-		t.Fatalf("GET /v1/models with a valid bearer: got %d, want 200 (body: %s)", ok.Code, ok.Body.String())
-	}
-	ids := modelIDs(t, ok.Body.Bytes())
-	if len(ids) == 0 {
-		t.Fatalf("authorized /v1/models returned no models: %s", ok.Body.String())
-	}
-}
-
-// /readyz is the keyless signal the landing page and monitors use now that
-// the model list is keyed. It must answer without an Authorization header.
-func TestReadyzNeedsNoBearer(t *testing.T) {
-	// The mux in main.go registers /healthz and /readyz outside the proxy
-	// handler, so they are reachable with no credentials by construction.
-	// This asserts the invariant we now depend on: if someone ever moves
-	// /readyz behind the authenticated handler, the landing page's status
-	// lights and both Kuma monitors go blind at once.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+// Credentials, identity headers and hop-by-hop headers stay at the proxy, on both
+// forwarding paths (cv-56 #11, cv-54 #11).
+func TestOnlyAllowlistedHeadersReachEngine(t *testing.T) {
+	var seen atomic.Value
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Clone())
+		w.Header().Set("X-Engine", "1")
+		w.Write([]byte("{}"))
+	}, func(c *Config) {
+		c.Auth = auth.Config{Mode: "trusted_header", Secret: "0123456789abcdef-secret"}
 	})
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/readyz unauthenticated: got %d, want 200", rec.Code)
+	hdr := map[string]string{
+		"Authorization": "Bearer caller", "Proxy-Authorization": "Basic x", "Cookie": "a=b",
+		auth.HeaderSecret: "0123456789abcdef-secret", auth.HeaderUser: "alice", auth.HeaderPriority: "3",
+		"X-Request-Id": "req-1", "Keep-Alive": "timeout=1", "X-Priority": "-5", "X-Session-Key": "s",
+	}
+	for _, body := range []string{chatBody, `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`} {
+		resp, err := h.request(context.Background(), "POST", "/v1/chat/completions", body, hdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		got := seen.Load().(http.Header)
+		for k := range got {
+			switch k {
+			case "Content-Type", "Content-Length", "User-Agent", "X-Request-Id", "Accept-Encoding", "Accept":
+			default:
+				t.Errorf("%s reached the engine", k)
+			}
+		}
+		if got.Get("X-Request-Id") != "req-1" {
+			t.Error("X-Request-Id not forwarded")
+		}
 	}
 }
 
-// In trusted_header mode the gateway's secret and identity headers must not reach the
-// engine.
-func TestTrustedHeadersNotForwarded(t *testing.T) {
-	var got http.Header
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer up.Close()
-	f := t.TempDir() + "/c.yaml"
-	os.WriteFile(f, []byte("upstream: "+up.URL+"\nauth:\n  mode: trusted_header\n  secret: 0123456789abcdef-secret\n"), 0o600)
-	cfg, err := LoadConfig(f)
+func TestBodyOverLimitIs413(t *testing.T) {
+	var hits atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }, func(c *Config) { c.MaxBodyBytes = 100 })
+	big := `{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("x", 500) + `"}]}`
+	if code, body := h.do("POST", "/v1/chat/completions", big, nil); code != 413 || !strings.Contains(body, "max_body_bytes") {
+		t.Fatalf("declared length: %d %s", code, body)
+	}
+	if ev := h.event(1); num(ev["status"]) != 413 || num(ev["content_length"]) != len(big) {
+		t.Fatalf("log: %v", ev)
+	}
+	// No declared length: refused once the limit is crossed, not truncated and parsed.
+	req, _ := http.NewRequest("POST", h.srv.URL+"/v1/chat/completions", io.MultiReader(strings.NewReader(big)))
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := NewProxy(cfg, NewModelResolver(up.URL, http.DefaultClient), NewEventLogger(io.Discard))
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Fatalf("chunked: %d", resp.StatusCode)
+	}
+	if code, _ := h.do("POST", "/v1/tokenize", big, nil); code != 413 {
+		t.Fatalf("tokenize: %d", code)
+	}
+	if hits.Load() != 0 {
+		t.Fatal("an oversized body reached the engine")
+	}
+}
+
+// A body cut short is a 400 that says so, with the declared and received sizes logged
+// (cv-59 #10).
+func TestTruncatedUploadIs400(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	conn, err := net.Dial("tcp", h.srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.health.recordSuccess("test")
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
-	req.Header.Set(auth.HeaderSecret, "0123456789abcdef-secret")
-	req.Header.Set(auth.HeaderUser, "alice")
-	req.Header.Set(auth.HeaderPriority, "5")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	defer conn.Close()
+	fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: 255\r\n\r\n%s", testKey, strings.Repeat("a", 60))
+	conn.(*net.TCPConn).CloseWrite()
+	ev := h.event(1)
+	if num(ev["status"]) != 400 || num(ev["content_length"]) != 255 || num(ev["request_bytes"]) != 60 ||
+		!strings.Contains(ev["error"].(string), "read request body") {
+		t.Fatalf("log: %v", ev)
 	}
-	for _, k := range []string{auth.HeaderSecret, auth.HeaderUser, auth.HeaderPriority} {
-		if got.Get(k) != "" {
-			t.Errorf("%s forwarded to the engine", k)
+}
+
+func TestInvalidJSONIs400(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	for _, body := range []string{"{", "[1]", "null", `"x"`} {
+		if code, _ := h.do("POST", "/v1/chat/completions", body, nil); code != 400 {
+			t.Errorf("%q: %d", body, code)
 		}
+	}
+}
+
+// The body is forwarded as sent apart from priority (and include_usage on streams): the
+// model name passes through, and numbers keep their exact text.
+func TestBodyPassesThrough(t *testing.T) {
+	var seen atomic.Value
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		seen.Store(string(b))
+		w.Write([]byte("{}"))
+	}, nil)
+	h.do("POST", "/v1/chat/completions", `{"model":"default","seed":12345678901234567890,"temperature":0.70,"messages":[{"role":"developer","content":"x"}]}`, nil)
+	got := seen.Load().(string)
+	for _, want := range []string{`"model":"default"`, `"seed":12345678901234567890`, `"temperature":0.70`, `"role":"developer"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("engine body %s lacks %s", got, want)
+		}
+	}
+}
+
+// The caller's identity is the most urgent it may run; the body's priority may only make
+// it run later, clamped. X-Priority is not a control.
+func TestPriorityFromBodyOnlyLater(t *testing.T) {
+	var seen atomic.Value
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		json.NewDecoder(r.Body).Decode(&b)
+		seen.Store(b)
+		w.Write([]byte("{}"))
+	}, func(c *Config) {
+		c.Auth.Keys = append(c.Auth.Keys, auth.StaticKey{Key: "k5", User: "bob", Priority: 5})
+	})
+	for _, c := range []struct {
+		key, prio string
+		want      any
+	}{
+		{testKey, "", nil}, {testKey, `,"priority":7`, 7.0}, {testKey, `,"priority":-3`, nil},
+		{"k5", "", 5.0}, {"k5", `,"priority":-3`, 5.0}, {"k5", `,"priority":500`, 100.0},
+		{"k5", `,"priority":7.5`, 5.0}, {"k5", `,"priority":"9"`, 5.0},
+	} {
+		body := `{"model":"m","messages":[{"role":"user","content":"hi"}]` + c.prio + `}`
+		h.do("POST", "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer " + c.key, "X-Priority": "-10"})
+		if got := seen.Load().(map[string]any)["priority"]; got != c.want {
+			t.Errorf("key %s body %q: engine priority %v, want %v", c.key, c.prio, got, c.want)
+		}
+	}
+}
+
+// Sessions come from the conversation and the caller only; X-Session-Key is ignored.
+func TestSessionFromConversation(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("{}")) }, func(c *Config) {
+		c.Auth.Keys = append(c.Auth.Keys, auth.StaticKey{Key: "k2", User: "bob"})
+	})
+	h.do("POST", "/v1/chat/completions", chatBody, map[string]string{"X-Session-Key": "a"})
+	h.do("POST", "/v1/chat/completions", chatBody, map[string]string{"X-Session-Key": "b"})
+	h.do("POST", "/v1/chat/completions", chatBody, map[string]string{"Authorization": "Bearer k2"})
+	s1, s2, s3 := h.event(1)["session"], h.event(2)["session"], h.event(3)["session"]
+	if s1 == nil || s1 != s2 {
+		t.Errorf("same conversation, different sessions: %v %v", s1, s2)
+	}
+	if s1 == s3 {
+		t.Error("two callers share a session")
+	}
+}
+
+// Usage is read from a real vLLM body, where fields follow usage (cv-59 #1).
+func TestNonStreamingUsage(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, realVLLMChatResponse)
+	}, nil)
+	code, body := h.do("POST", "/v1/chat/completions", chatBody, nil)
+	if code != 200 || body != realVLLMChatResponse {
+		t.Fatalf("%d %s", code, body)
+	}
+	ev := h.event(1)
+	if num(ev["prompt_tokens"]) != 78 || num(ev["cached_prompt_tokens"]) != 64 || ev["usage_details"] != true ||
+		num(ev["completion_tokens"]) != 5 || num(ev["status"]) != 200 || ev["error"] != nil {
+		t.Fatalf("log: %v", ev)
+	}
+	_, m := h.do("GET", "/metrics", "", nil)
+	for _, want := range []string{`cavp_requests_total{route="chat",status="200"} 1`, "cavp_prompt_tokens_total 78", "cavp_cached_prompt_tokens_total 64"} {
+		if !strings.Contains(m, want) {
+			t.Errorf("metrics lack %q:\n%s", want, m)
+		}
+	}
+}
+
+// A response larger than the usage copy is still forwarded whole.
+func TestLargeResponseForwardedWhole(t *testing.T) {
+	big := `{"x":"` + strings.Repeat("a", maxUsageBodyBytes) + `","usage":{"prompt_tokens":1,"total_tokens":2}}`
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, big) }, nil)
+	code, body := h.do("POST", "/v1/chat/completions", chatBody, nil)
+	if code != 200 || body != big {
+		t.Fatalf("%d, %d bytes", code, len(body))
+	}
+	if ev := h.event(1); ev["prompt_tokens"] != nil {
+		t.Fatalf("usage from a body that was not kept: %v", ev)
+	}
+}
+
+// While the engine is not ready, requests wait instead of failing, and go once it is.
+func TestRequestsWaitForReadiness(t *testing.T) {
+	var hits atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write([]byte(realVLLMChatResponse))
+	}, nil)
+	h.p.ready.set(false, "test")
+	done := make(chan int)
+	go func() {
+		code, _ := h.do("POST", "/v1/chat/completions", chatBody, nil)
+		done <- code
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if hits.Load() != 0 {
+		t.Fatal("forwarded while the engine was not ready")
+	}
+	h.p.ready.set(true, "")
+	if code := <-done; code != 200 {
+		t.Fatalf("status %d", code)
+	}
+	if ev := h.event(1); num(ev["ready_wait_ms"]) < 150 {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// A request whose client leaves while it is queued gets a log line (cv-54 #13, cv-59 #3).
+func TestAbandonedWhileQueuedIsLogged(t *testing.T) {
+	h := newHarness(t, nil, func(c *Config) { c.Admission.MaxActive = 1 })
+	rel, _, _, _, _ := h.p.admission.Acquire(context.Background(), AdmissionRequest{})
+	defer rel()
+	for i, body := range []string{chatBody, `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`} {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			waitFor(t, "queued", func() bool { return h.p.admission.Snapshot().Queued == 1 })
+			cancel()
+		}()
+		if resp, err := h.request(ctx, "POST", "/v1/chat/completions", body, nil); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		ev := h.event(i + 1)
+		if num(ev["status"]) != statusClientGone || ev["error"] == nil {
+			t.Fatalf("log: %v", ev)
+		}
+	}
+}
+
+// Shutting down answers waiting requests 503 rather than cutting them silently (cv-53 #4).
+func TestShutdownAnswersWaiters(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.p.ready.set(false, "test")
+	done := make(chan int)
+	go func() {
+		code, _ := h.do("POST", "/v1/chat/completions", chatBody, nil)
+		done <- code
+	}()
+	time.Sleep(100 * time.Millisecond)
+	h.p.Close()
+	if code := <-done; code != 503 {
+		t.Fatalf("status %d", code)
+	}
+}
+
+// An unreachable engine is a 502 that names no internal address.
+func TestEngineFailureIs502WithoutDetail(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.eng.Close()
+	code, body := h.do("POST", "/v1/chat/completions", chatBody, nil)
+	if code != 502 || strings.Contains(body, "127.0.0.1") {
+		t.Fatalf("%d %s", code, body)
+	}
+	if ev := h.event(1); !strings.Contains(fmt.Sprint(ev["error"]), "engine request failed") {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// A client that gives up while the engine works is logged as gone, not as an engine
+// failure (cv-55 #11).
+func TestClientCancelIsNotAnEngineFailure(t *testing.T) {
+	started := make(chan struct{})
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body) // so the server notices the disconnect
+		close(started)
+		<-r.Context().Done()
+	}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-started; cancel() }()
+	h.request(ctx, "POST", "/v1/chat/completions", chatBody, nil)
+	if ev := h.event(1); num(ev["status"]) != statusClientGone {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// An engine response cut mid-body aborts the client's connection instead of ending the
+// response as if it were complete.
+func TestEngineResponseCutAbortsClient(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"partial":`))
+		w.(http.Flusher).Flush()
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	}, nil)
+	resp, err := h.request(context.Background(), "POST", "/v1/chat/completions", chatBody, nil)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("the client saw a complete response")
+	}
+	if ev := h.event(1); !strings.Contains(fmt.Sprint(ev["error"]), "engine response cut") {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// A client that stops reading (without disconnecting) loses its admission permit once a
+// write stalls past the guard, on both paths (cv-58 #3, cv-53 #7).
+func TestStalledClientReleasesPermit(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", stream), func(t *testing.T) {
+			h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				chunk := []byte("data: " + strings.Repeat("x", 64<<10) + "\n\n")
+				for r.Context().Err() == nil {
+					if _, err := w.Write(chunk); err != nil {
+						return
+					}
+				}
+			}, nil)
+			h.p.writeStall = 200 * time.Millisecond
+			conn, err := net.Dial("tcp", h.srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			body := fmt.Sprintf(`{"model":"m","stream":%v,"messages":[]}`, stream)
+			fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\n\r\n%s", testKey, len(body), body)
+			// Read nothing.
+			waitFor(t, "admitted", func() bool { return h.p.admission.Snapshot().Active == 1 })
+			waitFor(t, "permit released", func() bool { return h.p.admission.Snapshot().Active == 0 })
+			if ev := h.event(1); !strings.Contains(fmt.Sprint(ev["error"]), "client went away") {
+				t.Fatalf("log: %v", ev)
+			}
+		})
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("{}")) }, nil)
+	h.do("POST", "/v1/chat/completions", chatBody, nil)
+	h.do("POST", "/v1/nothing", chatBody, nil)
+	h.event(2)
+	_, body := h.do("GET", "/metrics", "", map[string]string{"Authorization": ""})
+	for _, want := range []string{
+		"# TYPE cavp_queue_length gauge\ncavp_queue_length 0\n",
+		"cavp_active_requests 0\n", "cavp_cache_used_tokens ", "cavp_cache_budget_tokens ",
+		"cavp_cache_held_tokens ", "cavp_guard_margin_blocks 0\n", "# TYPE cavp_guard_raises_total counter\n",
+		"cavp_kv_mirror_connected 0\n", "cavp_engine_ready 1\n",
+		`cavp_requests_total{route="chat",status="200"} 1`, `cavp_requests_total{route="none",status="404"} 1`,
+		"cavp_prompt_tokens_total 0\n", "cavp_cached_prompt_tokens_total 0\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+	// Every sample line parses as name{labels} value.
+	sc := bufio.NewScanner(strings.NewReader(body))
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if f := strings.Fields(line); len(f) != 2 || !strings.HasPrefix(f[0], "cavp_") {
+			t.Errorf("bad sample line %q", line)
+		}
+	}
+}
+
+// The write guard's deadline does not outlive its request on a kept-alive connection.
+func TestWriteDeadlineClearedForNextRequest(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("{}")) }, nil)
+	h.p.writeStall = 50 * time.Millisecond
+	tr := &http.Transport{MaxConnsPerHost: 1}
+	defer tr.CloseIdleConnections()
+	c := &http.Client{Transport: tr}
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest("POST", h.srv.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		time.Sleep(150 * time.Millisecond)
 	}
 }

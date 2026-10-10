@@ -1,13 +1,15 @@
 # cache-aware-vllm-proxy configuration.
 #
-# ${VAR} references are replaced from the environment before parsing, so secrets can live
-# outside this file. Unknown keys are an error: a misspelt setting fails at startup instead
-# of being ignored. Validate a file with `cavp -check -config config.yaml`.
+# ${VAR} in a value is replaced from the environment after the file is parsed, so
+# secrets can live outside this file and a value never changes the file's structure.
+# Unknown keys are an error: a misspelt setting fails at startup instead of being
+# ignored. Validate a file with `cavp -check -config config.yaml`.
 
 # Address the proxy listens on (plain HTTP; put TLS in front if it is exposed).
 listen: ":4001"
 
-# The vLLM OpenAI-compatible server.
+# The vLLM OpenAI-compatible server. It must not require an API key: the proxy sends
+# none (the readiness probe and /v1/models would fail).
 upstream: "http://vllm:8000"
 
 # Who may call the proxy (internal/auth). Pick one mode:
@@ -17,8 +19,8 @@ upstream: "http://vllm:8000"
 #                   from the gateway alone, or anyone can claim any identity.
 #   none            everyone, as user "anonymous": only for a proxy reachable from
 #                   trusted hosts alone
-# A key's priority is the most urgent its caller can be (lower runs first, as in vLLM);
-# a caller may ask to run later with an X-Priority header or a "priority" body field.
+# A caller's priority is the most urgent it can be (lower runs first, as in vLLM); a
+# request may ask to run later with a "priority" body field.
 auth:
   mode: static
   keys:
@@ -27,21 +29,6 @@ auth:
       priority: 0
   # mode: trusted_header
   # secret: ${CAVP_GATEWAY_SECRET}
-
-# Model names clients may use. "<auto>" resolves to whatever the upstream serves, so
-# clients survive a model swap. priority_override makes every request through that alias
-# run at that priority or later (it never makes a caller more urgent than its key).
-aliases:
-  default:
-    target: "<auto>"
-    description: "Whatever model is currently served."
-  batch:
-    target: "<auto>"
-    priority_override: 10
-    description: "Same model, low priority: for non-interactive work that should yield."
-
-# How often to re-read the upstream's model list (for "<auto>" and /v1/models).
-models_refresh_interval: "60s"
 
 admission:
   # Most requests the engine runs at once (match vLLM's --max-num-seqs).
@@ -74,48 +61,12 @@ admission:
     prefill_overhead_blocks: 4
     decode_overhead_blocks: 4
 
-# Riding out engine restarts. A readiness probe (GET /v1/models, which must list a model)
-# runs on its own. When a request fails with a transient error (connection refused or
-# reset, or a status in retry_status_codes) and the engine answered a request or a probe
-# within recent_success_window, an outage episode opens: that request and every later one
-# wait for the probe to answer again and are then retried, all on one shared clock of
-# recovery_timeout, after which they fail with 503. An engine that has not answered
-# within the window (or one that never answered) fails requests at once until a probe
-# succeeds; a 502/503/504 from an engine that never answered also opens one episode,
-# for an engine still loading. Set recovery_timeout longer than your engine's restart.
-retry:
-  retry_status_codes: [502, 503, 504]
-  recovery_timeout: "8m"
-  recent_success_window: "2m"   # longer than healthy_probe_interval, so one slow probe is harmless
-  healthy_probe_interval: "30s" # probe period while the engine answers
-  recovery_probe_interval: "3s" # during an outage episode; must be shorter than recovery_timeout
-  down_probe_interval: "10s"    # while the engine is down outside an episode
+# The engine is ready while GET /v1/models lists a model, probed every interval. While
+# it is not (starting, restarting), requests wait in the queue instead of failing;
+# streaming clients get SSE keepalives meanwhile. /readyz reports the probe.
+readiness:
+  interval: "5s"
 
-# Memory for request bodies. There is no per-request cap by default (0): instead the
-# total held across all requests at once is bounded, each body charged
-# body_amplification times its size for the copies parsing makes (default 6). A body
-# without a Content-Length is charged, and capped at, max_chunked_body_bytes.
-max_body_bytes: 0
-max_inflight_body_bytes: 3221225472
-max_chunked_body_bytes: 134217728
-
-# Optional per-model sampling defaults. Through an alias they are authoritative and
-# replace what the request sent; with the literal model name they only fill in keys the
-# request did not set. "thinking" applies when the request enables reasoning,
-# "no_thinking" otherwise.
-# sampling_defaults:
-#   my-model-name:
-#     thinking:
-#       temperature: 0.6
-#       top_p: 0.95
-#     no_thinking:
-#       temperature: 0.7
-#       top_p: 0.8
-
-# Optional reasoning_effort handling per model: translate names the model does not
-# accept, and pick one for requests that omit it.
-# reasoning_effort_mappings:
-#   my-model-name:
-#     minimal: low
-# reasoning_effort_defaults:
-#   my-model-name: medium
+# Largest request body accepted; a larger one is answered 413. Image threads are
+# tens of megabytes.
+max_body_bytes: 268435456

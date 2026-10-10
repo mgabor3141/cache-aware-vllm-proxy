@@ -1,26 +1,16 @@
-// The proxy handler: auth, alias rewrite, priority injection,
-// stream-through forwarding to vLLM.
+// The request path: routing, authentication, body parsing, waiting for the engine and
+// for admission, and forwarding.
 //
-// Design notes:
+// Routes (anything else is 404):
 //
-//   - We only inspect/modify the body for endpoints that take a JSON
-//     body with a `model` field (chat/completions, completions,
-//     embeddings). Everything else under /v1/ is passed straight
-//     through with the auth check applied. /v1/models is handled
-//     specially so callers see *our* alias set, not raw upstream.
+//	POST /v1/chat/completions, /v1/completions   admitted (cache.go), then forwarded
+//	POST /v1/tokenize, /tokenize                 forwarded to the engine's /tokenize
+//	GET  /v1/models                              forwarded
+//	GET  /healthz, /readyz, /metrics             keyless; aggregate state only
 //
-//   - Body rewrite is one-shot at request time. We read the request
-//     body, mutate, and hand a new bytes.Reader to ReverseProxy. The
-//     response stream is untouched: ReverseProxy handles SSE
-//     correctly out of the box (flushes per write, propagates
-//     cancellation via request Context).
-//
-//   - We log one structured event when the response completes. Status
-//     code is captured via a ResponseWriter wrapper; latency is wall
-//     time start→done. Token counts are not parsed in v1 (would
-//     require tee'ing the SSE stream and matching the final usage
-//     chunk); the architecture supports adding it later without
-//     touching the streaming path.
+// Every /v1 and /tokenize request is authenticated and logged as one JSON line
+// (logging.go). Only a few request headers reach the engine (upstreamHeaders); the
+// caller's credentials never do.
 package proxy
 
 import (
@@ -33,11 +23,9 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,820 +33,457 @@ import (
 	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
-// Proxy carries the bits a request handler needs. Built once at
-// startup; goroutine-safe.
-//
-// Callers are authenticated by the configured auth.Authenticator (auth.go).
+const (
+	// keepaliveInterval: a waiting or silent stream gets an SSE comment at least this
+	// often, so clients and intermediaries with idle timeouts keep the connection.
+	keepaliveInterval = 10 * time.Second
+	// writeStallTimeout bounds one write to a client. A client that stops reading
+	// (without disconnecting) would otherwise hold its admission permit forever.
+	writeStallTimeout = 5 * time.Minute
+)
+
+// Proxy is the HTTP handler. Built once at startup; safe for concurrent use.
 type Proxy struct {
 	cfg       *Config
-	resolver  *ModelResolver
 	upstream  *url.URL
-	rp        *httputil.ReverseProxy
+	client    *http.Client // to the engine; no timeout, the request's context rules
 	logger    *EventLogger
 	auth      auth.Authenticator
 	admission *AdmissionQueue
-	// tokenizeClient sizes requests for cache-aware admission; one-shot, no retries.
+	mirror    *kvmirror.Mirror
+	ready     *readiness
+	metrics   requestMetrics
+
 	tokenizeClient *http.Client
 	tokenizeSem    chan struct{}
-	mirror         *kvmirror.Mirror
-	// bodyBudget bounds total request-body bytes held at once. Bodies must be
-	// read to rewrite the model alias, so size is bounded in aggregate rather than
-	// per request; see bodybudget.go.
-	bodyBudget *byteBudget
-	health     *upstreamHealth
 
-	// logRequestBodies, if true, emits the raw request body (pre-
-	// rewrite) and the final body (post-rewrite) to stderr for every
-	// body-rewrite path. Opt-in via the LOG_REQUEST_BODIES env var.
-	// Used to diagnose client-side request shape issues (what is the
-	// client actually sending, are sampling params or thinking flags
-	// present, etc.). Off by default because bodies contain user
-	// prompts and can be large.
-	logRequestBodies bool
+	keepalive  time.Duration
+	writeStall time.Duration
+
+	closing   chan struct{} // closed when the server shuts down
+	closeOnce sync.Once
 }
 
-func NewProxy(cfg *Config, resolver *ModelResolver, logger *EventLogger) (*Proxy, error) {
+func NewProxy(cfg *Config, logger *EventLogger) (*Proxy, error) {
 	u, err := url.Parse(cfg.Upstream)
 	if err != nil {
 		return nil, err
 	}
-	health := newUpstreamHealth(cfg.Upstream, cfg.Retry, nil)
 	authn, err := auth.New(cfg.Auth)
 	if err != nil {
 		return nil, err
 	}
-	p := &Proxy{
-		cfg: cfg, resolver: resolver, upstream: u, logger: logger, auth: authn,
+	return &Proxy{
+		cfg: cfg, upstream: u, logger: logger, auth: authn,
+		client:         &http.Client{},
 		admission:      NewAdmissionQueue(cfg.Admission),
+		ready:          newReadiness(cfg.Upstream, cfg.Readiness.Interval),
 		tokenizeClient: &http.Client{},
 		tokenizeSem:    make(chan struct{}, 4),
-		bodyBudget: newByteBudget(cfg.MaxInflightBodyBytes, cfg.BodyAmplification,
-			cfg.MaxChunkedBodyBytes),
-		health:           health,
-		logRequestBodies: envFlag("LOG_REQUEST_BODIES"),
+		keepalive:      keepaliveInterval,
+		writeStall:     writeStallTimeout,
+		closing:        make(chan struct{}),
+	}, nil
+}
+
+// Close makes every request still waiting for the engine or for admission give up with
+// 503; requests already running continue. Called when the server shuts down.
+func (p *Proxy) Close() {
+	p.closeOnce.Do(func() { close(p.closing) })
+}
+
+// apiRoute names the API route of a request, or "" when there is none.
+func apiRoute(r *http.Request) string {
+	switch r.Method + " " + r.URL.Path {
+	case "POST /v1/chat/completions":
+		return "chat"
+	case "POST /v1/completions":
+		return "completions"
+	case "POST /v1/tokenize", "POST /tokenize":
+		return "tokenize"
+	case "GET /v1/models":
+		return "models"
 	}
-	p.rp = &httputil.ReverseProxy{
-		// Transport with retry-on-transient. The retryingTransport
-		// re-issues the request on connection-refused / dial-timeout
-		// (vLLM restart window) and on configured 5xx codes. POST
-		// bodies survive the retry because rewriteBody() sets
-		// req.GetBody before forwarding.
-		Transport: newHealthAwareRetryingTransport(http.DefaultTransport, cfg.Retry, health),
-		Director: func(r *http.Request) {
-			r.URL.Scheme = u.Scheme
-			r.URL.Host = u.Host
-			r.Host = u.Host
-			// vLLM exposes tokenization at /tokenize rather than under /v1.
-			// Keep the public API consistently namespaced.
-			if r.URL.Path == "/v1/tokenize" {
-				r.URL.Path = "/tokenize"
-			}
-			// Strip our bearer header so upstream doesn't see it.
-			// (vLLM ignores auth, but being clean costs nothing.)
-			r.Header.Del("Authorization")
-		},
-		// Strip any CORS headers vLLM sets before the response reaches
-		// the client. We set our own in ServeHTTP; letting upstream
-		// headers through would produce duplicate values (e.g. "*, *").
-		ModifyResponse: func(resp *http.Response) error {
-			resp.Header.Del("Access-Control-Allow-Origin")
-			resp.Header.Del("Access-Control-Allow-Methods")
-			resp.Header.Del("Access-Control-Allow-Headers")
-			resp.Header.Del("Access-Control-Allow-Credentials")
-			resp.Header.Del("Access-Control-Max-Age")
-			resp.Header.Del("Access-Control-Expose-Headers")
-			return nil
-		},
-		// httputil.ReverseProxy already streams response bodies and
-		// flushes per chunk for SSE. FlushInterval -1 forces immediate
-		// flush on every Write — defensive against any future buffering
-		// changes upstream.
-		FlushInterval: -1,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if errors.Is(err, ErrUpstreamUnavailable) {
-				writeUpstreamUnavailable(w, health)
-				return
-			}
-			log.Printf("level=warn msg=\"inference upstream proxy error\" err=%q path=%s", err.Error(), r.URL.Path)
-			writeError(w, http.StatusBadGateway, "inference upstream request failed")
-		},
-	}
-	return p, nil
+	return ""
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	ev := Event{
-		TS:     start.UTC().Format(time.RFC3339Nano),
-		Method: r.Method,
-		Path:   r.URL.Path,
-	}
-
-	// CORS: emit headers on every response so browser clients can reach
-	// the API. OPTIONS preflight is answered before auth because the
-	// browser never sends credentials on the preflight request.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-	w.Header().Set("Access-Control-Max-Age", "86400")
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// Auth required for everything, including /v1/models (see below).
-	who, authErr := p.auth.Authenticate(r)
-	if authErr != nil {
-		log.Printf("level=warn msg=\"refused a malformed credential\" err=%q", authErr.Error())
-	}
-	// Credentials stop here: neither the gateway secret nor the identity headers reach
-	// the engine.
-	for _, h := range []string{auth.HeaderSecret, auth.HeaderUser, auth.HeaderPriority} {
-		r.Header.Del(h)
-	}
-	if authErr != nil || who == nil {
-		writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
-		ev.Status = http.StatusUnauthorized
-		ev.LatencyMS = time.Since(start).Milliseconds()
-		p.logger.Log(ev)
-		return
-	}
-	ev.User = who.User
-	ev.Auth = who.Source
-
-	// /v1/models is answered locally by serveModels (synthetic alias list) and,
-	// like every path here, requires an authenticated caller. Keyless liveness is
-	// /readyz, which reports ready/not-ready without naming a model.
-	// Cache-aware admission state: modelled occupancy and resident sessions (hashed).
-	if r.Method == http.MethodGet && r.URL.Path == "/debug/residency" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(p.admission.Residency())
-		ev.Status = http.StatusOK
-		ev.LatencyMS = time.Since(start).Milliseconds()
-		return
-	}
-
-	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
-		p.serveModels(w, r)
-		ev.Status = http.StatusOK
-		ev.LatencyMS = time.Since(start).Milliseconds()
-		p.logger.Log(ev)
-		return
-	}
-
-	// Known prolonged downtime fails before body rewriting, admission, and SSE
-	// headers. This also avoids returning a stale alias-resolution error when
-	// the proxy started while the upstream was already offline.
-	if p.health != nil && !p.health.Accepting() {
-		writeUpstreamUnavailable(w, p.health)
-		ev.Status = http.StatusServiceUnavailable
-		ev.LatencyMS = time.Since(start).Milliseconds()
-		p.logger.Log(ev)
-		return
-	}
-
-	// 2b. Reserve the memory this body will occupy before reading it. Admission
-	// limits how many requests run at once; this limits how much of the host they
-	// consume between them. The reservation is held until the upstream response is
-	// done, because the body stays resident while it is being forwarded.
-	//
-	// Waiting here is deliberate and is not a new failure: a request that cannot
-	// afford its own body waits, exactly as it would wait for an execution slot.
-	// What it replaces is the old behavior of reading any size and then holding it
-	// for a queue wait of up to thirty minutes.
-	if p.shouldRewriteBody(r) {
-		reserveStart := time.Now()
-		release, err := p.bodyBudget.acquire(r.Context(), r.ContentLength)
-		ev.BodyReserveMS = time.Since(reserveStart).Milliseconds()
-		if err != nil {
-			ev.ContentLength = r.ContentLength
-			ev.Error = "in-flight body budget full: " + err.Error()
-			writeError(w, http.StatusServiceUnavailable, ev.Error)
-			ev.Status = http.StatusServiceUnavailable
-			ev.LatencyMS = time.Since(start).Milliseconds()
-			p.logger.Log(ev)
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/healthz":
+			io.WriteString(w, "ok\n")
 			return
-		}
-		defer release()
-	}
-
-	// 3. For body-bearing JSON endpoints, rewrite alias + inject priority.
-	isStream := false
-	if p.shouldRewriteBody(r) {
-		var ok bool
-		ok, isStream = p.rewriteBody(w, r, who, &ev)
-		if !ok {
-			ev.LatencyMS = time.Since(start).Milliseconds()
-			p.logger.Log(ev)
-			return // rewriteBody already wrote the error response
-		}
-	}
-
-	// 4. Forward. Two paths:
-	//   - Streaming chat/completions: we own the response so we can
-	//     emit SSE keepalive comments while the retrying transport
-	//     waits for a restarting upstream. See streaming.go.
-	//   - Everything else (non-streaming, GET, etc.): ReverseProxy
-	//     handles it; the retrying transport still covers connection
-	//     errors but no keepalive is possible (can't send partial
-	//     JSON, and non-streaming clients usually have long timeouts).
-	if isStream {
-		p.serveStreamingWithKeepalive(w, r, &ev)
-		ev.LatencyMS = time.Since(start).Milliseconds()
-		p.logger.Log(ev)
-		return
-	}
-
-	if p.admission != nil && p.shouldAdmit(r) {
-		release, _, wait, snap, ok := p.admission.Acquire(r.Context(), p.admissionRequest(r, &ev))
-		ev.QueueMS = wait.Milliseconds()
-		ev.RequestBytes = r.ContentLength
-		ev.ActiveOnArrival = snap.Active
-		ev.QueuedOnArrival = snap.Queued
-		ev.CacheUsedOnArrival = snap.CacheUsed
-		ev.applyAdmissionReport()
-		if !ok {
-			if r.Context().Err() != nil {
+		case "/readyz":
+			if !p.ready.Ready() {
+				http.Error(w, "engine not ready", http.StatusServiceUnavailable)
 				return
 			}
-			status := http.StatusServiceUnavailable
-			if wait == 0 {
-				status = http.StatusTooManyRequests
-			}
-			writeError(w, status, "inference admission queue unavailable")
-			ev.Status = status
-			ev.LatencyMS = time.Since(start).Milliseconds()
-			p.logger.Log(ev)
+			io.WriteString(w, "ok\n")
+			return
+		case "/metrics":
+			p.serveMetrics(w)
 			return
 		}
-		defer release()
 	}
 
-	rw := &capturingWriter{ResponseWriter: w, status: 200, captureBody: shouldCaptureUsage(r.URL.Path)}
-	p.rp.ServeHTTP(rw, r)
-	ev.Status = rw.status
-	if rw.captureBody && rw.status == http.StatusOK {
-		if u, ok := parseUsageFromTail(rw.usageTail()); ok {
-			ev.PromptTokens = u.Prompt
-			ev.CompletionTokens = u.Completion
-			ev.TotalTokens = u.Total
-			ev.CachedPromptTokens = u.Cached
-			// Set before the truncation flag: whether the engine told us about details at
-			// all is a property of the response, not of how much of it we kept.
-			ev.UsageDetails = u.Details
-			ev.UsageTruncated = rw.truncated
-		}
+	start := time.Now()
+	route := apiRoute(r)
+	ev := &Event{TS: start.UTC().Format(time.RFC3339Nano), Method: r.Method, Path: r.URL.Path}
+	defer func() {
+		ev.LatencyMS = time.Since(start).Milliseconds()
+		p.logger.Log(ev)
+		p.metrics.observe(route, ev)
+	}()
+
+	if route == "" {
+		ev.Status = http.StatusNotFound
+		writeError(w, ev.Status, "not found")
+		return
 	}
-	ev.LatencyMS = time.Since(start).Milliseconds()
-	p.logger.Log(ev)
+	who, err := p.auth.Authenticate(r)
+	if err != nil {
+		log.Printf("level=warn msg=\"refused a malformed credential\" err=%q", err.Error())
+	}
+	if who == nil {
+		ev.Status = http.StatusUnauthorized
+		writeError(w, ev.Status, "missing or invalid credentials")
+		return
+	}
+	ev.User, ev.Auth = who.User, who.Source
+
+	// Bound every write: see writeStallTimeout. The deadline is cleared at the end, as
+	// the connection may serve further requests.
+	rc := http.NewResponseController(w)
+	defer rc.SetWriteDeadline(time.Time{})
+	w = &stallGuard{ResponseWriter: w, rc: rc, d: p.writeStall}
+
+	switch route {
+	case "models":
+		p.forward(w, r, ev, "/v1/models", nil)
+	case "tokenize":
+		if raw, ok := p.readBody(w, r, ev); ok {
+			p.forward(w, r, ev, "/tokenize", raw)
+		}
+	default:
+		p.serveInference(w, r, ev, who)
+	}
 }
 
-// shouldRewriteBody decides which routes carry a JSON body with a
-// `model` field that we want to inspect. Keep the list narrow; future
-// vLLM routes that don't take `model` (e.g. /v1/tokenize *does* take
-// model, so it's in) should be added explicitly.
-func (p *Proxy) shouldAdmit(r *http.Request) bool {
-	if r.Method != http.MethodPost {
-		return false
+// readBody reads the request body, at most max_body_bytes of it. On failure it has
+// answered the client: 413 for a body over the limit (refused before reading when the
+// declared length already says so), 400 for one that could not be read.
+func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, ev *Event) ([]byte, bool) {
+	limit := p.cfg.MaxBodyBytes
+	tooLarge := func() ([]byte, bool) {
+		ev.ContentLength = r.ContentLength
+		ev.Status, ev.Error = http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds max_body_bytes (%d)", limit)
+		writeError(w, ev.Status, ev.Error)
+		return nil, false
 	}
-	switch r.URL.Path {
-	case "/v1/chat/completions", "/v1/completions":
-		return true
+	if r.ContentLength > limit {
+		return tooLarge()
 	}
-	return false
+	var buf bytes.Buffer
+	if r.ContentLength > 0 {
+		buf.Grow(int(r.ContentLength) + bytes.MinRead)
+	}
+	_, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, limit))
+	ev.RequestBytes = int64(buf.Len())
+	if err != nil {
+		if errors.As(err, new(*http.MaxBytesError)) {
+			return tooLarge()
+		}
+		ev.ContentLength = r.ContentLength
+		ev.Status, ev.Error = http.StatusBadRequest, "read request body: "+err.Error()
+		writeError(w, ev.Status, ev.Error)
+		return nil, false
+	}
+	return buf.Bytes(), true
 }
 
-func (p *Proxy) shouldRewriteBody(r *http.Request) bool {
-	if r.Method != http.MethodPost {
-		return false
+// serveInference handles an admitted route: parse and amend the body, then forward it
+// as a stream or as one response.
+func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event, who *auth.Result) {
+	raw, ok := p.readBody(w, r, ev)
+	if !ok {
+		return
 	}
-	switch r.URL.Path {
-	case "/v1/chat/completions",
-		"/v1/completions",
-		"/v1/embeddings",
-		"/tokenize",
-		"/v1/tokenize":
-		return true
-	}
-	return false
-}
-
-// rewriteBody reads the JSON request body, swaps the model name if
-// it's an alias, and injects `priority` if non-zero. Returns (ok,
-// isStreaming) where ok=false means the body was malformed and an
-// error response has already been written. isStreaming reports
-// whether the request body has `stream: true`, used by ServeHTTP
-// to pick the right forwarding path (the streaming path emits SSE
-// keepalives during upstream-retry windows).
-//
-// We decode into a generic map so we don't have to enumerate every
-// field the OpenAI / vLLM body schemas support; we only touch
-// `model` and `priority`, leaving the rest byte-equivalent.
-func (p *Proxy) rewriteBody(w http.ResponseWriter, r *http.Request, who *auth.Result, ev *Event) (bool, bool) {
-	// A declared length over the optional per-request cap is refused before the
-	// body is read, so a rejection costs the client the upload it had not sent yet.
-	// The cap is off by default (max_body_bytes: 0): image threads are legitimately
-	// tens of megabytes, and the log showed a 34.7 MB thread rejected after the
-	// client had already spent 32 seconds uploading it.
-	raw, err := readBody(r, p.cfg.MaxBodyBytes, p.cfg.MaxChunkedBodyBytes)
-	if err != nil && !errors.Is(err, errBodyOverBudget) {
-		// Record how much of the body arrived against the declared length so
-		// an aborted or timed-out upload is diagnosable from this log line.
-		ev.RequestBytes = int64(len(raw))
-		if r.ContentLength > 0 {
-			ev.ContentLength = r.ContentLength
-		}
-		if errors.Is(err, errBodyOverBudget) && p.cfg.MaxBodyBytes > 0 {
-			ev.Error = fmt.Sprintf("request body exceeds max_body_bytes (%d)", p.cfg.MaxBodyBytes)
-			writeError(w, http.StatusRequestEntityTooLarge, ev.Error)
-			ev.Status = http.StatusRequestEntityTooLarge
-			return false, false
-		}
-		ev.Error = "read request body: " + err.Error()
-		writeError(w, http.StatusBadRequest, ev.Error)
-		ev.Status = http.StatusBadRequest
-		return false, false
-	}
-	r.Body.Close()
-
-	if p.logRequestBodies {
-		logBodyDump(ev, "raw_in", raw)
-	}
-
 	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil {
-		ev.RequestBytes = int64(len(raw))
-		ev.Error = "request body is not valid JSON"
-		writeError(w, http.StatusBadRequest, ev.Error)
-		ev.Status = http.StatusBadRequest
-		return false, false
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber() // numbers pass through exactly as sent
+	if err := dec.Decode(&body); err != nil || body == nil {
+		ev.Status, ev.Error = http.StatusBadRequest, "request body is not a JSON object"
+		writeError(w, ev.Status, ev.Error)
+		return
 	}
+	raw = nil
 
-	// vLLM Router currently rejects the OpenAI `developer` role before
-	// forwarding the request, even though vLLM itself accepts it. Keep
-	// this compatibility rewrite at the public API boundary so clients
-	// do not need provider-specific workarounds. Remove it after router
-	// PR https://github.com/vllm-project/router/pull/120 is merged and
-	// the deployed router version has been validated with this role.
+	ev.Model, _ = body["model"].(string)
+	// Only a JSON true streams; anything else is a single response.
+	ev.Stream = body["stream"] == true
 	if r.URL.Path == "/v1/chat/completions" {
-		normalizeDeveloperRoles(body)
+		ev.Session = sessionKey(ev.Model, who.Source+"/"+who.User, body)
 	}
 
-	// Detect streaming. The JSON field `stream: true` selects SSE
-	// output from vLLM; non-bool / absent means non-streaming.
-	isStream, _ := body["stream"].(bool)
-
-	// Resolve alias if the caller used one.
-	requested, _ := body["model"].(string)
-	ev.Alias = requested
-	target, override, known := ResolveAlias(requested, p.cfg.Aliases, p.resolver)
-	if known {
-		if target == "" {
-			writeError(w, http.StatusServiceUnavailable,
-				"alias target unresolved; upstream model list not yet known")
-			ev.Status = http.StatusServiceUnavailable
-			return false, false
-		}
-		body["model"] = target
+	// Priority (lower runs first): the caller's identity sets the most urgent it may be;
+	// the body's priority field may only make it run later, since ordering is strict and
+	// an over-eager caller would starve everyone else.
+	ev.Priority = who.Priority
+	if v, ok := intField(body, "priority"); ok {
+		ev.Priority = max(min(max(v, minCallerPriority), maxCallerPriority), who.Priority)
 	}
-	ev.Target, _ = body["model"].(string)
-
-	// Fingerprint the conversation for passive request correlation. An explicit
-	// X-Session-Key wins because it cannot collide across conversations; the
-	// content hash is the fallback for clients that send nothing. This metadata
-	// does not affect admission or vLLM cache behavior.
-	if r.URL.Path == "/v1/chat/completions" {
-		if id := r.Header.Get("X-Session-Key"); id != "" {
-			ev.Session = sessionKeyFromID(ev.Target, who.Source+"/"+who.User, id)
-		} else {
-			ev.Session = sessionKey(ev.Target, who.Source+"/"+who.User, body)
-		}
-	}
-
-	// Determine final priority (lower runs first). The caller's identity sets the base;
-	// a caller may ask to run later (X-Priority header, else the body's priority field)
-	// but never sooner than its identity allows, since ordering is strict and an
-	// over-eager caller would starve everyone else. An alias priority override (the
-	// caller picks the alias) replaces the request's value under the same floor.
-	final := who.Priority
-	if v, ok := callerPriority(r, body); ok {
-		final = max(min(max(v, minCallerPriority), maxCallerPriority), who.Priority)
-	}
-	// Priority is the proxy's to set; the header is not forwarded upstream.
-	r.Header.Del("X-Priority")
-	if override != nil {
-		final = max(*override, who.Priority)
-	}
-	ev.Priority = final
-	if final != 0 {
-		body["priority"] = final
+	if ev.Priority != 0 {
+		body["priority"] = ev.Priority
 	} else {
 		delete(body, "priority")
 	}
-
-	// Inputs for cache-aware admission (cache.go). The body is kept for /tokenize, which
-	// runs in the admission step, after a streaming client already gets keepalives.
-	if p.cfg.Admission.Cache.enabled() && p.shouldAdmit(r) {
-		ev.maxTokens = maxTokensOf(body)
-		ev.textBytes = textBytesOf(body)
-		ev.admitBody = body
-	}
-
-	// Reasoning policy is chat-only: reasoning_effort is consumed while
-	// rendering the chat template, so it has no meaning on raw /v1/completions
-	// and the proxy has no basis to interpret it there. Both steps apply to
-	// aliases and literal IDs alike, because neither overwrites a value the
-	// caller deliberately chose and both reach the same template.
-	if r.URL.Path == "/v1/chat/completions" {
-		if mapping, exists := p.cfg.ReasoningEffortMappings[target]; exists {
-			applyReasoningEffortMapping(body, mapping)
-		}
-		if effort, exists := p.cfg.ReasoningEffortDefaults[target]; exists {
-			applyReasoningEffortDefault(body, effort)
-		}
-	}
-
-	// Sampling policy is model-specific and applies to both generation routes.
-	// Managed aliases apply it authoritatively; literal model IDs preserve
-	// caller sampling values.
-	//
-	// This runs AFTER the reasoning steps on purpose: which preset applies
-	// depends on whether the model will think, and that is only settled once
-	// the effort has been translated and defaulted. Running it first would
-	// pick the preset from the caller's raw body and miss the default we are
-	// about to inject.
-	if r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions" {
-		if policy, exists := p.cfg.SamplingDefaults[target]; exists {
-			// Raw /v1/completions renders no chat template, so no reasoning
-			// scaffold is emitted whatever the body carries, and the
-			// non-thinking row is the honest preset there.
-			thinking := r.URL.Path == "/v1/chat/completions" && isThinkingEnabled(body)
-			applySamplingDefaults(body, policy, known, thinking)
-		}
-	}
-
-	// For streaming requests, ask vLLM to emit the final usage chunk so
-	// we can log token counts (set-if-missing; see ensureStreamUsage).
-	if isStream {
+	// The final usage chunk of a stream is how the proxy learns a turn's size, which
+	// becomes its session's hold.
+	if ev.Stream {
 		ensureStreamUsage(body)
 	}
-
-	// Drop the original bytes before re-encoding. The decoded map owns its own
-	// strings by now, so leaving raw live across the Marshal would hold both
-	// copies at once at the peak of the request.
-	raw = nil
+	ev.maxTokens = maxTokensOf(body)
+	ev.textBytes = textBytesOf(body)
+	ev.body = body
 
 	out, err := json.Marshal(body)
 	if err != nil {
-		// We just decoded this; re-encode failing would be a bug.
-		writeError(w, http.StatusInternalServerError, "re-encode body: "+err.Error())
-		ev.Status = http.StatusInternalServerError
-		return false, false
+		ev.Status, ev.Error = http.StatusBadRequest, "re-encode body: "+err.Error()
+		writeError(w, ev.Status, ev.Error)
+		return
 	}
-	if p.logRequestBodies {
-		logBodyDump(ev, "rewritten_out", out)
+	if ev.Stream {
+		p.serveStream(w, r, ev, out)
+		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(out))
-	r.ContentLength = int64(len(out))
-	r.Header.Set("Content-Length", itoa(len(out)))
-	// Body replay for the retrying transport: if the first upstream
-	// attempt fails on a connection error (vLLM restart), the
-	// transport asks GetBody for a fresh reader to retry with.
-	// Without this, retries of POST endpoints would send an empty
-	// body. Captures `out` by value via the closure.
-	buf := out
-	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(buf)), nil
+
+	release, err := p.admit(r.Context(), r, ev)
+	if err != nil {
+		waitOutcome(ev, err)
+		if ev.Status == http.StatusServiceUnavailable {
+			writeError(w, ev.Status, "the proxy is shutting down; retry")
+		}
+		return
 	}
-	return true, isStream
+	defer release() // runs after the usage below is recorded: admission reads it
+	keep := &bodyKeeper{limit: maxUsageBodyBytes}
+	p.forwardTo(w, r, ev, r.URL.Path, out, keep)
+	if ev.Status == http.StatusOK && !keep.over {
+		if u, ok := parseResponseUsage(keep.buf); ok {
+			ev.setUsage(u)
+		}
+	}
 }
 
-// normalizeDeveloperRoles maps OpenAI's newer developer role to system for
-// compatibility with vLLM Router's currently strict chat-message parser.
-// Malformed message entries are left untouched for the upstream to validate.
-func normalizeDeveloperRoles(body map[string]any) {
-	messages, ok := body["messages"].([]any)
+var (
+	errClientGone   = errors.New("client went away while waiting")
+	errShuttingDown = errors.New("shutting down")
+)
+
+// admit waits for the engine to be ready and for an admission permit, however long
+// that takes. It fails only when the client leaves or the server shuts down.
+func (p *Proxy) admit(ctx context.Context, r *http.Request, ev *Event) (func(), error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-p.closing:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	gone := func() error {
+		select {
+		case <-p.closing:
+			return errShuttingDown
+		default:
+			return errClientGone
+		}
+	}
+
+	start := time.Now()
+	if p.ready.Wait(ctx) != nil {
+		ev.ReadyWaitMS = time.Since(start).Milliseconds()
+		return nil, gone()
+	}
+	ev.ReadyWaitMS = time.Since(start).Milliseconds()
+
+	release, _, wait, snap, ok := p.admission.Acquire(ctx, p.admissionRequest(ctx, r, ev))
+	ev.QueueMS = wait.Milliseconds()
+	ev.ActiveOnArrival, ev.QueuedOnArrival, ev.CacheUsedOnArrival = snap.Active, snap.Queued, snap.CacheUsed
+	ev.applyAdmissionReport()
 	if !ok {
+		return nil, gone()
+	}
+	// The engine may have gone away while this request queued. Wait for it again,
+	// holding the permit: nothing runs meanwhile, and the request keeps its turn.
+	if !p.ready.Ready() {
+		start := time.Now()
+		err := p.ready.Wait(ctx)
+		ev.ReadyWaitMS += time.Since(start).Milliseconds()
+		if err != nil {
+			release()
+			return nil, gone()
+		}
+	}
+	return release, nil
+}
+
+// waitOutcome records a request that left while waiting: 499 when its client went away
+// (nothing to answer), 503 when the server is shutting down.
+func waitOutcome(ev *Event, err error) {
+	ev.Status, ev.Error = statusClientGone, err.Error()
+	if errors.Is(err, errShuttingDown) {
+		ev.Status = http.StatusServiceUnavailable
+	}
+}
+
+// upstreamHeaders are the request headers forwarded to the engine. Everything else
+// (credentials, identity headers, hop-by-hop and proxy headers) stays here.
+var upstreamHeaders = []string{"Content-Type", "Accept", "User-Agent", "X-Request-Id"}
+
+// hopHeaders are response headers that describe one connection and are not forwarded.
+var hopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Connection", "Proxy-Authenticate",
+	"Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+
+// upstreamRequest builds the request to the engine at path.
+func (p *Proxy) upstreamRequest(ctx context.Context, r *http.Request, path string, body []byte) (*http.Request, error) {
+	u := *p.upstream
+	u.Path = strings.TrimRight(u.Path, "/") + path
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, u.String(), rd)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range upstreamHeaders {
+		if v := r.Header.Values(h); len(v) > 0 {
+			req.Header[h] = v
+		}
+	}
+	return req, nil
+}
+
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte) {
+	p.forwardTo(w, r, ev, path, body, nil)
+}
+
+// forwardTo sends the request to the engine and relays the response. keep, when set,
+// also receives the response body. A response cut short aborts the client's connection,
+// so the client cannot mistake it for a complete one.
+func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte, keep *bodyKeeper) {
+	req, err := p.upstreamRequest(r.Context(), r, path, body)
+	if err != nil {
+		ev.Status, ev.Error = http.StatusInternalServerError, err.Error()
+		writeError(w, ev.Status, "internal error")
 		return
 	}
-	for _, raw := range messages {
-		message, ok := raw.(map[string]any)
-		if !ok {
-			continue
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if r.Context().Err() != nil {
+			ev.Status, ev.Error = statusClientGone, "client went away"
+			return
 		}
-		if role, _ := message["role"].(string); role == "developer" {
-			message["role"] = "system"
-		}
-	}
-}
-
-// applySamplingDefaults picks the preset for the requested thinking mode.
-// Managed aliases use authoritative=true and overwrite configured keys.
-// Literal IDs preserve caller keys, including meaningful explicit zeroes,
-// and fill only keys that are absent.
-func applySamplingDefaults(body map[string]any, sd ModelSamplingDefaults, authoritative, thinking bool) {
-	defaults := sd.NoThinking
-	if thinking {
-		defaults = sd.Thinking
-	}
-	// A model that configures only one row has no mode-specific policy: that
-	// row is simply its sampling policy, so use it either way. Without this,
-	// a non-thinking model configured with just `no_thinking` would get no
-	// policy at all, since thinking is the default for the models that do
-	// distinguish. Both rows empty stays a no-op.
-	if len(defaults) == 0 {
-		if thinking {
-			defaults = sd.NoThinking
-		} else {
-			defaults = sd.Thinking
-		}
-	}
-	for k, v := range defaults {
-		if authoritative {
-			body[k] = v
-			continue
-		}
-		if _, exists := body[k]; !exists {
-			body[k] = v
-		}
-	}
-}
-
-// applyReasoningEffortMapping replaces an explicitly requested effort when
-// the served model defines a translation for it. Missing and non-string
-// values remain untouched for upstream validation.
-func applyReasoningEffortMapping(body map[string]any, mapping map[string]string) {
-	effort, ok := body["reasoning_effort"].(string)
-	if !ok {
+		ev.Status, ev.Error = http.StatusBadGateway, "engine request failed: "+err.Error()
+		writeError(w, ev.Status, "inference upstream request failed")
 		return
 	}
-	if replacement, exists := mapping[effort]; exists {
-		body["reasoning_effort"] = replacement
+	defer resp.Body.Close()
+	ev.Status = resp.StatusCode
+	h := w.Header()
+	for k, v := range resp.Header {
+		h[k] = v
 	}
-}
-
-// applyReasoningEffortDefault fills the effort for callers who omitted it, so
-// an unspecified request means what the service chose rather than whatever the
-// upstream chat template happens to default to. Any present value wins,
-// including a non-string one, which is left for the upstream to reject.
-//
-// An explicit chat_template_kwargs.enable_thinking=false is also caller intent,
-// expressed through the older per-template surface, so no default is added on
-// top of it. vLLM only derives enable_thinking from reasoning_effort when the
-// caller did not set it, so injecting here would be inert rather than harmful,
-// but adding a second contradictory control would still be confusing and would
-// depend on that precedence rule holding.
-func applyReasoningEffortDefault(body map[string]any, effort string) {
-	if _, exists := body["reasoning_effort"]; exists {
-		return
+	for _, k := range hopHeaders {
+		h.Del(k)
 	}
-	if thinkingExplicitlyDisabled(body) {
-		return
-	}
-	body["reasoning_effort"] = effort
-}
-
-// thinkingExplicitlyDisabled reports whether the caller turned thinking off
-// through chat_template_kwargs. It differs from isThinkingEnabled, which cannot
-// distinguish an absent flag from an explicit false.
-func thinkingExplicitlyDisabled(body map[string]any) bool {
-	ctk, ok := body["chat_template_kwargs"].(map[string]any)
-	if !ok {
-		return false
-	}
-	val, ok := ctk["enable_thinking"].(bool)
-	return ok && !val
-}
-
-// isThinkingEnabled reports whether the request will produce reasoning.
-//
-// Thinking is assumed on unless turned off, as in chat templates like Qwen3's,
-// where an absent reasoning_effort makes the template pick its top tier, so silence means thinking, not
-// silence means off. Only two things turn it off, and both are explicit:
-// reasoning_effort "none", or chat_template_kwargs.enable_thinking false.
-//
-// enable_thinking is checked first because it wins upstream too: vLLM only
-// derives enable_thinking from reasoning_effort when the caller did not set
-// it (chat_completion/protocol.py:587). That same precedence is why a
-// reasoning_effort of "none" reaches the template at all instead of being
-// rejected as an unsupported tier.
-//
-// Call this only for chat requests. Raw /v1/completions renders no template,
-// so no reasoning is emitted regardless of what the body carries.
-func isThinkingEnabled(body map[string]any) bool {
-	if ctk, ok := body["chat_template_kwargs"].(map[string]any); ok {
-		if val, ok := ctk["enable_thinking"].(bool); ok {
-			return val
+	w.WriteHeader(resp.StatusCode)
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			keep.Write(buf[:n])
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				ev.Error = "client went away: " + werr.Error()
+				return
+			}
+		}
+		if rerr == io.EOF {
+			return
+		}
+		if rerr != nil {
+			ev.Error = "engine response cut: " + rerr.Error()
+			if r.Context().Err() != nil {
+				ev.Error = "client went away"
+				return
+			}
+			panic(http.ErrAbortHandler)
 		}
 	}
-	if effort, ok := body["reasoning_effort"].(string); ok && effort == "none" {
-		return false
-	}
-	return true
 }
 
-// serveModels returns a synthetic /v1/models response listing both
-// the configured aliases and the literal upstream
-// model id. The literal name was always passthrough-callable;
-// including it in the list just makes it discoverable for callers who
-// want to pin a specific model regardless of what an alias resolves to.
-//
-// owned_by distinguishes the two: aliases are "cavp",
-// the literal upstream is "vllm". A client showing model lists can
-// reasonably treat that as a grouping hint.
-func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request) {
-	type modelEntry struct {
-		ID          string `json:"id"`
-		Object      string `json:"object"`
-		Created     int64  `json:"created"`
-		OwnedBy     string `json:"owned_by"`
-		Description string `json:"description,omitempty"`
-		MaxModelLen int64  `json:"max_model_len,omitempty"`
-	}
-	now := time.Now().Unix()
-	out := struct {
-		Object string       `json:"object"`
-		Data   []modelEntry `json:"data"`
-	}{Object: "list"}
-	maxModelLen := p.resolver.MaxModelLen()
-	for name, alias := range p.cfg.Aliases {
-		out.Data = append(out.Data, modelEntry{
-			ID:          name,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "cavp",
-			Description: alias.Description,
-			MaxModelLen: maxModelLen,
-		})
-	}
-	// Include the upstream's literal name when known. When the
-	// resolver hasn't refreshed yet (or the upstream is down), we
-	// just omit it; the aliases still work, and a missing entry is
-	// less surprising than a placeholder.
-	if up := p.resolver.Current(); up != "" {
-		out.Data = append(out.Data, modelEntry{
-			ID:          up,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "vllm",
-			Description: "Literal upstream model id. Use it to pin a specific model version, bypassing alias indirection. This changes when the model is updated, at which point requests using this id will break until you update to the new id shown here.",
-			MaxModelLen: maxModelLen,
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+// bodyKeeper keeps a copy of a response body up to limit; over it, it keeps nothing.
+type bodyKeeper struct {
+	limit int
+	buf   []byte
+	over  bool
 }
 
-// maxUsageCaptureBytes caps how much of a non-streaming response we
-// buffer to parse its `usage` object. Chat/completions JSON is small;
-// embeddings responses can be large (float arrays), so we stop
-// capturing past the cap and skip usage parsing rather than buffer an
-// unbounded body. The client still gets every byte (Write always
-// forwards); only our side copy is bounded.
-// maxUsageTailBytes is how much of the *end* of a response is kept to find the
-// usage object. vLLM writes usage last in a JSON completion and in the final
-// chunk of a stream, so the tail is the part worth keeping. The previous design
-// kept the first 4 MiB and gave up past it, which silently dropped usage on long
-// agentic responses: the biggest, most expensive turns were the ones with no
-// token accounting, including the cached_tokens measurement.
-const maxUsageTailBytes = 64 << 10
+func (k *bodyKeeper) Write(b []byte) {
+	if k == nil || k.over {
+		return
+	}
+	if len(k.buf)+len(b) > k.limit {
+		k.buf, k.over = nil, true
+		return
+	}
+	k.buf = append(k.buf, b...)
+}
 
-// capturingWriter remembers the response status for logging without
-// breaking streaming. Implements http.Flusher so ReverseProxy can
-// flush through it for SSE. When captureBody is set it also tees the
-// response body (up to maxUsageCaptureBytes) so the caller can parse
-// token usage after ServeHTTP returns.
-type capturingWriter struct {
+// stallGuard gives each write to the client writeStallTimeout to complete.
+type stallGuard struct {
 	http.ResponseWriter
-	status      int
-	captureBody bool
-	tail        []byte
-	truncated   bool
+	rc *http.ResponseController
+	d  time.Duration
 }
 
-func (c *capturingWriter) WriteHeader(s int) {
-	c.status = s
-	c.ResponseWriter.WriteHeader(s)
+func (s *stallGuard) Write(b []byte) (int, error) {
+	_ = s.rc.SetWriteDeadline(time.Now().Add(s.d))
+	return s.ResponseWriter.Write(b)
 }
 
-func (c *capturingWriter) Write(b []byte) (int, error) {
-	if c.captureBody {
-		c.tail = append(c.tail, b...)
-		// Trim at twice the target so the copy is amortised. Trimming on every
-		// write would copy 64 KiB for each 50-byte SSE chunk, which is more CPU
-		// than the response deserves.
-		if len(c.tail) > 2*maxUsageTailBytes {
-			c.tail = c.tail[len(c.tail)-maxUsageTailBytes:]
-			c.truncated = true
-		}
-	}
-	return c.ResponseWriter.Write(b)
+func (s *stallGuard) Flush() {
+	_ = s.rc.SetWriteDeadline(time.Now().Add(s.d))
+	_ = s.rc.Flush()
 }
 
-// usageTail returns the kept tail, capped at maxUsageTailBytes.
-func (c *capturingWriter) usageTail() []byte {
-	if len(c.tail) > maxUsageTailBytes {
-		return c.tail[len(c.tail)-maxUsageTailBytes:]
-	}
-	return c.tail
+func (s *stallGuard) FlushError() error {
+	_ = s.rc.SetWriteDeadline(time.Now().Add(s.d))
+	return s.rc.Flush()
 }
 
-// usageCapturePaths are the non-streaming endpoints whose JSON bodies
-// carry a `usage` object worth logging.
-func shouldCaptureUsage(path string) bool {
-	switch path {
-	case "/v1/chat/completions", "/v1/completions", "/v1/embeddings":
-		return true
-	}
-	return false
-}
-
-func (c *capturingWriter) Flush() {
-	if f, ok := c.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
+func (s *stallGuard) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"message": msg, "type": "proxy_error"},
+		"error": map[string]any{"message": msg, "type": "proxy_error", "code": status},
 	})
 }
 
-func writeUpstreamUnavailable(w http.ResponseWriter, health *upstreamHealth) {
-	retryAfter := 10
-	if health != nil {
-		retryAfter = health.RetryAfterSeconds()
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"message": "Inference is currently offline",
-			"type":    "upstream_unavailable",
-			"code":    "upstream_offline",
-		},
-	})
-}
-
-// envFlag returns true for env values "1", "true", "yes" (case-
-// insensitive); false otherwise. Used by opt-in diagnostic knobs.
-func envFlag(name string) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
-	return v == "1" || v == "true" || v == "yes"
-}
-
-// logBodyDump prints a request-body dump line for diagnostic
-// purposes. Truncates at maxBodyDumpBytes to keep log files
-// manageable; vision payloads can be several MB and we never want
-// those landing whole in stderr. The cap is generous because long-
-// context agent traffic regularly exceeds 16 KB once tools + skills
-// + a few prior turns are spliced in, and a truncated body is much
-// less useful than the full picture for diagnosis. Vision payloads
-// (base64 PNGs) will still hit the cap, which is intentional.
-const maxBodyDumpBytes = 256 * 1024
-
-func logBodyDump(ev *Event, label string, body []byte) {
-	truncated := ""
-	dump := body
-	if len(dump) > maxBodyDumpBytes {
-		dump = dump[:maxBodyDumpBytes]
-		truncated = fmt.Sprintf(" (truncated from %d bytes)", len(body))
-	}
-	log.Printf("body_dump path=%s alias=%q target=%q user=%q %s%s: %s",
-		ev.Path, ev.Alias, ev.Target, ev.User, label, truncated, dump)
-}
-
-// itoa avoids strconv for a value we know fits a small int.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}
-
-// admissionRequest builds the admission inputs. With cache-aware admission it tokenizes
-// the request first (exact size and the token IDs the KV mirror needs); on the streaming
-// path this runs after SSE keepalives started. Observe reads ev at release time; both
-// forwarding paths fill the usage fields before their deferred release runs.
-func (p *Proxy) admissionRequest(r *http.Request, ev *Event) AdmissionRequest {
-	report := &AdmissionReport{}
+// admissionRequest builds the admission inputs. It tokenizes the prompt first (exact
+// size, and the token IDs the KV mirror needs); on the streaming path keepalives are
+// already flowing. Observe reads ev when the permit is released, after the forwarding
+// path recorded the status and usage.
+func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event) AdmissionRequest {
+	ev.report = &AdmissionReport{}
 	ev.generated = &atomic.Int64{}
 	ar := AdmissionRequest{
-		Generated: ev.generated,
-		Priority:  ev.Priority,
-		Session:   ev.Session, MaxTokens: ev.maxTokens,
-		Report: report,
+		Priority: ev.Priority, Session: ev.Session, MaxTokens: ev.maxTokens,
+		Generated: ev.generated, Report: ev.report,
 		Observe: func() (CacheObservation, bool) {
 			if ev.PromptTokens <= 0 || ev.Status != http.StatusOK {
 				return CacheObservation{}, false
@@ -866,33 +491,27 @@ func (p *Proxy) admissionRequest(r *http.Request, ev *Event) AdmissionRequest {
 			return CacheObservation{PromptTokens: ev.PromptTokens, CompletionTokens: ev.CompletionTokens}, true
 		},
 	}
-	ev.report = report
-	if body := ev.admitBody; body != nil {
-		ev.admitBody = nil
-		block := p.cfg.Admission.Cache.BlockTokens
-		if p.mirror != nil && p.mirror.BlockSize() > 0 {
-			block = p.mirror.BlockSize()
-		}
-
-		start := time.Now()
-		tokens, err := p.tokenize(r.Context(), r.URL.Path, body, tokenizeTimeout)
-		ev.TokenizeMS = time.Since(start).Milliseconds()
-		if err == nil {
-			ar.PromptTokens = len(tokens)
-			if p.mirror != nil {
-				ar.Blocks = p.mirror.NewPromptKeys(tokens)
-			} else {
-				ar.Blocks = kvmirror.PromptKeys{Blocks: kvmirror.PromptBlockKeys(tokens, block)}
-			}
-			ev.Tokenized = true
-		} else {
-			// Never charge less than the estimate: a 4xx may be a validation failure the
-			// real request repeats, or a changed route that it does not.
-			ar.PromptTokens = FallbackPrompt(ev.textBytes)
-			ev.TokenizeError = err.Error()
-		}
-		ev.EstPromptTokens = ar.PromptTokens
+	body := ev.body
+	ev.body = nil
+	if body == nil {
+		return ar
 	}
+	start := time.Now()
+	tokens, err := p.tokenize(ctx, r.URL.Path, body, tokenizeTimeout)
+	ev.TokenizeMS = time.Since(start).Milliseconds()
+	if err == nil {
+		ar.PromptTokens = len(tokens)
+		if p.mirror != nil {
+			ar.Blocks = p.mirror.NewPromptKeys(tokens)
+		}
+		ev.Tokenized = true
+	} else {
+		// Never charge less than the estimate: a 4xx may be a validation failure the
+		// real request repeats, or a changed route that it does not.
+		ar.PromptTokens = FallbackPrompt(ev.textBytes)
+		ev.TokenizeError = err.Error()
+	}
+	ev.EstPromptTokens = ar.PromptTokens
 	return ar
 }
 
@@ -908,25 +527,24 @@ func (ev *Event) applyAdmissionReport() {
 	ev.DisplaceCostS = math.Round(ev.report.DisplaceCostS*10) / 10
 }
 
-// callerPriority reads a caller-chosen priority: the X-Priority header, else a numeric
-// priority field in the body.
-func callerPriority(r *http.Request, body map[string]any) (int, bool) {
-	if h := strings.TrimSpace(r.Header.Get("X-Priority")); h != "" {
-		if v, err := strconv.Atoi(h); err == nil {
-			return v, true
-		}
+// intField reads an integer field of the body.
+func intField(body map[string]any, key string) (int, bool) {
+	n, ok := body[key].(json.Number)
+	if !ok {
+		return 0, false
 	}
-	if v, ok := body["priority"].(float64); ok && v == float64(int(v)) {
-		return int(v), true
+	v, err := n.Int64()
+	if err != nil || v != int64(int(v)) {
+		return 0, false
 	}
-	return 0, false
+	return int(v), true
 }
 
 // maxTokensOf returns the request's output cap, or 0 when it has none.
 func maxTokensOf(body map[string]any) int {
 	for _, k := range []string{"max_completion_tokens", "max_tokens"} {
-		if v, ok := body[k].(float64); ok && v > 0 {
-			return int(v)
+		if v, ok := intField(body, k); ok && v > 0 {
+			return v
 		}
 	}
 	return 0
@@ -959,8 +577,7 @@ func textBytesOf(v any) int64 {
 
 // tokenize asks the engine for the prompt's token IDs, rendering the chat template
 // exactly as the real request will (same messages, tools and template kwargs; the
-// engine applies its own defaults in both paths). status is the HTTP status when the
-// engine answered.
+// engine applies its own defaults in both paths).
 func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any, timeout time.Duration) ([]int64, error) {
 	req := map[string]any{"model": body["model"]}
 	if path == "/v1/chat/completions" {
@@ -1007,7 +624,7 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any, 
 		return nil, ctx.Err()
 	}
 	u := *p.upstream
-	u.Path = "/tokenize"
+	u.Path = strings.TrimRight(u.Path, "/") + "/tokenize"
 	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
@@ -1019,7 +636,6 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		return nil, fmt.Errorf("tokenize HTTP %d", resp.StatusCode)
 	}
 	var out struct {

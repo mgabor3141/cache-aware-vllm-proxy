@@ -1,201 +1,186 @@
-// streaming_test.go — verify the keepalive-aware streaming handler.
-//
-// We're testing behaviour the user actually cares about, not internal
-// state:
-//
-//  1. While upstream is unavailable, the client receives SSE keepalive
-//     lines so its connection doesn't time out.
-//  2. Once upstream becomes available, real SSE events flow through.
-//  3. If the engine stays down past the recovery timeout, the client receives an SSE error event
-//     and a [DONE] marker so the chat UI can render a clean error
-//     rather than hanging.
-//  4. The Authorization header is stripped before reaching upstream.
 package proxy
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
-// makeTestProxy builds a minimal Proxy with the given upstream URL
-// and retry config, wired with a real *httputil.ReverseProxy (its
-// .Transport field is what serveStreamingWithKeepalive reads). No
-// auth, no resolver: those paths aren't exercised by streaming
-// tests.
-func makeTestProxy(t *testing.T, upstreamURL string, ready *atomic.Bool) *Proxy {
-	t.Helper()
-	u, err := url.Parse(upstreamURL)
-	if err != nil {
-		t.Fatalf("parse upstream: %v", err)
-	}
-	h := liveHealth(t, ready)
-	flakey := &flakeyTransport{base: http.DefaultTransport}
-	rp := &httputil.ReverseProxy{
-		Transport: newHealthAwareRetryingTransport(flakey, h.cfg, h),
-	}
-	return &Proxy{
-		cfg:      &Config{Upstream: upstreamURL, Retry: h.cfg},
-		upstream: u,
-		logger:   NewEventLogger(io.Discard),
-		rp:       rp,
-		health:   h,
-	}
-}
+const streamBody = `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 
-// flakeyOf reaches into the proxy's retrying transport stack and
-// returns the embedded *flakeyTransport so tests can configure
-// its per-test failure count and read its attempt counter.
-func flakeyOf(p *Proxy) *flakeyTransport {
-	rt := p.rp.Transport.(*retryingTransport)
-	return rt.base.(*flakeyTransport)
-}
+const (
+	sseChunk = `data: {"id":"c","choices":[{"index":0,"delta":{"content":"x"}}],"usage":null}` + "\n\n"
+	sseUsage = `data: {"id":"c","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":2,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":32}},"kv_transfer_params":null}` + "\n\n"
+	sseDone  = "data: [DONE]\n\n"
+)
 
-func TestStreaming_Success_AfterTransientUpstreamFailures(t *testing.T) {
-	// Upstream that refuses connections for the first 2 attempts,
-	// then accepts and returns a single SSE chunk + [DONE]. We
-	// verify the client sees the real chunk after the retries
-	// complete and that the auth header is stripped on the way
-	// upstream.
-	realUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "" {
-			t.Errorf("upstream saw Authorization header: %q", r.Header.Get("Authorization"))
-		}
+func sseEngine(parts ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher, _ := w.(http.Flusher)
-		_, _ = fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`+"\n\n")
-		flusher.Flush()
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
-	}))
-	defer realUp.Close()
-
-	ready := &atomic.Bool{}
-	ready.Store(true)
-	p := makeTestProxy(t, realUp.URL, ready)
-	flakey := flakeyOf(p)
-	flakey.failures = 2
-
-	req := buildStreamReq(t)
-	rec := httptest.NewRecorder()
-	ev := &Event{Path: "/v1/chat/completions"}
-	p.serveStreamingWithKeepalive(rec, req, ev)
-
-	if rec.Result().StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 (streaming committed), got %d", rec.Result().StatusCode)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, `data: {"choices":[{"delta":{"content":"hi"}}]}`) {
-		t.Fatalf("missing real SSE chunk; got body:\n%s", body)
-	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("missing [DONE] marker; got body:\n%s", body)
-	}
-	if got := flakey.attempts.Load(); got != 3 {
-		t.Fatalf("expected 3 upstream attempts (2 fail + 1 success), got %d", got)
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
-		t.Fatalf("expected Content-Type text/event-stream, got %q", ct)
+		for _, p := range parts {
+			io.WriteString(w, p)
+			w.(http.Flusher).Flush()
+		}
 	}
 }
 
-func TestStreaming_RetriesExhausted_EmitsSSEError(t *testing.T) {
-	// Upstream never recovers within the retry budget. We've
-	// already committed HTTP 200 (sent SSE headers immediately so
-	// the client connection stays alive), so the failure has to
-	// surface as an SSE error event + [DONE] marker. Chat UIs
-	// render this as an in-conversation error message rather than
-	// a transport failure.
-	ready := &atomic.Bool{}
-	ready.Store(true)
-	p := makeTestProxy(t, "http://placeholder", ready)
-	flakey := flakeyOf(p)
-	flakey.failures = 100                         // always fail
-	flakey.onFail = func() { ready.Store(false) } // and the engine stays down
-
-	req := buildStreamReq(t)
-	rec := httptest.NewRecorder()
-	ev := &Event{Path: "/v1/chat/completions"}
-	p.serveStreamingWithKeepalive(rec, req, ev)
-
-	if rec.Result().StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 (streaming committed), got %d", rec.Result().StatusCode)
+func TestStreamRelaysAndRecordsUsage(t *testing.T) {
+	var sent atomic.Value
+	stream := sseEngine(sseChunk, sseChunk, sseUsage, sseDone)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		json.NewDecoder(r.Body).Decode(&b)
+		sent.Store(b)
+		stream(w, r)
+	}, nil)
+	code, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if code != 200 || body != sseChunk+sseChunk+sseUsage+sseDone {
+		t.Fatalf("%d %q", code, body)
 	}
-	body := rec.Body.String()
+	so, _ := sent.Load().(map[string]any)["stream_options"].(map[string]any)
+	if so["include_usage"] != true {
+		t.Errorf("include_usage not set: %v", sent.Load())
+	}
+	ev := h.event(1)
+	if num(ev["status"]) != 200 || ev["error"] != nil || ev["stream"] != true ||
+		num(ev["prompt_tokens"]) != 40 || num(ev["cached_prompt_tokens"]) != 32 {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// A caller that sets include_usage keeps its value.
+func TestStreamIncludeUsageRespected(t *testing.T) {
+	var sent atomic.Value
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		sent.Store(string(b))
+		sseEngine(sseDone)(w, r)
+	}, nil)
+	h.do("POST", "/v1/chat/completions", `{"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]}`, nil)
+	if !strings.Contains(sent.Load().(string), `"include_usage":false`) {
+		t.Fatal(sent.Load())
+	}
+}
+
+// Only a JSON true streams; "stream":"true" is a single response, documented.
+func TestStreamNeedsJSONTrue(t *testing.T) {
+	var sent atomic.Value
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		sent.Store(string(b))
+		w.Write([]byte("{}"))
+	}, nil)
+	h.do("POST", "/v1/chat/completions", `{"model":"m","stream":"true","messages":[]}`, nil)
+	if strings.Contains(sent.Load().(string), "include_usage") || h.event(1)["stream"] != nil {
+		t.Fatal("a string stream field took the streaming path")
+	}
+}
+
+// An engine refusal reaches the client as an error event with the engine's message, and
+// the log carries the engine's status (cv-54 #3, cv-59 #2).
+func TestStreamEngineErrorLogged(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		io.WriteString(w, `{"object":"error","message":"prompt too long","type":"BadRequestError","code":400}`+strings.Repeat(" ", 1<<20))
+	}, nil)
+	code, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if code != 200 || !strings.Contains(body, "prompt too long") || !strings.HasSuffix(body, sseDone) {
+		t.Fatalf("%d %q", code, body)
+	}
+	if ev := h.event(1); num(ev["status"]) != 400 || !strings.Contains(fmt.Sprint(ev["error"]), "prompt too long") {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// A transport failure names no internal address to the client (cv-56 #5).
+func TestStreamEngineUnreachable(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.eng.Close()
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if !strings.Contains(body, `"error"`) || strings.Contains(body, "127.0.0.1") {
+		t.Fatalf("%q", body)
+	}
+	if ev := h.event(1); num(ev["status"]) != 502 {
+		t.Fatalf("log: %v", ev)
+	}
+}
+
+// A stream that ends without [DONE] is an error, for the client and in the log (cv-54 #1).
+func TestStreamWithoutDone(t *testing.T) {
+	h := newHarness(t, sseEngine(sseChunk), nil)
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
 	if !strings.Contains(body, `"error"`) {
-		t.Fatalf("missing error event in SSE; got body:\n%s", body)
+		t.Fatalf("client not told: %q", body)
 	}
-	if !strings.Contains(body, `"proxy_retry_exhausted"`) {
-		t.Fatalf("missing proxy_retry_exhausted code; got body:\n%s", body)
-	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("missing [DONE] marker after error; got body:\n%s", body)
-	}
-	// Verify the SSE error payload parses as JSON.
-	found := false
-	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, `data: {"error"`) {
-			payload := strings.TrimPrefix(line, "data: ")
-			var v map[string]any
-			if err := json.Unmarshal([]byte(payload), &v); err != nil {
-				t.Fatalf("error payload is not valid JSON: %v\n%s", err, payload)
-			}
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("didn't find an SSE data line containing an error JSON")
+	if ev := h.event(1); !strings.Contains(fmt.Sprint(ev["error"]), "without [DONE]") {
+		t.Fatalf("log: %v", ev)
 	}
 }
 
-// flakeyTransport fails the first N attempts with connection-refused
-// errors, then forwards subsequent attempts to the embedded base
-// transport. Used to simulate a vLLM restart that lasts N attempts.
-type flakeyTransport struct {
-	attempts atomic.Int32
-	failures int
-	onFail   func()
-	base     http.RoundTripper
-}
-
-func (f *flakeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	n := f.attempts.Add(1)
-	if int(n) <= f.failures {
-		if f.onFail != nil {
-			f.onFail()
-		}
-		return nil, fmt.Errorf("dial tcp 10.0.0.2:8000: connect: connection refused")
+// A stream cut by the engine is an error too.
+func TestStreamCutByEngine(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		sseEngine(sseChunk)(w, r)
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	}, nil)
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if !strings.Contains(body, `"error"`) {
+		t.Fatalf("client not told: %q", body)
 	}
-	return f.base.RoundTrip(req)
+	if ev := h.event(1); !strings.Contains(fmt.Sprint(ev["error"]), "engine stream cut") {
+		t.Fatalf("log: %v", ev)
+	}
 }
 
-// buildStreamReq builds a POST /v1/chat/completions request with a
-// stream:true body and an Authorization header (which the streaming
-// handler should strip before sending upstream). Sets GetBody so
-// the retrying transport can replay.
-func buildStreamReq(t *testing.T) *http.Request {
-	t.Helper()
-	body := []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	req, err := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+// A streaming client gets keepalives while it waits for the engine, then the stream.
+func TestStreamKeepaliveWhileWaiting(t *testing.T) {
+	h := newHarness(t, sseEngine(sseChunk, sseDone), nil)
+	h.p.keepalive = 40 * time.Millisecond
+	h.p.ready.set(false, "test")
+	resp, err := h.request(context.Background(), "POST", "/v1/chat/completions", streamBody, nil)
 	if err != nil {
-		t.Fatalf("new req: %v", err)
+		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer test")
-	req.Header.Set("Content-Type", "application/json")
-	req.ContentLength = int64(len(body))
-	buf := body
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(buf)), nil
+	defer resp.Body.Close()
+	buf := make([]byte, len(keepaliveLine))
+	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != keepaliveLine {
+		t.Fatalf("%q %v", buf, err)
 	}
-	return req
+	h.p.ready.set(true, "")
+	rest, _ := io.ReadAll(resp.Body)
+	if !strings.HasSuffix(string(rest), sseChunk+sseDone) {
+		t.Fatalf("%q", rest)
+	}
+}
+
+// Keepalives fill silences only: none while chunks flow, one during a long prefill
+// (cv-54 #10).
+func TestKeepaliveOnlyWhenSilent(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		time.Sleep(300 * time.Millisecond) // prefill
+		for i := 0; i < 30; i++ {
+			io.WriteString(w, sseChunk)
+			w.(http.Flusher).Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+		io.WriteString(w, sseDone)
+	}, nil)
+	h.p.keepalive = 100 * time.Millisecond
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	first := strings.Index(body, "data:")
+	if first < 0 || !strings.Contains(body[:first], keepaliveLine) {
+		t.Fatalf("no keepalive during the prefill: %q", body)
+	}
+	if strings.Contains(body[first:], keepaliveLine) {
+		t.Fatalf("keepalive between chunks: %q", body)
+	}
 }
