@@ -213,3 +213,36 @@ func TestStreamFeedsOutputCounter(t *testing.T) {
 		t.Fatalf("after usage: %d, want the engine's 2", got)
 	}
 }
+
+// When the engine dies inside an event, the error event still starts on a line of its
+// own, so the client can parse it (rev-1 #1).
+func TestStreamErrorAfterPartialEvent(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		sseEngine(sseChunk, `data: {"choices":[{"del`)(w, r)
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	}, nil)
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if !strings.Contains(body, "\n\ndata: {\"error\"") || !strings.HasSuffix(body, sseDone) {
+		t.Fatalf("%q", body)
+	}
+	// Each event parses: the cut one is skipped by a client, the error is not lost.
+	events := strings.Split(strings.TrimSpace(body), "\n\n")
+	if last := events[len(events)-2]; !strings.HasPrefix(last, `data: {"error"`) {
+		t.Fatalf("error event %q", last)
+	}
+}
+
+// A keepalive never lands inside an event the engine is still writing (rev-1 #2).
+func TestNoKeepaliveInsideAnEvent(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		sseEngine(`data: {"choices":[{"del`)(w, r)
+		time.Sleep(300 * time.Millisecond)
+		sseEngine(`ta":{}}]}`+"\n\n", sseDone)(w, r)
+	}, nil)
+	h.p.keepalive = 40 * time.Millisecond
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if !strings.Contains(body, `data: {"choices":[{"delta":{}}]}`+"\n\n") {
+		t.Fatalf("event corrupted: %q", body)
+	}
+}

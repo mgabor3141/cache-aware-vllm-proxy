@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -88,7 +89,7 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			scan.Write(buf[:n])
-			if werr := sw.write(buf[:n]); werr != nil {
+			if werr := sw.relay(buf[:n]); werr != nil {
 				ev.Error = "client went away mid-stream: " + werr.Error()
 				return
 			}
@@ -137,18 +138,19 @@ func engineErrorMessage(r io.Reader) string {
 }
 
 // sseWriter serialises writes from the stream copier and the keepalive goroutine, and
-// flushes each one.
+// flushes each one. It tracks whether the relayed engine stream stopped inside an event,
+// so nothing of the proxy's own (a keepalive, an error event) lands in the middle of one.
 type sseWriter struct {
 	mu     sync.Mutex
 	w      http.ResponseWriter
 	cancel context.CancelFunc
-	wrote  bool // since the last keepalive check
+	wrote  bool    // since the last keepalive check
+	tail   [4]byte // last bytes relayed from the engine
+	open   bool    // the relayed stream ends inside an event
 	failed bool
 }
 
-func (s *sseWriter) write(b []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *sseWriter) writeLocked(b []byte) error {
 	if s.failed {
 		return os.ErrClosed
 	}
@@ -165,14 +167,57 @@ func (s *sseWriter) write(b []byte) error {
 	return nil
 }
 
+func (s *sseWriter) write(b []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeLocked(b)
+}
+
+// relay writes engine bytes and notes whether they end at an event boundary (a blank
+// line).
+func (s *sseWriter) relay(b []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(b) >= len(s.tail) {
+		copy(s.tail[:], b[len(b)-len(s.tail):])
+	} else {
+		n := copy(s.tail[:], s.tail[len(b):])
+		copy(s.tail[n:], b)
+	}
+	t := string(s.tail[:])
+	s.open = !strings.HasSuffix(t, "\n\n") && t != "\r\n\r\n"
+	return s.writeLocked(b)
+}
+
 func (s *sseWriter) flush() { _ = s.write(nil) }
 
-// errorEvent sends an OpenAI-style error event and ends the stream.
+// keepaliveTick sends a keepalive comment if nothing was written since the last tick
+// and the stream is between events.
+func (s *sseWriter) keepaliveTick() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idle := !s.wrote
+	s.wrote = false
+	if !idle || s.open {
+		return nil
+	}
+	return s.writeLocked([]byte(keepaliveLine))
+}
+
+// errorEvent sends an OpenAI-style error event and ends the stream. If the engine's
+// stream stopped inside an event, that event is terminated first, so the error is a
+// line of its own.
 func (s *sseWriter) errorEvent(msg string, code int) {
 	payload, _ := json.Marshal(map[string]any{
 		"error": map[string]any{"message": msg, "type": "proxy_error", "code": code},
 	})
-	_ = s.write([]byte("data: " + string(payload) + "\n\ndata: [DONE]\n\n"))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ev := "data: " + string(payload) + "\n\ndata: [DONE]\n\n"
+	if s.open {
+		ev = "\n\n" + ev
+	}
+	_ = s.writeLocked([]byte(ev))
 }
 
 // keepalive sends a comment whenever nothing was written for about an interval, until
@@ -188,11 +233,7 @@ func (s *sseWriter) keepalive(interval time.Duration) (stop func()) {
 			case <-quit:
 				return
 			case <-t.C:
-				s.mu.Lock()
-				idle := !s.wrote
-				s.wrote = false
-				s.mu.Unlock()
-				if idle && s.write([]byte(keepaliveLine)) != nil {
+				if s.keepaliveTick() != nil {
 					return
 				}
 			}
