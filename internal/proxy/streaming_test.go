@@ -184,3 +184,32 @@ func TestKeepaliveOnlyWhenSilent(t *testing.T) {
 		t.Fatalf("keepalive between chunks: %q", body)
 	}
 }
+
+// Live output for admission follows the stream: per choice chunk at tokens_per_chunk, and
+// the engine's own count once a chunk carries usage.
+func TestStreamFeedsOutputCounter(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		sseEngine(sseChunk, sseChunk, sseChunk)(w, r)
+		<-release
+		sseEngine(sseUsage, sseDone)(w, r)
+	}, func(c *Config) { c.Admission.Cache.TokensPerChunk = 4 })
+	var gen *OutputCounter
+	done := make(chan struct{})
+	go func() {
+		h.do("POST", "/v1/chat/completions", streamBody, nil)
+		close(done)
+	}()
+	waitFor(t, "running", func() bool { return h.p.admission.Snapshot().Active == 1 })
+	h.p.admission.mu.Lock()
+	for w := range h.p.admission.running {
+		gen = w.gen
+	}
+	h.p.admission.mu.Unlock()
+	waitFor(t, "3 chunks counted", func() bool { return gen.Load() == 12 })
+	close(release)
+	<-done
+	if got := gen.Load(); got != 2 {
+		t.Fatalf("after usage: %d, want the engine's 2", got)
+	}
+}
