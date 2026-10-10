@@ -26,6 +26,10 @@ of its time recomputing.
   proxy costs nothing.
 - **No timeouts and no queue limit.** Agents retry. Timeouts that fire for many waiters at once
   only add load. A retry from the same conversation keeps its place in the queue.
+- **One job.** The proxy decides when a chat request reaches the engine, and nothing else: no
+  model aliases, no request rewriting beyond priority and usage reporting, no replays. Deployment
+  concerns (external identity, rate limits, CORS) belong to a gateway in front, which names the
+  caller through trusted headers.
 - **Judge by real traffic.** An early simulator gave answers that did not survive contact with
   real agents; every figure here comes from live runs.
 - **Depend only on public engine interfaces:** the OpenAI API, `/metrics`, and KV cache events.
@@ -70,13 +74,18 @@ by arrival. A blocked waiter reserves the room it still needs, so smaller work c
 **Eviction.** An expendable hold is displaced only while fewer than 4 requests run. On a busy
 engine displacing a context only adds prefill work.
 
-**Priority is a ceiling.** A caller's identity sets the most urgent it may be; a request or an
-alias may only make it run later. Ordering is strict, so a self-promoted caller could starve
-everyone else.
+**Priority is a ceiling.** A caller's identity sets the most urgent it may be; a request may only
+make it run later (its `priority` body field). Ordering is strict, so a self-promoted caller
+could starve everyone else.
 
 Holds do not control what the engine evicts: vLLM evicts its least recently freed cached blocks.
 The proxy can only keep enough room free that the engine has no reason to evict a held context.
 An engine-side retention API (vLLM RFC #37003) would let holds become real pins.
+
+**Engine restarts.** A readiness probe lists the engine's models every few seconds. While the
+engine is not ready, requests wait, as they would for room, instead of failing; nothing is
+replayed. A request that fails after it reached the engine returns its error: replaying it would
+hide the failure and repeat the work of a turn that may have half run.
 
 ## The per-request overhead
 

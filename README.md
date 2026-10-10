@@ -28,8 +28,8 @@ context resident:
 Measured on one 4x RTX 3090 box with 10 parallel coding agents: 91% of prompt tokens served
 from cache and zero preemptions over 6.4 hours, against 13-16% with plain slot limits.
 
-It also retries engine restarts transparently, sends SSE keepalives while a request waits,
-and logs one JSON line per request with token usage.
+It also holds requests through engine restarts, sends SSE keepalives while a request waits,
+logs one JSON line per request with token usage, and exports aggregate metrics.
 
 ## Quick start
 
@@ -41,8 +41,51 @@ cp config.example.yaml config.yaml   # set upstream and kv_events_endpoint
 go run ./cmd/cavp -config config.yaml
 ```
 
-Clients need no changes: a conversation is identified by its first two messages. A client
-may send `X-Session-Key` to name its conversation explicitly.
+Clients need no changes: a conversation is identified by its first two messages.
+
+## Requests
+
+cavp serves a small, fixed set of routes; everything else is 404:
+
+| Route | |
+|---|---|
+| `POST /v1/chat/completions`, `POST /v1/completions` | admitted, then forwarded |
+| `POST /v1/tokenize`, `POST /tokenize` | forwarded to the engine's `/tokenize`, not admitted |
+| `GET /v1/models` | the engine's model list, unchanged |
+| `GET /healthz` | the process is up |
+| `GET /readyz` | the engine is ready (see below) |
+| `GET /metrics` | aggregate state, Prometheus text format |
+
+`/healthz`, `/readyz` and `/metrics` need no credentials and expose only totals. Every other
+route requires a caller (`auth` in the config: `static` bearer keys, `trusted_header` behind a
+gateway, or `none`). Only `Content-Type`, `Accept`, `User-Agent` and `X-Request-Id` are passed
+to the engine; the engine must not require an API key.
+
+**Bodies** are forwarded as sent, with two changes. `priority` is set by the proxy: the
+caller's identity is the most urgent it may run, and a numeric `priority` field in the body
+may only make a request run later (clamped to -10..100). On a streaming request,
+`stream_options.include_usage` is set to `true` unless the request sets it: the final usage
+chunk is how the proxy learns the size of a turn, which becomes its conversation's hold, so a
+client that sets it `false` gets no hold. A request streams only when `stream` is the JSON value
+`true`. Bodies over `max_body_bytes` (256 MiB) are refused with 413.
+
+**Conversations** are identified by their first two messages, the model and the caller, so
+clients need no changes.
+
+**Waiting.** A request waits until the engine is ready and admission lets it in, however long
+that takes; there are no timeouts and no queue limit, so a client that gives up simply leaves.
+Streaming clients get SSE keepalive comments while they wait and whenever the stream is silent.
+A client that stops reading for 5 minutes during a single write is disconnected, so it cannot
+hold its place on the engine.
+
+**Engine restarts.** A readiness probe asks the engine's `/v1/models` every
+`readiness.interval` (5 s); the engine is ready while it lists a model. While it is not,
+requests wait in the queue rather than fail. Nothing is retried: a request that fails once it
+reached the engine returns its error (for a stream, as an SSE error event).
+
+**Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
+status and an `error` when it failed or ended without `[DONE]`; `status` 499 for a client that
+left while waiting; token usage including `cached_prompt_tokens`.
 
 ## License
 
@@ -77,7 +120,7 @@ prints the two values with a margin of 2 blocks. It needs the engine to itself: 
 (its guard would also react to the calibration traffic) and run it when nothing else reaches the
 engine, ideally right after the engine starts. A round aborts rather than report a
 wrong figure if other requests run or the engine frees pinned blocks during it. Rerun it when
-the model or the engine changes. Set `VLLM_API_KEY` if the engine requires a key.
+the model or the engine changes. It sends `VLLM_API_KEY` if set; the proxy itself sends no key.
 
 Its prompts span two blocks (at most 16K tokens), and the prefill figure comes from a single
 request, so it is a floor: some engines take more per request on long prompts (on halt95's vLLM fork, v2.5,
@@ -101,8 +144,8 @@ every running request's overhead:
 
 Each raises the margin by 2 blocks, at most once a minute and up to 32 blocks. After 15
 minutes without a signal the margin falls by one step, back to zero. Every change is logged
-(`overcommit guard raised the margin`, with its reason), and `/debug/residency` shows
-`guard_margin_blocks` and `guard_raises_total`.
+(`overcommit guard raised the margin`, with its reason), and `/metrics` shows
+`cavp_guard_margin_blocks` and `cavp_guard_raises_total`.
 
 The engine's waiting queue is deliberately not a signal: vLLM counts every request it has not
 scheduled yet, including one admitted a moment ago and one waiting behind another's prefill
@@ -118,7 +161,8 @@ climbing means capacity is being lost.
 ```
 cmd/cavp/           the binary
 internal/proxy/     flags and wiring (run.go), HTTP handling, admission (cache.go,
-                    admission.go, guard.go), retry, streaming, usage accounting, calibration
+                    admission.go, guard.go), readiness, streaming, usage accounting,
+                    metrics, calibration
 internal/auth/      none / static / trusted_header authentication
 kvmirror/           a mirror of a vLLM engine's prefix cache from its KV events; usable
                     on its own
