@@ -75,7 +75,8 @@ type AdmissionQueue struct {
 	marginRaises int
 	lastRaise    time.Time
 	lastSignal   time.Time
-	lastPreempt  float64 // engine preemption counter; -1 until first read
+	lastPreempt  map[string]float64 // engine preemption counter per series (EngineSignals)
+	preemptBlind bool               // the last read had no preemption counter
 
 	// mirror says what the engine has cached (fed by its KV events, run.go).
 	mirror *kvmirror.Mirror
@@ -84,7 +85,7 @@ type AdmissionQueue struct {
 func NewAdmissionQueue(cfg AdmissionConfig) *AdmissionQueue {
 	cfg.applyDefaults()
 	return &AdmissionQueue{cfg: cfg, now: time.Now, sessions: map[string]*cacheSession{},
-		running: map[*admissionWaiter]struct{}{}, lastPreempt: -1, mirror: kvmirror.New()}
+		running: map[*admissionWaiter]struct{}{}, mirror: kvmirror.New()}
 }
 
 // PromptKeys are a tokenized prompt's mirror keys.

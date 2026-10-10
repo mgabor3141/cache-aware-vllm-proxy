@@ -1,33 +1,39 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
+func preempted(v float64) map[string]float64 { return map[string]float64{`{engine="0"}`: v} }
+
 func TestGuardRaiseCooldownCapAndDecay(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	base := q.overheadLocked(true)
-	q.EngineSignals(3) // first read of the counter: no signal
+	q.EngineSignals(preempted(3)) // first read of the counter: no signal
 	if q.margin != 0 {
 		t.Fatalf("margin %d after the first counter read", q.margin)
 	}
-	q.EngineSignals(4)
+	q.EngineSignals(preempted(4))
 	if q.margin != guardStepBlocks || q.overheadLocked(true) != base+guardStepBlocks {
 		t.Fatalf("margin %d after a preemption", q.margin)
 	}
-	q.EngineSignals(5) // within the cooldown: one episode, one step
+	q.EngineSignals(preempted(5)) // within the cooldown: one episode, one step
 	if q.margin != guardStepBlocks {
 		t.Fatalf("margin %d: raised twice inside the cooldown", q.margin)
 	}
 	for i := 0; i < 40; i++ { // one raise per cooldown
 		clk.add(guardCooldown)
-		q.EngineSignals(float64(6 + i))
+		q.EngineSignals(preempted(float64(6 + i)))
 	}
 	if q.margin != guardMaxMarginBlocks {
 		t.Fatalf("margin %d, want the cap %d", q.margin, guardMaxMarginBlocks)
@@ -37,82 +43,102 @@ func TestGuardRaiseCooldownCapAndDecay(t *testing.T) {
 	q.guardDecayLocked(q.now())
 	q.mu.Unlock()
 	if q.margin != guardMaxMarginBlocks {
-		t.Fatal("decayed before a quiet hour")
+		t.Fatal("decayed before guardDecayAfter without a signal")
 	}
 	clk.add(time.Second)
 	q.mu.Lock()
 	q.guardDecayLocked(q.now())
 	q.mu.Unlock()
 	if q.margin != guardMaxMarginBlocks-guardStepBlocks {
-		t.Fatalf("margin %d after a quiet hour", q.margin)
+		t.Fatalf("margin %d after guardDecayAfter without a signal", q.margin)
 	}
 }
 
-// The early signal: the engine evicting a hold the proxy still counted as firm counts only
-// near the budget; with room to spare it is the engine's own policy.
-func TestGuardFirmHoldEviction(t *testing.T) {
-	for _, c := range []struct {
-		name     string
-		big      int // a running request beside the hold, in prompt tokens
-		wantRise bool
-	}{{"room to spare", 0, false}, {"near the budget", 600000, true}} {
-		t.Run(c.name, func(t *testing.T) {
-			q, _ := newCacheQueue(t, func(a *AdmissionConfig) {
-				a.Cache.PrefillOverheadBlocks, a.Cache.DecodeOverheadBlocks = intPtr(2), intPtr(2)
-			})
-			m := q.mirror
-			m.SetConnected(true)
-			if c.big > 0 {
-				mustAdmit(t, q.start("big", 0, c.big), "big")
-			}
-			prompt := make([]int64, 3200*20)
-			for i := range prompt {
-				prompt[i] = int64(i%5000 + 1)
-			}
-			g := 5
-			var evs []kvmirror.Event
-			var parent any
-			for i := 0; i < 20; i++ {
-				evs = append(evs, kvmirror.Event{Type: "BlockStored", BlockHashes: []any{uint64(i + 1)}, ParentBlockHash: parent,
-					TokenIDs: prompt[i*3200 : (i+1)*3200], BlockSize: 3200, GroupIdx: &g, Kind: "full_attention"})
-				parent = uint64(i + 1)
-			}
-			m.Apply(-1, evs)
-			tr := q.startReq("agent", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
-			rel := mustAdmit(t, tr, "agent")
-			tr.finish(rel, len(prompt), 100) // its context is now a firm hold
+// The counter is judged per series: a series appearing (a data-parallel engine, a
+// relabel) or going down (an engine restart) sets a baseline and raises nothing; a rise
+// in any series is a preemption. A read with no counter at all is logged, not ignored
+// (review cv-60 F9).
+func TestGuardPreemptionSeries(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	q, clk := newCacheQueue(t, nil)
+	two := func(a, b float64) map[string]float64 { return map[string]float64{`{engine="0"}`: a, `{engine="1"}`: b} }
+	q.EngineSignals(preempted(5))
+	q.EngineSignals(two(5, 3)) // a second series appears
+	q.EngineSignals(two(0, 3)) // engine 0 restarted
+	q.EngineSignals(two(0, 3))
+	if q.margin != 0 {
+		t.Fatalf("margin %d without a preemption", q.margin)
+	}
+	q.EngineSignals(two(0, 4))
+	if q.margin != guardStepBlocks {
+		t.Fatalf("margin %d after engine 1 preempted", q.margin)
+	}
+	clk.add(guardCooldown)
+	q.EngineSignals(map[string]float64{})
+	q.EngineSignals(map[string]float64{})
+	if n := strings.Count(logs.String(), "no vllm:num_preemptions_total"); n != 1 {
+		t.Fatalf("missing counter logged %d times, want once:\n%s", n, logs.String())
+	}
+	q.EngineSignals(two(0, 9)) // the counter is back: a baseline, not a rise
+	if q.margin != guardStepBlocks {
+		t.Fatalf("margin %d after the counter reappeared", q.margin)
+	}
+}
 
-			var rm []any
-			for i := 0; i < 20; i++ {
-				rm = append(rm, uint64(i+1))
-			}
-			m.Apply(0, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: rm, GroupIdx: &g}})
-			mustAdmit(t, q.start("other", 0, 1000), "other")
-			if q.evictedHolds != 1 {
-				t.Fatalf("evicted %d, want 1", q.evictedHolds)
-			}
-			if got := q.margin > 0; got != c.wantRise {
-				t.Fatalf("margin %d", q.margin)
-			}
-		})
+// The engine evicting a hold the proxy still protected is not a signal: it drops cached
+// prefixes for its own reasons, and with idle holds filling the pool the old near-budget
+// gate let it raise the margin with nothing running (review cv-60 F1, F5).
+func TestGuardIgnoresHoldEviction(t *testing.T) {
+	q, _ := newCacheQueue(t, func(a *AdmissionConfig) {
+		a.Cache.PrefillOverheadBlocks, a.Cache.DecodeOverheadBlocks = intPtr(2), intPtr(2)
+	})
+	m := q.mirror
+	m.SetConnected(true)
+	mustAdmit(t, q.start("big", 0, 600000), "big")
+	prompt := testPrompt(20, 0)
+	storePrompt(m, -1, prompt, 1)
+	tr := q.startReq("agent", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr.finish(mustAdmit(t, tr, "agent"), len(prompt), 100) // a firm hold, near the budget
+	q.tick()
+	g := 5
+	var rm []any
+	for i := 0; i < 20; i++ {
+		rm = append(rm, uint64(i+1))
+	}
+	m.Apply(-1, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: rm, GroupIdx: &g}})
+	q.tick()
+	if q.evictedHolds != 1 || q.margin != 0 {
+		t.Fatalf("evicted %d holds, margin %d: want the hold dropped and no raise", q.evictedHolds, q.margin)
 	}
 }
 
 // The guard's late signal and the usage figure come from /metrics; a format change must not
 // silently disable them.
 func TestFetchEngineUsageParses(t *testing.T) {
-	for name, body := range map[string]string{
-		"labelled": "# HELP x\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"m\"} 0.25\n" +
+	for name, c := range map[string]struct {
+		body string
+		pre  map[string]float64
+	}{
+		"labelled": {"# HELP x\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"m\"} 0.25\n" +
 			"vllm:num_preemptions_total{engine=\"0\",model_name=\"m\"} 2.0\n" +
-			"vllm:num_preemptions_total{engine=\"1\",model_name=\"m\"} 1.0\n",
-		"unlabelled": "vllm:kv_cache_usage_perc 0.25\nvllm:num_preemptions_total 3\n",
+			"vllm:num_preemptions_total{engine=\"1\",model_name=\"m\"} 1.0\n" +
+			"vllm:num_preemptions_total_created{engine=\"0\"} 1.7e9\n",
+			map[string]float64{`{engine="0",model_name="m"}`: 2, `{engine="1",model_name="m"}`: 1}},
+		"unlabelled": {"vllm:kv_cache_usage_perc 0.25\nvllm:num_preemptions_total 3\n", map[string]float64{"": 3}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(body)) }))
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(c.body)) }))
 			defer srv.Close()
 			u, pre, ok := fetchEngineUsage(context.Background(), srv.URL)
-			if !ok || u != 0.25 || pre != 3 {
+			if !ok || u != 0.25 || len(pre) != len(c.pre) {
 				t.Fatalf("usage %v preemptions %v ok %v", u, pre, ok)
+			}
+			for k, v := range c.pre {
+				if pre[k] != v {
+					t.Fatalf("preemptions %v, want %v", pre, c.pre)
+				}
 			}
 		})
 	}
@@ -133,8 +159,8 @@ func TestGuardMarginReachesQueuedWaiters(t *testing.T) {
 	early := q.start("early", 0, blocks(40))
 	mustWait(t, early, "early")
 
-	q.EngineSignals(3)
-	q.EngineSignals(4) // the guard raises while early waits
+	q.EngineSignals(preempted(3))
+	q.EngineSignals(preempted(4)) // the guard raises while early waits
 	if got := waiterCharge(q.Residency(), "early"); got != (40+guardStepBlocks)*bs {
 		t.Fatalf("queued charge %d, want the raised %d", got, (40+guardStepBlocks)*bs)
 	}

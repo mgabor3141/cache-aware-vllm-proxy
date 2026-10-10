@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -67,13 +68,31 @@ func fetchEnginePool(ctx context.Context, upstream string) (int, int, error) {
 	return parseEnginePool(resp.Body)
 }
 
-var (
-	poolUsageRe = regexp.MustCompile(`^vllm:kv_cache_usage_perc(?:\{[^}]*\})? ([0-9.eE+-]+)`)
-	preemptRe   = regexp.MustCompile(`^vllm:num_preemptions_total(?:\{[^}]*\})? ([0-9.eE+-]+)`)
-)
+// metricValue parses one Prometheus text line of the named metric, labelled or not, into
+// its label set and value.
+func metricValue(line, name string) (labels string, v float64, ok bool) {
+	rest, found := strings.CutPrefix(line, name)
+	if !found {
+		return "", 0, false
+	}
+	if strings.HasPrefix(rest, "{") {
+		i := strings.IndexByte(rest, '}')
+		if i < 0 {
+			return "", 0, false
+		}
+		labels, rest = rest[:i+1], rest[i+1:]
+	}
+	f := strings.Fields(rest)
+	if len(f) == 0 || !strings.HasPrefix(rest, " ") {
+		return "", 0, false // another metric sharing the prefix
+	}
+	v, err := strconv.ParseFloat(f[0], 64)
+	return labels, v, err == nil
+}
 
-// runEngineUsage feeds q the engine's occupied blocks every second. Missing reads
-// leave the last value; the model's own charges stay the floor either way.
+// runEngineUsage feeds q the engine's occupied blocks and preemption counters every
+// second. Missing reads leave the last value; the model's own charges stay the floor
+// either way.
 func runEngineUsage(ctx context.Context, upstream string, q *AdmissionQueue) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -93,24 +112,29 @@ func runEngineUsage(ctx context.Context, upstream string, q *AdmissionQueue) {
 	}
 }
 
-func fetchEngineUsage(ctx context.Context, upstream string) (usage, preemptions float64, ok bool) {
+// fetchEngineUsage reads the engine's KV usage (the highest, should there be several
+// series) and its preemption counter per series. ok is false when the metrics could not
+// be read or carry no usage.
+func fetchEngineUsage(ctx context.Context, upstream string) (usage float64, preemptions map[string]float64, ok bool) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstream+"/metrics", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, 0, false
+		return 0, nil, false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, nil, false
+	}
+	preemptions = map[string]float64{}
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
-		if m := poolUsageRe.FindStringSubmatch(sc.Text()); m != nil {
-			usage, _ = strconv.ParseFloat(m[1], 64)
-			ok = true
-		} else if m := preemptRe.FindStringSubmatch(sc.Text()); m != nil {
-			v, _ := strconv.ParseFloat(m[1], 64)
-			preemptions += v // summed: a data-parallel engine reports one series per engine
+		if _, v, found := metricValue(sc.Text(), "vllm:kv_cache_usage_perc"); found {
+			usage, ok = max(usage, v), true
+		} else if labels, v, found := metricValue(sc.Text(), "vllm:num_preemptions_total"); found {
+			preemptions[labels] = v
 		}
 	}
 	return usage, preemptions, ok

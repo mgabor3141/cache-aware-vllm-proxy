@@ -534,9 +534,6 @@ func (q *AdmissionQueue) syncHoldsLocked(now time.Time) {
 			continue
 		}
 		if cached < s.heldSeen/2 {
-			if q.firm(s, now) {
-				q.guardEvictionLocked(now, s.held)
-			}
 			q.dropHoldLocked(s)
 			q.evictedHolds++
 		}
