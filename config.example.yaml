@@ -63,8 +63,10 @@ admission:
     # state, speculative and checkpoint blocks), while prefilling and while decoding.
     # Engine and model specific: measure with `cavp -calibrate` on an idle engine.
     # See "Per-request overhead" in the README; the overcommit guard covers a low figure.
-    prefill_overhead_blocks: 4
-    decode_overhead_blocks: 4
+    # Unset, both are 28, the largest figure measured (hybrid model with speculative
+    # decoding): safe but wasteful elsewhere. Set the calibrated values, e.g.:
+    # prefill_overhead_blocks: 12
+    # decode_overhead_blocks: 10
 
 # The engine is ready while GET /v1/models lists a model, probed every interval. While
 # it is not (starting, restarting), requests wait in the queue instead of failing;

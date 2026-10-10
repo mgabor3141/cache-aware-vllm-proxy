@@ -141,3 +141,24 @@ func TestCacheConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+// The README's quick-start config loads as written (rev-3 #5).
+func TestReadmeQuickStartConfigLoads(t *testing.T) {
+	readme, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rest, ok := strings.Cut(string(readme), "cat > config.yaml <<'EOF'\n")
+	cfgText, _, ok2 := strings.Cut(rest, "\nEOF\n")
+	if !ok || !ok2 {
+		t.Fatal("README has no quick-start config block")
+	}
+	t.Setenv("CAVP_API_KEY", "test-key")
+	cfg, err := loadYAML(t, cfgText+"\n")
+	if err != nil {
+		t.Fatalf("README quick-start config: %v", err)
+	}
+	if cfg.Auth.Keys[0].Key != "test-key" || cfg.Admission.MaxActive != 8 {
+		t.Fatalf("%+v", cfg)
+	}
+}

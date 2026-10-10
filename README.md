@@ -33,13 +33,56 @@ logs one JSON line per request with token usage, and exports aggregate metrics.
 
 ## Quick start
 
-```sh
-vllm serve <model> --enable-prefix-caching \
-  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}'
+You need one vLLM engine, Go 1.23 (or Docker), and a model. The engine needs prefix caching,
+KV cache events with a replay socket on the port after the event socket, and priority
+scheduling (cavp sends each request's `priority`; vLLM's default first-come scheduling refuses
+a non-zero one). `--enable-prompt-tokens-details` makes the engine report cached tokens per
+request, which the log and the hit-ratio metrics need. Set `--max-num-seqs` to the same value
+as `admission.max_active`. The engine must not require an API key.
 
-cp config.example.yaml config.yaml   # set upstream and kv_events_endpoint
-go run ./cmd/cavp -config config.yaml
+```sh
+vllm serve Qwen/Qwen3-8B --port 8000 \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
+  --scheduling-policy priority \
+  --max-num-seqs 8 \
+  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558"}'
 ```
+
+A minimal cavp config (`config.example.yaml` documents every setting):
+
+```sh
+cat > config.yaml <<'EOF'
+upstream: "http://localhost:8000"
+auth:
+  mode: static
+  keys:
+    - key: ${CAVP_API_KEY}
+      user: me
+admission:
+  max_active: 8
+  cache:
+    kv_events_endpoint: "tcp://localhost:5557"
+EOF
+
+export CAVP_API_KEY=$(openssl rand -hex 16)
+go run ./cmd/cavp -check -config config.yaml   # validates and exits
+go run ./cmd/cavp -config config.yaml          # listens on :4001
+```
+
+Or with Docker: `docker build -t cavp .` and
+`docker run --network host -e CAVP_API_KEY -v "$PWD/config.yaml:/etc/cavp/config.yaml:ro" cavp`.
+
+Once `curl localhost:4001/readyz` answers `ok`, send a request:
+
+```sh
+curl -N localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $CAVP_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-8B","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Each request logs one JSON line on stdout; `curl localhost:4001/metrics` shows the queue and
+the cache. Clients need no changes: a conversation is identified by its first two messages.
 
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
 engine's cache from the replay whenever it (re)subscribes, and treats every prompt as uncached
@@ -47,8 +90,6 @@ until that replay completes. Requests wait until the engine's metrics have been 
 is where the KV pool size comes from). One engine means one engine: a data-parallel vLLM has a
 KV pool and an event publisher per rank, and the proxy follows only one, so it is not
 supported (`cavp -calibrate` refuses one).
-
-Clients need no changes: a conversation is identified by its first two messages.
 
 ## Requests
 
@@ -76,8 +117,7 @@ chunk is how the proxy learns the size of a turn, which becomes its conversation
 client that sets it `false` gets no hold. A request streams only when `stream` is the JSON value
 `true`. Bodies over `max_body_bytes` (256 MiB) are refused with 413.
 
-**Conversations** are identified by their first two messages, the model and the caller, so
-clients need no changes.
+**Conversations** are identified by their first two messages, the model and the caller.
 
 **Waiting.** A request waits until the engine is ready and admission lets it in, however long
 that takes; there are no timeouts and no queue limit, so a client that gives up simply leaves.
@@ -92,11 +132,9 @@ reached the engine returns its error (for a stream, as an SSE error event).
 
 **Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
 status and an `error` when it failed or ended without `[DONE]`; `status` 499 for a client that
-left while waiting; token usage including `cached_prompt_tokens`.
-
-## License
-
-Apache-2.0
+left while waiting; token usage including `cached_prompt_tokens` (with
+`--enable-prompt-tokens-details`; without it `usage_details` is absent and the hit-ratio
+counters in `/metrics` stay at zero rather than report misses).
 
 ## Per-request overhead
 
@@ -107,7 +145,7 @@ on a hybrid model with speculative decoding. Admission charges each running requ
 overhead, so it has to be right: too low and the engine runs out of KV space, evicts cached
 contexts and queues or preempts requests; too high and capacity sits unused.
 
-It is set in the config, per phase:
+It is set in the config, per phase, for example:
 
 ```yaml
 admission:
@@ -115,6 +153,9 @@ admission:
     prefill_overhead_blocks: 12   # peak while a request prefills
     decode_overhead_blocks: 10    # while it decodes
 ```
+
+Left unset, both are 28, the largest figure measured so far: safe on the engines we know, and
+wasteful on a plain transformer, which needs close to none.
 
 Output is charged as it streams: from the stream's own token counts when it reports usage on
 every chunk, else as `tokens_per_chunk` tokens per chunk (default 1; with speculative decoding
@@ -179,3 +220,7 @@ kvmirror/           a mirror of a vLLM engine's prefix cache from its KV events;
                     on its own
 docs/design.md      why it works the way it does, with the measurements
 ```
+
+## License
+
+Apache-2.0
