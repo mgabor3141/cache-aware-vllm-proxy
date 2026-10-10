@@ -35,6 +35,10 @@ import (
 // traffic would also trip its overcommit guard). Pinned blocks of finished turns (grace pins in
 // halt95's vLLM fork, v2.5) are part of each round's baseline; they must not be released mid-round, so run
 // it with plenty of free KV space, ideally right after the engine starts.
+//
+// It refuses rather than report a figure it could not check: a data-parallel engine (more
+// than one series of a gauge: its pool is per engine), metrics without the usage, running
+// or waiting gauge its checks read, and a round in which the usage gauge never moved.
 func calibrate(cfg *Config, out io.Writer) error {
 	ctx := context.Background()
 	up := strings.TrimRight(cfg.Upstream, "/")
@@ -141,24 +145,35 @@ func (c *calClient) stateDetail(ctx context.Context, usable int) (used float64, 
 		return 0, 0, 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, 0, fmt.Errorf("metrics: %s", resp.Status)
+	}
+	// Every check of a round reads these three gauges, labelled or not; one series each.
+	names := []string{"vllm:kv_cache_usage_perc", "vllm:num_requests_running", "vllm:num_requests_waiting"}
+	var vals [3]float64
+	var series [3]int
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
-		l := sc.Text()
-		var v float64
-		switch {
-		case strings.HasPrefix(l, "vllm:kv_cache_usage_perc{"):
-			fmt.Sscan(l[strings.LastIndexByte(l, ' ')+1:], &v)
-			used = v * float64(usable)
-		case strings.HasPrefix(l, "vllm:num_requests_running{"):
-			fmt.Sscan(l[strings.LastIndexByte(l, ' ')+1:], &v)
-			running += int(v)
-		case strings.HasPrefix(l, "vllm:num_requests_waiting{"):
-			fmt.Sscan(l[strings.LastIndexByte(l, ' ')+1:], &v)
-			waiting += int(v)
+		for i, name := range names {
+			if _, v, ok := metricValue(sc.Text(), name); ok {
+				vals[i] = v
+				series[i]++
+			}
 		}
 	}
-	return used, running, waiting, sc.Err()
+	if err := sc.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	for i, name := range names {
+		switch {
+		case series[i] == 0:
+			return 0, 0, 0, fmt.Errorf("the engine's metrics have no %s: calibrate cannot run its checks without it", name)
+		case series[i] > 1:
+			return 0, 0, 0, fmt.Errorf("the engine's metrics have %d %s series (data-parallel?): calibrate measures a single engine", series[i], name)
+		}
+	}
+	return vals[0] * float64(usable), int(vals[1]), int(vals[2]), nil
 }
 
 func (c *calClient) round(ctx context.Context, model string, n, prompt, decode, perReq, blockSize, usable int) (prefill, dec float64, err error) {
@@ -194,35 +209,38 @@ func (c *calClient) round(ctx context.Context, model string, n, prompt, decode, 
 		}(i)
 	}
 	prefill, dec = -1e9, -1e9
+	peak := base
 	// Sample only while all n run: a finished request's blocks go back (or into a pin that
 	// may push out an older one), which says nothing about overhead.
 	for done.Load() == 0 {
 		used, running, waiting, err := c.stateDetail(ctx, usable)
-		if err == nil && running+waiting > n {
+		if err != nil {
+			return 0, 0, fmt.Errorf("reading the engine's metrics mid-round: %w", err)
+		}
+		if running+waiting > n {
 			return 0, 0, fmt.Errorf("other requests reached the engine during the round (%d running, %d waiting)", running, waiting)
 		}
-		if err == nil && used < base-0.5 {
+		peak = max(peak, used)
+		if used < base-0.5 {
 			return 0, 0, fmt.Errorf("usage fell below the round's baseline (%.1f < %.1f blocks): the engine released pinned blocks mid-round (other traffic resuming a conversation, or a shortage of free blocks); rerun when the engine is quiet, ideally right after it starts", used, base)
 		}
-		if err == nil {
-			all, attn, answered := true, 0, 0
-			for i := range generated {
-				g := generated[i].Load()
-				if g < 0 {
-					all = false
-					continue
-				}
-				answered++
-				attn += (prompt + int(g) + blockSize - 1) / blockSize
+		all, attn, answered := true, 0, 0
+		for i := range generated {
+			g := generated[i].Load()
+			if g < 0 {
+				all = false
+				continue
 			}
-			// Running but not answered yet: its whole prompt (one prefill step).
-			attn += max(running-answered, 0) * ((prompt + blockSize - 1) / blockSize)
-			per := (used - base - float64(attn)) / float64(n)
-			if all {
-				dec = max(dec, per)
-			} else {
-				prefill = max(prefill, per)
-			}
+			answered++
+			attn += (prompt + int(g) + blockSize - 1) / blockSize
+		}
+		// Running but not answered yet: its whole prompt (one prefill step).
+		attn += max(running-answered, 0) * ((prompt + blockSize - 1) / blockSize)
+		per := (used - base - float64(attn)) / float64(n)
+		if all {
+			dec = max(dec, per)
+		} else {
+			prefill = max(prefill, per)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -243,6 +261,9 @@ func (c *calClient) round(ctx context.Context, model string, n, prompt, decode, 
 			return 0, 0, fmt.Errorf("the engine stayed busy after the round: other traffic")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if peak-base < 1 {
+		return 0, 0, fmt.Errorf("the engine's KV usage never rose above its baseline during the round (%.1f blocks): the gauge does not reflect the requests, so nothing was measured", base)
 	}
 	if dec < -1e8 {
 		return 0, 0, fmt.Errorf("no sample with every request decoding (the round was too fast to observe)")
