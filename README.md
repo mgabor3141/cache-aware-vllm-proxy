@@ -44,7 +44,9 @@ go run ./cmd/cavp -config config.yaml
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
 engine's cache from the replay whenever it (re)subscribes, and treats every prompt as uncached
 until that replay completes. Requests wait until the engine's metrics have been read once (that
-is where the KV pool size comes from).
+is where the KV pool size comes from). One engine means one engine: a data-parallel vLLM has a
+KV pool and an event publisher per rank, and the proxy follows only one, so it is not
+supported (`cavp -calibrate` refuses one).
 
 Clients need no changes: a conversation is identified by its first two messages.
 

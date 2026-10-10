@@ -70,6 +70,7 @@ type Mirror struct {
 	connected                     bool
 	// generation counts resets: subscriptions, engine restarts, AllBlocksCleared.
 	generation uint64
+	sizeWarned bool // a block of another size than blockSize was logged
 	// dropLast applies the EAGLE last-block drop (speculative decoding on).
 	dropLast bool
 	stats    Stats
@@ -288,6 +289,10 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		if m.blockSize == 0 {
 			m.blockSize = e.BlockSize
+		} else if e.BlockSize != m.blockSize && !m.sizeWarned {
+			// Keys are built at the engine's block size; blocks of another size never match.
+			m.sizeWarned = true
+			log.Printf("level=warn msg=\"kv events block size differs from the engine's: those blocks never match\" event_block_size=%d block_size=%d group=%d", e.BlockSize, m.blockSize, g)
 		}
 		if len(e.BlockHashes) == 0 {
 			m.stats.SkippedEmpty++

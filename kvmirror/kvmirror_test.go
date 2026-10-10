@@ -1,12 +1,15 @@
 package kvmirror
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -393,4 +396,20 @@ func TestKVMirrorRestartInsideReplayedRange(t *testing.T) {
 	m = replay(5)
 	m.Apply(2, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
 	check(m)
+}
+
+// Blocks stored at another size than the engine's (metrics and events disagreeing) can
+// never match a prompt's keys; that is logged once instead of silently reading 0
+// (review 3, rev-2 #5).
+func TestKVMirrorWarnsOnBlockSizeMismatch(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	m := New()
+	m.SetBlockSize(8)
+	toks := seqPrompt(9)
+	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	if n := strings.Count(logs.String(), "block size differs"); n != 1 {
+		t.Fatalf("logged %d times, want once:\n%s", n, logs.String())
+	}
 }
