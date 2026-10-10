@@ -914,7 +914,7 @@ func (p *Proxy) admissionRequest(r *http.Request, ev *Event) AdmissionRequest {
 			if p.mirror != nil {
 				ar.Blocks = p.mirror.NewPromptKeys(tokens)
 			} else {
-				ar.Blocks = kvmirror.PromptKeys{Blocks: kvmirror.PromptBlockKeys(tokens, block)}
+				ar.Blocks = kvmirror.PromptKeys{BlockSize: block, Blocks: kvmirror.PromptBlockKeys(tokens, block)}
 			}
 			ev.Tokenized = true
 		} else {

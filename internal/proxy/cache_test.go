@@ -58,7 +58,7 @@ type turn struct {
 func (q *AdmissionQueue) startReq(session string, prio, prompt int, blocks []kvmirror.BlockKey) *turn {
 	tr := &turn{admitted: make(chan func(), 1), rep: &AdmissionReport{}, done: make(chan struct{})}
 	ar := AdmissionRequest{
-		Priority: prio, Session: session, PromptTokens: prompt, MaxTokens: 4000, Blocks: kvmirror.PromptKeys{Blocks: blocks}, Report: tr.rep,
+		Priority: prio, Session: session, PromptTokens: prompt, MaxTokens: 4000, Blocks: kvmirror.PromptKeys{BlockSize: 3200, Blocks: blocks}, Report: tr.rep,
 		Observe: func() (CacheObservation, bool) {
 			tr.mu.Lock()
 			defer tr.mu.Unlock()
@@ -318,7 +318,7 @@ func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	m.Apply(-1, evs)
 	keys := kvmirror.PromptBlockKeys(prompt, 3200)
 	// 30 contiguous blocks, minus the speculative-decoding drop.
-	if got := m.CachedBlockKeys(keys); got != 92800 {
+	if got := m.Cached(kvmirror.PromptKeys{BlockSize: 3200, Blocks: keys}); got != 92800 {
 		t.Fatalf("mirror says %d cached, want 92800", got)
 	}
 
@@ -512,18 +512,18 @@ func TestCacheAdmissionPriorityDisplacesBestFit(t *testing.T) {
 func TestParseEnginePool(t *testing.T) {
 	m := "# HELP x\nvllm:num_requests_running{engine=\"0\"} 0.0\n" +
 		`vllm:cache_config_info{_block_size_resolved="True",block_size="3200",mamba_block_size="16",num_gpu_blocks="201",num_gpu_blocks_override="None",prefix_match_unit="64"} 1.0` + "\n"
-	b, s, u, err := parseEnginePool(strings.NewReader(m))
-	if err != nil || b != 201 || s != 3200 || u != 64 {
-		t.Fatalf("got %d x %d unit %d, %v", b, s, u, err)
+	b, s, err := parseEnginePool(strings.NewReader(m))
+	if err != nil || b != 201 || s != 3200 {
+		t.Fatalf("got %d x %d, %v", b, s, err)
 	}
-	if _, _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
+	if _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
 		t.Fatal("want an error without cache_config_info")
 	}
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{Enabled: true}})
 	if q.budget() != 0 {
 		t.Fatal("pool should be unknown before SetPool")
 	}
-	q.SetPool(201, 3200, 64)
+	q.SetPool(201, 3200)
 	if q.budget() != 640000 {
 		t.Fatalf("budget %d, want 200 blocks x 3200", q.budget())
 	}
@@ -682,5 +682,71 @@ func TestAcquireWithoutSession(t *testing.T) {
 			t.Fatalf("acquire %d refused", i)
 		}
 		rel()
+	}
+}
+
+// storePrompt announces a prompt's full blocks to the mirror, as one attention group.
+func storePrompt(m *kvmirror.Mirror, seq int64, prompt []int64, firstHash uint64) {
+	g := 5
+	var evs []kvmirror.Event
+	var parent any
+	for i := 0; (i+1)*3200 <= len(prompt); i++ {
+		h := firstHash + uint64(i)
+		evs = append(evs, kvmirror.Event{Type: "BlockStored", BlockHashes: []any{h}, ParentBlockHash: parent,
+			TokenIDs: prompt[i*3200 : (i+1)*3200], BlockSize: 3200, GroupIdx: &g, Kind: "full_attention"})
+		parent = h
+	}
+	m.Apply(seq, evs)
+}
+
+func testPrompt(blocks int, salt int64) []int64 {
+	p := make([]int64, 3200*blocks+1)
+	for i := range p {
+		p[i] = int64(i%5000) + 1 + salt*100000
+	}
+	return p
+}
+
+// A hold is judged against the mirror whenever the mirror is healthy, including after an
+// engine restart or a resubscribe rebuilt it: there is no exemption for holds seen
+// before (reviews cv-51 MED-3, cv-52 #11, cv-60 F4). A hold made while the mirror was
+// resyncing is judged once it is healthy again.
+func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	m := kvmirror.New()
+	q.SetMirror(m)
+	m.SetConnected(true)
+	prompt := testPrompt(20, 0)
+	storePrompt(m, 1, prompt, 1)
+	tr := q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
+	q.tick()
+	if r := q.Residency(); r.HeldTokens == 0 {
+		t.Fatal("no hold after the turn")
+	}
+	m.Apply(2, nil)
+	m.Apply(0, nil) // the engine restarted: the mirror starts over
+	q.tick()
+	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 1 {
+		t.Fatalf("hold survived an engine restart: %+v", r)
+	}
+
+	// A hold made while the mirror is resyncing is judged once it is healthy.
+	m.SetConnected(false)
+	storePrompt(m, 1, prompt, 1)
+	tr = q.startReq("a", 0, len(prompt), kvmirror.PromptBlockKeys(prompt, 3200))
+	tr.finish(mustAdmit(t, tr, "a"), len(prompt), 100)
+	q.tick()
+	m.SetConnected(true)
+	q.tick()
+	g := 5
+	var rm []any
+	for i := 0; i < 20; i++ {
+		rm = append(rm, uint64(i+1))
+	}
+	m.Apply(2, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: rm, GroupIdx: &g}})
+	q.tick()
+	if r := q.Residency(); r.HeldTokens != 0 || r.EvictedHolds != 2 {
+		t.Fatalf("evicted hold kept: %+v", r)
 	}
 }

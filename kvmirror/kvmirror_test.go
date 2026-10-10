@@ -1,12 +1,17 @@
 package kvmirror
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
+
+	"github.com/go-zeromq/zmq4"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 type fixtureRequest struct {
@@ -154,43 +159,197 @@ func TestReplayEndpointIsNextPort(t *testing.T) {
 	}
 }
 
-// The event sequence captured from the engine with --prefix-match-unit 64 (2026-10-08):
-// prompt 7,987 tokens; full blocks 0 and 1; a tail checkpoint ending at 7,872 in every
-// recurrent group (parent: an unannounced span); and the attention span [7872, 7936)
-// whose parent is that checkpoint. The next turn (8,483 tokens) was served 7,872.
-func TestKVMirrorFineGrainedTailHit(t *testing.T) {
-	m := New()
-	m.SetGeometry(3200, 64)
-	toks := make([]int64, 8483)
+func attnStore(hash uint64, parent any, toks []int64) Event {
+	g := 5
+	return Event{Type: "BlockStored", BlockHashes: []any{hash}, ParentBlockHash: parent, TokenIDs: toks, BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
+}
+
+func seqPrompt(n int) []int64 {
+	toks := make([]int64, n)
 	for i := range toks {
-		toks[i] = int64(i*7919%50000 + 1)
+		toks[i] = int64(i + 1)
 	}
-	ev := func(g int, kind string, bs int, hash, parent uint64, from int) Event {
-		e := Event{Type: "BlockStored", BlockHashes: []any{hash}, TokenIDs: toks[from : from+bs], BlockSize: bs, GroupIdx: &g, Kind: kind}
-		if parent != 0 {
-			e.ParentBlockHash = parent
+	return toks
+}
+
+// An engine restart resets the publisher's sequence. Without a replay in progress, any
+// sequence that goes backwards is a restart, however small the step (review cv-52 #1).
+func TestKVMirrorRestartInsideFormerDuplicateWindow(t *testing.T) {
+	m := New()
+	toks := seqPrompt(9)
+	m.Apply(0, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	m.Apply(1, nil)
+	m.Apply(2, nil)
+	if m.CachedTokens(toks) != 4 {
+		t.Fatal("blocks not stored")
+	}
+	m.Apply(0, nil) // the restarted engine's first batch
+	if got := m.CachedTokens(toks); got != 0 {
+		t.Fatalf("mirror kept a dead engine's blocks: %d cached", got)
+	}
+	if st := m.Status(); st.Stats.Restarts != 1 {
+		t.Fatalf("restart not counted: %+v", st.Stats)
+	}
+	// The new engine's batches are applied, not dropped as duplicates.
+	m.Apply(1, []Event{attnStore(7, nil, toks[:4]), attnStore(8, uint64(7), toks[4:8])})
+	if got := m.CachedTokens(toks); got != 4 {
+		t.Fatalf("new engine's blocks: %d cached, want 4", got)
+	}
+}
+
+// After a replay, live delivery repeats the replayed batches in order: those are
+// skipped, however many there are (a deep backlog must not look like a restart), and the
+// stream then continues. A repeat that goes backwards is a restart.
+func TestKVMirrorReplayOverlap(t *testing.T) {
+	m := New()
+	toks := seqPrompt(9)
+	m.Apply(20000, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	m.replayedTo, m.liveSeq = m.lastSeq, -1 // as subscribe does when the replay completes
+	for _, seq := range []int64{14000, 14001, 20000} {
+		if !m.Apply(seq, []Event{{Type: "AllBlocksCleared"}}) {
+			t.Fatalf("seq %d: reported a gap", seq)
 		}
-		return e
 	}
-	var evs []Event
-	for g := 0; g < 4; g++ {
-		evs = append(evs, ev(g, "mamba", 3200, 11, 0, 0))
+	if got := m.CachedTokens(toks); got != 4 {
+		t.Fatalf("a replayed batch was applied again: %d cached", got)
 	}
-	evs = append(evs, ev(5, "mla_attention", 3200, 11, 0, 0), ev(5, "mla_attention", 3200, 22, 11, 3200))
-	for g := 0; g < 4; g++ {
-		evs = append(evs, ev(g, "mamba", 64, 33, 999, 7808))
+	if !m.Apply(20001, nil) {
+		t.Fatal("the next live batch is a gap")
 	}
-	evs = append(evs, ev(5, "mla_attention", 64, 44, 33, 7872))
-	m.Apply(1, evs)
-	if got := m.CachedTokens(toks); got != 7872 {
-		t.Fatalf("next turn cached %d, want 7872", got)
+	m.Apply(20000, nil)
+	if st := m.Status(); st.Stats.Restarts != 1 || st.Stats.Duplicates != 3 {
+		t.Fatalf("after the overlap a repeat is a restart: %+v", st.Stats)
 	}
-	if got := m.CachedTokens(toks[:7930]); got != 3200 {
-		t.Fatalf("a prompt ending inside the attention span cached %d, want the block-level 3200", got)
+
+	m = New()
+	m.Apply(50, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	m.replayedTo, m.liveSeq = m.lastSeq, -1
+	m.Apply(40, nil)
+	m.Apply(0, nil) // inside the overlap, but behind the previous live batch
+	if st := m.Status(); st.Stats.Restarts != 1 {
+		t.Fatalf("a restart during the overlap went unnoticed: %+v", st.Stats)
 	}
-	g := 0
-	m.Apply(2, []Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(33)}, GroupIdx: &g}})
-	if got := m.CachedTokens(toks); got != 3200 {
-		t.Fatalf("after losing one recurrent checkpoint cached %d, want 3200", got)
+}
+
+// One event whose parent the mirror never saw is skipped; the batch's other events are
+// applied (review cv-52 #14). A block hash the mirror cannot read still chains the
+// blocks after it.
+func TestKVMirrorOrphanEventSkipsOnlyItself(t *testing.T) {
+	m := New()
+	m.dropLast = false
+	toks := seqPrompt(13)
+	g := 5
+	m.Apply(-1, []Event{
+		attnStore(9, uint64(12345), seqPrompt(4)), // orphan
+		{Type: "BlockStored", BlockHashes: []any{"?", uint64(2), uint64(3)}, TokenIDs: toks[:12], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"},
+	})
+	if st := m.Status(); st.Stats.SkippedOrphan != 1 || st.Blocks != 2 {
+		t.Fatalf("status %+v", st)
+	}
+	// Block 1 has no engine hash to find it by; blocks 2 and 3 are cached but not a prefix.
+	if got := m.CachedTokens(toks); got != 0 {
+		t.Fatalf("cached %d without the first block", got)
+	}
+	m.Apply(-1, []Event{attnStore(1, nil, toks[:4])})
+	if got := m.CachedTokens(toks); got != 12 {
+		t.Fatalf("cached %d, want 12", got)
+	}
+}
+
+// Keys carry the block size they were built at; under another geometry they match
+// nothing rather than being rescaled (review cv-52 #2).
+func TestKVMirrorKeysAtAnotherBlockSizeMatchNothing(t *testing.T) {
+	m := New()
+	m.dropLast = false
+	toks := seqPrompt(9)
+	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	keys := m.NewPromptKeys(toks)
+	if got := m.Cached(keys); got != 8 {
+		t.Fatalf("cached %d, want 8", got)
+	}
+	m.SetBlockSize(8)
+	if got := m.Cached(keys); got != 0 {
+		t.Fatalf("keys built at 4 read %d under block size 8", got)
+	}
+}
+
+// Two engine hashes for one block: evicting one and storing the other again keeps the
+// block findable (review cv-52 #5).
+func TestKVMirrorAliasRestoredAfterEviction(t *testing.T) {
+	m := New()
+	m.dropLast = false
+	toks := seqPrompt(5)
+	g := 5
+	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, nil, toks[:4])})
+	m.Apply(-1, []Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(1), uint64(2)}, GroupIdx: &g}})
+	if got := m.CachedTokens(toks); got != 0 {
+		t.Fatalf("evicted block cached %d", got)
+	}
+	m.Apply(-1, []Event{attnStore(1, nil, toks[:4])})
+	if got := m.CachedTokens(toks); got != 4 {
+		t.Fatalf("re-stored block cached %d, want 4", got)
+	}
+}
+
+// A subscription is healthy only once its replay completed: a replay that fails leaves
+// the mirror unhealthy and the subscription retries (review cv-52 #6). Once the replay
+// reaches the end marker, the mirror holds the replayed blocks and is healthy.
+func TestKVMirrorHealthyOnlyAfterReplay(t *testing.T) {
+	old := replayFirstWait
+	replayFirstWait = 300 * time.Millisecond
+	defer func() { replayFirstWait = old }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pub := zmq4.NewPub(ctx)
+	defer pub.Close()
+	if err := pub.Listen("tcp://127.0.0.1:0"); err != nil {
+		t.Skipf("zmq listen: %v", err)
+	}
+	pubEP := "tcp://" + pub.Addr().String()
+
+	// A replay service that never answers.
+	silent := zmq4.NewRouter(ctx)
+	defer silent.Close()
+	if err := silent.Listen("tcp://127.0.0.1:0"); err != nil {
+		t.Skipf("zmq listen: %v", err)
+	}
+	m := New()
+	rctx, rcancel := context.WithCancel(ctx)
+	go m.Run(rctx, pubEP, "tcp://"+silent.Addr().String())
+	time.Sleep(1500 * time.Millisecond)
+	if m.Healthy() {
+		t.Fatal("healthy after a failed replay")
+	}
+	rcancel()
+
+	toks := seqPrompt(9)
+	payload, _ := msgpack.Marshal([]any{1.0, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])}, 0})
+	router := zmq4.NewRouter(ctx)
+	defer router.Close()
+	if err := router.Listen("tcp://127.0.0.1:0"); err != nil {
+		t.Skipf("zmq listen: %v", err)
+	}
+	go func() {
+		msg, err := router.Recv()
+		if err != nil {
+			return
+		}
+		id := msg.Frames[0]
+		seq := make([]byte, 8)
+		binary.BigEndian.PutUint64(seq, 7)
+		router.Send(zmq4.NewMsgFrom(id, []byte{}, []byte("kv"), seq, payload))
+		router.Send(zmq4.NewMsgFrom(id, []byte{}, []byte{}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, []byte{}))
+	}()
+	m2 := New()
+	go m2.Run(ctx, pubEP, "tcp://"+router.Addr().String())
+	deadline := time.Now().Add(5 * time.Second)
+	for !m2.Healthy() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !m2.Healthy() {
+		t.Fatal("not healthy after a complete replay")
+	}
+	if got := m2.CachedTokens(toks); got != 4 {
+		t.Fatalf("replayed blocks: %d cached, want 4", got)
 	}
 }

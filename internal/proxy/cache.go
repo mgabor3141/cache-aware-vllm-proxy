@@ -164,11 +164,11 @@ func (q *AdmissionQueue) budget() int { return q.roundDown(q.pool) }
 
 // SetPool records the engine's block pool (vllm:cache_config_info num_gpu_blocks x
 // block_size). One block is the engine's reserved null block.
-func (q *AdmissionQueue) SetPool(blocks, blockSize, unit int) {
+func (q *AdmissionQueue) SetPool(blocks, blockSize int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.mirror != nil {
-		q.mirror.SetGeometry(blockSize, unit)
+		q.mirror.SetBlockSize(blockSize)
 	}
 	q.pool = max(blocks-1, 0) * blockSize
 	q.cfg.Cache.BlockTokens = blockSize // until the mirror has seen an event
@@ -205,8 +205,9 @@ type cacheSession struct {
 	lastDone                  time.Time
 	held                      int                 // prompt tokens protected while idle (whole blocks); 0 when not holding
 	heldBlocks                kvmirror.PromptKeys // mirror keys of the held prompt
-	heldVisible               bool                // the mirror saw the hold cached when it began
-	heldEpoch                 uint64              // mirror subscription it was seen under
+	// heldSeen is what the mirror saw cached of the hold: -1 until the mirror is healthy to
+	// ask, 0 when it saw nothing (the hold cannot be verified).
+	heldSeen int
 
 	gaveUpSince, gaveUpAt time.Time // a waiter whose client left: since when it waited, and when it left
 	waiting               int       // requests of this session in the queue
@@ -518,22 +519,28 @@ func (q *AdmissionQueue) grantCacheLocked() {
 func (q *AdmissionQueue) dropHoldLocked(s *cacheSession) {
 	s.held = 0
 	s.heldBlocks = kvmirror.PromptKeys{}
-	s.heldVisible = false
 }
 
-// syncHoldsLocked drops holds the engine evicted. Only on evidence: the mirror must have
-// seen most of the hold cached when it began (heldVisible), and then see it gone. Holds
-// it never saw (image blocks carry extra hash keys; threads older than a resubscribe's
-// replay window) are unknown, not evicted.
+// syncHoldsLocked drops holds the engine no longer has, judged by the mirror while it is
+// healthy (subscribed, and its replay complete). The first healthy look at a hold records
+// how much of it is cached; a hold that later falls below half of that is gone: evicted,
+// or lost to an engine restart or to a resync whose replay did not reach it. A hold the
+// mirror saw nothing of (image blocks carry extra hash keys; a prompt of a block or two,
+// which the engine never serves whole) cannot be judged, and stays until displaced.
 func (q *AdmissionQueue) syncHoldsLocked(now time.Time) {
 	if q.mirror == nil || !q.mirror.Healthy() {
 		return
 	}
 	for _, s := range q.sessions {
-		if !s.holding(now) || !s.heldVisible || s.heldEpoch != q.mirror.Epoch() {
-			continue // never seen, or seen before a resubscribe whose replay may not reach it
+		if !s.holding(now) || s.heldSeen == 0 {
+			continue
 		}
-		if q.mirror.Cached(s.heldBlocks) < s.held/2 {
+		cached := q.mirror.Cached(s.heldBlocks)
+		if s.heldSeen < 0 {
+			s.heldSeen = cached
+			continue
+		}
+		if cached < s.heldSeen/2 {
 			if q.firm(s, now) {
 				q.guardEvictionLocked(now, s.held)
 			}
@@ -554,7 +561,6 @@ func (q *AdmissionQueue) admitLocked(w *admissionWaiter, now time.Time) {
 		s.running++
 		s.held = 0
 		s.heldBlocks = kvmirror.PromptKeys{}
-		s.heldVisible = false
 		s.priority = w.priority
 	}
 }
@@ -596,11 +602,7 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 		// the prompt is what stays useful in the cache.
 		s.held = q.roundUp(s.lastPrompt) // with tail hits its partial last block is kept too
 		s.heldBlocks = s.busyBlocks
-		s.heldVisible = q.mirror != nil && q.mirror.Healthy() && !s.heldBlocks.Empty() &&
-			q.mirror.Cached(s.heldBlocks) >= s.held/2
-		if q.mirror != nil {
-			s.heldEpoch = q.mirror.Epoch()
-		}
+		s.heldSeen = -1 // judged on the next pass (syncHoldsLocked)
 	}
 	s.busyFootprint, s.busyPrompt, s.busyBlocks = 0, 0, kvmirror.PromptKeys{}
 }
