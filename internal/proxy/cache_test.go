@@ -671,3 +671,16 @@ func TestCacheAdmissionEngineUsageIsNoFloor(t *testing.T) {
 		t.Fatalf("running %d blocks with nothing running", got/3200)
 	}
 }
+
+// Raw /v1/completions has no session key; admission must not dereference a nil session
+// (a panic there would leave the queue mutex held and wedge the proxy).
+func TestAcquireWithoutSession(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	for i := 0; i < 2; i++ {
+		rel, _, _, _, ok := q.Acquire(context.Background(), AdmissionRequest{PromptTokens: 2000, MaxTokens: 8, Report: &AdmissionReport{}})
+		if !ok {
+			t.Fatalf("acquire %d refused", i)
+		}
+		rel()
+	}
+}

@@ -169,10 +169,13 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 		s := q.session(ar.Session, now)
 		// A client that timed out and retried keeps its place: its wait counts from the
 		// first attempt, so a retry is not sent to the back.
-		if ar.Session != "" && !s.gaveUpAt.IsZero() && now.Sub(s.gaveUpAt) < retryMemory {
-			w.enqueued = s.gaveUpSince
+		// No session (raw /v1/completions, or chat without messages): s is nil.
+		if s != nil {
+			if !s.gaveUpAt.IsZero() && now.Sub(s.gaveUpAt) < retryMemory {
+				w.enqueued = s.gaveUpSince
+			}
+			s.gaveUpAt = time.Time{}
 		}
-		s.gaveUpAt = time.Time{}
 		w.expOut = q.expectedOutput(s, ar.MaxTokens)
 		w.charge = q.liveCharge(w)
 		if ar.Report != nil {
