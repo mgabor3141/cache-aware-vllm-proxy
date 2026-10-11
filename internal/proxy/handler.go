@@ -619,7 +619,7 @@ func intField(body map[string]any, key string) (int, bool) {
 // (choices) times the prompts of a batched /v1/completions prompt, at least 1.
 func sequencesOf(body map[string]any) int {
 	n := 1
-	if v, ok := intField(body, "n"); ok && v > 1 {
+	if v, ok := engineInt(body, "n"); ok && v > 1 {
 		n = v
 	}
 	if list, ok := body["prompt"].([]any); ok && len(list) > 1 {
@@ -637,18 +637,28 @@ func sequencesOf(body map[string]any) int {
 // rejects, so it allocates nothing and reads as no cap.
 func maxTokensOf(body map[string]any) int {
 	for _, k := range []string{"max_completion_tokens", "max_tokens"} {
-		var s string
-		switch v := body[k].(type) {
-		case json.Number:
-			s = string(v)
-		case string:
-			s = strings.TrimSpace(v)
-		}
-		if f, err := strconv.ParseFloat(s, 64); err == nil && f >= 1 && f <= math.MaxInt32 && f == math.Trunc(f) {
-			return int(f)
+		if v, ok := engineInt(body, k); ok && v >= 1 {
+			return v
 		}
 	}
 	return 0
+}
+
+// engineInt reads an integer field as the engine's validator does: a JSON integer, an
+// integral float (8.0, 8e0) or a numeric string ("8"), within int32.
+func engineInt(body map[string]any, key string) (int, bool) {
+	var s string
+	switch v := body[key].(type) {
+	case json.Number:
+		s = string(v)
+	case string:
+		s = strings.TrimSpace(v)
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f < math.MinInt32 || f > math.MaxInt32 || f != math.Trunc(f) {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // mediaKeys name the content parts that carry media (OpenAI and vLLM chat schemas). A
