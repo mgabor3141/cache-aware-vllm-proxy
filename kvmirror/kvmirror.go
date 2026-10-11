@@ -262,6 +262,15 @@ func (m *Mirror) rememberLocked(key, content uint64, attn, ckpt bool) {
 	m.tailOrder = append(m.tailOrder, key)
 }
 
+// SetSpeculative tells the mirror the engine runs speculative decoding (EAGLE, MTP), so
+// a hit loses its last block, or its last unit with a prefix-match unit, as the engine's
+// does. Off by default: plain vLLM serves every cached block.
+func (m *Mirror) SetSpeculative(on bool) {
+	m.mu.Lock()
+	m.dropLast = on
+	m.mu.Unlock()
+}
+
 // SetGeometry sets the engine's block size and prefix-match unit (from its metrics), so
 // prompt keys are built right before the first event shows them. A unit that is not a
 // proper divisor of the block size is ignored (and logged once); 0 leaves the unit to
@@ -308,7 +317,7 @@ type Stats struct {
 }
 
 func New() *Mirror {
-	m := &Mirror{dropLast: true, tails: map[uint64]end{}}
+	m := &Mirror{tails: map[uint64]end{}}
 	m.resetLocked()
 	return m
 }

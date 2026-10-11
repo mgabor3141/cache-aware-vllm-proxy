@@ -46,6 +46,11 @@ admission:
     # engine's /metrics; nothing to set here.
     kv_events_endpoint: "tcp://vllm:5557"
 
+    # Whether the engine runs speculative decoding (--speculative-config: EAGLE, MTP).
+    # vLLM then serves a cached prefix minus its last block (its last unit with
+    # --prefix-match-unit), and the mirror must predict the same. Default false.
+    # speculative_decoding: true
+
     # Prefill speed of your engine in tokens per second. With decode_interference (how
     # much a running prefill slows decoding, 0-1) it decides how long a finished turn's
     # context is protected: as long as re-prefilling it would take, at least 5 s.

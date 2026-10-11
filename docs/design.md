@@ -45,7 +45,9 @@ In live runs the prediction matched the engine's reported `cached_tokens` on ove
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
 attention blocks: a hit at position p also needs a saved recurrent state at exactly p. The mirror
-tracks each KV group separately and only counts a hit where every group has it.
+tracks each KV group separately and only counts a hit where every group has it. With
+speculative decoding (EAGLE, MTP) vLLM drops the last block of a hit; the mirror does the same
+only when `speculative_decoding` is set, as nothing in the event stream says so.
 
 Engines that cache hybrid-model prefixes at a finer unit than the block, such as halt95's vLLM
 fork (`--block-size 4096 --prefix-match-unit 64`), save a recurrent state where each prompt ends,

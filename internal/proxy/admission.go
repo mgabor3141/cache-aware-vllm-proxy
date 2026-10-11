@@ -84,8 +84,10 @@ type AdmissionQueue struct {
 
 func NewAdmissionQueue(cfg AdmissionConfig) *AdmissionQueue {
 	cfg.applyDefaults()
-	return &AdmissionQueue{cfg: cfg, now: time.Now, sessions: map[string]*cacheSession{},
+	q := &AdmissionQueue{cfg: cfg, now: time.Now, sessions: map[string]*cacheSession{},
 		running: map[*admissionWaiter]struct{}{}, mirror: kvmirror.New()}
+	q.mirror.SetSpeculative(cfg.Cache.SpeculativeDecoding)
+	return q
 }
 
 // Run re-evaluates the queue once a second: holds the engine dropped are released and

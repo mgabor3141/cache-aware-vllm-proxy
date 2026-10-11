@@ -296,6 +296,7 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 // A request whose prefix the mirror reports cached costs less and goes first.
 func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
+	q.mirror.SetSpeculative(true)
 	m := q.mirror
 	m.SetConnected(true)
 	prompt := make([]int64, 3200*30+10)
@@ -885,6 +886,7 @@ func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
 func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{KVEventsEndpoint: "tcp://vllm:5557"}})
 	q.mirror.SetConnected(true)
+	q.mirror.SetSpeculative(true)
 	prompt := testPrompt(20, 0)
 	rep := &AdmissionReport{}
 	got := make(chan func(), 1)
@@ -909,6 +911,7 @@ func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 func TestCacheAdmissionHoldJudgedByUnitHit(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	m := q.mirror
+	m.SetSpeculative(true)
 	m.SetConnected(true)
 	m.SetGeometry(3200, 64)
 	prompt := testPrompt(3, 0)[:6900]

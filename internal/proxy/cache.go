@@ -49,6 +49,11 @@ type CacheConfig struct {
 	// service, which rebuilds the mirror on (re)subscribe, is on the next port.
 	KVEventsEndpoint string `yaml:"kv_events_endpoint"`
 
+	// SpeculativeDecoding says the engine runs speculative decoding (EAGLE, MTP:
+	// --speculative-config). vLLM then serves a cached prefix minus its last block (or
+	// unit), and the mirror predicts the same. Default false (plain vLLM).
+	SpeculativeDecoding bool `yaml:"speculative_decoding"`
+
 	PrefillTokensPerSecond float64 `yaml:"prefill_tokens_per_s"`
 	DecodeInterference     float64 `yaml:"decode_interference"`
 

@@ -80,6 +80,7 @@ func TestKVMirrorUnitHitDeployedShape(t *testing.T) {
 	toks := fixtureTokens(t)
 	turn1, turn2 := toks[:10260], toks[:10800]
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, unit)
 	m.NewPromptKeys(turn1) // turn 1 went through the proxy
 	m.Apply(0, fullBlocks(turn1, 2))
@@ -126,6 +127,7 @@ func TestKVMirrorUnitFromEvents(t *testing.T) {
 	toks := fixtureTokens(t)
 	turn1, turn2 := toks[:10260], toks[:10800]
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, 0)
 	m.Apply(0, fullBlocks(turn1, 2))
 	m.Apply(1, tailEntries(turn1, len(turn1), 900, 901, uint64(899)))
@@ -162,6 +164,7 @@ func TestKVMirrorUnitEntriesReset(t *testing.T) {
 	} {
 		quietLog(t)
 		m := New()
+		m.SetSpeculative(true)
 		m.SetGeometry(ubs, unit)
 		m.Apply(0, fullBlocks(toks, 2))
 		m.Apply(1, tailEntries(toks, 10260, 900, 901, uint64(899)))
@@ -179,6 +182,7 @@ func TestKVMirrorUnitEntriesReset(t *testing.T) {
 func TestKVMirrorUnitHitNeedsCachedBlocksAndAKnownEnd(t *testing.T) {
 	toks := fixtureTokens(t)
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, unit)
 	m.NewPromptKeys(toks[:10260])
 	m.Apply(0, tailEntries(toks, 10260, 900, 901, uint64(899)))
@@ -206,6 +210,7 @@ func TestKVMirrorUnitHitNeedsCachedBlocksAndAKnownEnd(t *testing.T) {
 func TestKVMirrorUnitHitAtBlockBoundaries(t *testing.T) {
 	toks := fixtureTokens(t)
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, unit)
 	m.NewPromptKeys(toks[:2*ubs+10])
 	m.Apply(0, fullBlocks(toks, 2))
@@ -237,7 +242,6 @@ func TestKVMirrorUnitHitAtBlockBoundaries(t *testing.T) {
 func TestKVMirrorUnitHitWithoutDrop(t *testing.T) {
 	toks := fixtureTokens(t)
 	m := New()
-	m.dropLast = false
 	m.SetGeometry(ubs, unit)
 	m.NewPromptKeys(toks[:10260])
 	m.Apply(0, fullBlocks(toks, 2))
@@ -269,6 +273,7 @@ func TestKVMirrorUnitHitAmongDuplicates(t *testing.T) {
 		toks[i] = 0
 	}
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, unit)
 	m.NewPromptKeys(toks[:10260])
 	m.Apply(0, fullBlocks(toks, 2))
@@ -303,6 +308,7 @@ func duplicates(toks []int64, n uint64) []Event {
 // bounded too.
 func TestPromptKeysTail(t *testing.T) {
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, unit)
 	k := m.NewPromptKeys(seqPrompt(200000))
 	if len(k.Units) != 200000/unit {
@@ -332,6 +338,7 @@ func TestPromptKeysTail(t *testing.T) {
 func TestKVMirrorCapturedEventsWithUnit(t *testing.T) {
 	batches, reqs := loadFixture(t)
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(3200, 64)
 	for _, b := range batches {
 		events, err := decodeBatch(b[8:])
@@ -353,6 +360,7 @@ func BenchmarkCachedUnitDuplicates(b *testing.B) {
 		toks[i] = 0
 	}
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(ubs, unit)
 	m.NewPromptKeys(toks[:10260])
 	m.Apply(0, fullBlocks(toks, 2))
@@ -399,6 +407,7 @@ func TestKVMirrorUnitHitAfterDecodeFillsTheBlock(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
+			m.SetSpeculative(true)
 			m.SetGeometry(ubs, unit)
 			m.NewPromptKeys(prev)
 			m.Apply(0, fullBlocks(all, 15))

@@ -38,7 +38,9 @@ KV cache events with a replay socket on the port after the event socket, and pri
 scheduling (cavp sends each request's `priority`; vLLM's default first-come scheduling refuses
 a non-zero one). `--enable-prompt-tokens-details` makes the engine report cached tokens per
 request, which the log and the hit-ratio metrics need. Set `--max-num-seqs` to the same value
-as `admission.max_active`. The engine must not require an API key.
+as `admission.max_active`. The engine must not require an API key. If it runs speculative
+decoding (`--speculative-config`), set `admission.cache.speculative_decoding: true`: such an
+engine serves a cached prefix minus its last block, and the cache mirror must know.
 
 ```sh
 vllm serve Qwen/Qwen3-8B --port 8000 \
