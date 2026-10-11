@@ -566,3 +566,20 @@ func TestHitRatioCountsOnlyReportedDetails(t *testing.T) {
 		t.Fatalf("prompt tokens without details counted:\n%s", m)
 	}
 }
+
+// A full KV cache report would publish stores the mirror counts as copies forever; the
+// field is removed, other vllm_xargs pass through.
+func TestKVCacheReportModeStripped(t *testing.T) {
+	var seen atomic.Value
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		json.NewDecoder(r.Body).Decode(&b)
+		seen.Store(b)
+		w.Write([]byte("{}"))
+	}, nil)
+	h.do("POST", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}],"vllm_xargs":{"kv_cache_report_mode":"full","x":1}}`, nil)
+	x, _ := seen.Load().(map[string]any)["vllm_xargs"].(map[string]any)
+	if _, ok := x["kv_cache_report_mode"]; ok || x["x"] != 1.0 {
+		t.Fatalf("engine got vllm_xargs %v", x)
+	}
+}

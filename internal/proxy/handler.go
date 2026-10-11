@@ -246,6 +246,12 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 	} else {
 		delete(body, "priority")
 	}
+	// A full KV cache report (vllm_xargs.kv_cache_report_mode "full") makes the engine
+	// publish stores for reused blocks with no removal to match, which the mirror cannot
+	// tell from real copies.
+	if x, ok := body["vllm_xargs"].(map[string]any); ok {
+		delete(x, "kv_cache_report_mode")
+	}
 	// The final usage chunk of a stream is how the proxy learns a turn's size, which
 	// becomes its session's hold.
 	if ev.Stream {

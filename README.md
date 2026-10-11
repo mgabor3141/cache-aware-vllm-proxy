@@ -117,13 +117,15 @@ route requires a caller (`auth` in the config: `static` bearer keys, `trusted_he
 gateway, or `none`). Only `Content-Type`, `Accept`, `User-Agent` and `X-Request-Id` are passed
 to the engine; the engine must not require an API key.
 
-**Bodies** are forwarded as sent, with two changes. `priority` is set by the proxy: the
+**Bodies** are forwarded as sent, with three changes. `priority` is set by the proxy: the
 caller's identity is the most urgent it may run, and a numeric `priority` field in the body
 may only make a request run later (clamped to -10..100). On a streaming request,
 `stream_options.include_usage` is set to `true` unless the request sets it: the final usage
 chunk is how the proxy learns the size of a turn, which becomes its conversation's hold, so a
 client that sets it `false` gets no hold. A request streams only when `stream` is the JSON value
-`true`. Bodies over `max_body_bytes` (256 MiB) are refused with 413.
+`true`. `vllm_xargs.kv_cache_report_mode` is removed: a full report would corrupt the
+proxy's mirror of the engine's cache. Bodies over `max_body_bytes` (256 MiB) are refused
+with 413.
 
 **Conversations** are identified by their first two messages, the model and the caller.
 
