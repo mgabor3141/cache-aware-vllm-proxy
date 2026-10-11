@@ -176,22 +176,39 @@ func TestUnsatisfiableWaiterReservesNothing(t *testing.T) {
 	}
 }
 
-// A request its session's hold already covers takes no room, so other waiters'
+// A request that shares its session's held prefix and fits inside it takes no room, so other waiters'
 // reservations do not hold it back.
 func TestCoveredRequestIgnoresReservations(t *testing.T) {
-	q, _ := newCacheQueue(t, nil)
-	ta := q.start("a", 0, 300000)
-	ta.finish(mustAdmit(t, ta, "a"), 300000, 0)
-	r1 := mustAdmit(t, q.start("r1", 0, 1000), "r1")
-	w1 := q.start("w1", 0, 600000) // waits for r1, reserving more than is free
-	mustWait(t, w1, "w1")
-	side := q.start("a", 1, 2000)
-	rel := side.waitAdmitted(time.Second)
-	if rel == nil {
-		t.Fatal("a's side call, covered by its own hold, is held back by w1's reservation")
+	for _, tc := range []struct {
+		name    string
+		side    []int64
+		covered bool
+	}{
+		{"same prefix", testPrompt(93, 1)[:6401], true},
+		{"other prefix", testPrompt(2, 2), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, _ := newCacheQueue(t, nil)
+			p := testPrompt(93, 1)
+			ta := q.startReq("a", 0, len(p), p)
+			ta.finish(mustAdmit(t, ta, "a"), len(p), 0)
+			r1 := mustAdmit(t, q.start("r1", 0, 1000), "r1")
+			w1 := q.start("w1", 0, 600000) // waits for r1, reserving more than is free
+			mustWait(t, w1, "w1")
+			side := q.startReq("a", 1, len(tc.side), tc.side)
+			rel := side.waitAdmitted(200 * time.Millisecond)
+			if tc.covered && rel == nil {
+				t.Fatal("a's side call, covered by its own hold, is held back by w1's reservation")
+			}
+			if !tc.covered && rel != nil {
+				t.Fatal("a side call that shares nothing with a's hold skipped w1's reservation")
+			}
+			if rel != nil {
+				rel()
+			}
+			r1()
+		})
 	}
-	rel()
-	r1()
 }
 
 // With every slot taken, a grant pass returns before it scores waiters against the

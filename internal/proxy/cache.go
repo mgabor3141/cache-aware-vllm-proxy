@@ -500,10 +500,10 @@ func (q *AdmissionQueue) reachLocked(g *grantState, w *admissionWaiter, now time
 // fitLocked decides whether w can run now within free room (budget minus running work,
 // holds, and what earlier blocked waiters reserved), and which idle holds it displaces.
 func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved int, g *grantState) (plan []displacement, ok bool) {
-	// A waiter its session's hold already covers takes no room: reservations do not hold
-	// it back.
+	// A waiter its session's hold already covers (it resends a prefix of the held prompt
+	// and fits inside it) takes no room: reservations do not hold it back.
 	adds := q.addsLocked(w)
-	if adds <= 0 {
+	if adds <= 0 && q.sharesHold(w) {
 		return nil, true
 	}
 	need := adds - g.free + reserved
@@ -747,4 +747,22 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 type CacheObservation struct {
 	PromptTokens     int
 	CompletionTokens int
+}
+
+// sharesHold: w's prompt is a prefix of its session's held prompt, by mirror keys.
+func (q *AdmissionQueue) sharesHold(w *admissionWaiter) bool {
+	s := q.sessions[w.session]
+	if s == nil || s.held == 0 {
+		return false
+	}
+	a, b := w.blocks, s.heldBlocks
+	if len(a.Blocks) == 0 || a.BlockSize != b.BlockSize || len(a.Blocks) > len(b.Blocks) {
+		return false
+	}
+	for i, k := range a.Blocks {
+		if b.Blocks[i] != k {
+			return false
+		}
+	}
+	return true
 }
