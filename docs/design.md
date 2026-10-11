@@ -68,7 +68,8 @@ next turn resumes there, at for example 2 blocks and 31 units (10,176 tokens), n
 full block. The mirror matches these events. It takes the unit from `prefix_match_unit` in
 `vllm:cache_config_info`, else from the size of the unit events, and follows the engine's rule:
 the attention layers reach through the contiguous cached full blocks and then the next block's
-unit boundaries, probed from the top; speculative decoding drops one unit rather than a block;
+unit boundaries, probed from the top but never past the prompt's last token (the engine recomputes it, so
+a prompt that ends on a unit boundary cannot read the entry it registers there; a longer one can); speculative decoding drops one unit rather than a block;
 the hit is the newest boundary at or below that with a recurrent checkpoint, which may lie a
 block or more lower (a turn whose decode filled the block its prompt ended in leaves its
 checkpoint below a block the next turn matches whole). Unit matching only adds boundaries to
@@ -84,9 +85,13 @@ The mirror is only as good as the stream. On every (re)subscription it starts em
 from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
 replay that fails ends the subscription so it is retried. Batches missing from the replay
 buffer are skipped and the mirror starts over from the batch after them (they may have removed
-blocks); undecodable batches are skipped. Neither fails every retry. A sequence number that goes backwards
+blocks); undecodable batches are skipped. Neither fails every retry. Events the mirror cannot
+use are counted and logged once, never applied: blocks on another medium than the GPU (CPU or
+disk KV offload), events without a usable `group_idx`, and block hashes of an unknown type. A sequence number that goes backwards
 outside the replay overlap means the engine restarted: the mirror starts over, resyncs from the
-replay, and its generation moves so admission sees its holds may be gone. Holds are
+replay, and its generation moves so admission sees its holds may be gone. The same goes for a
+restart seen inside the replay: each later round asks from the last batch already applied, and a
+publisher that does not send it back unchanged fails the replay, which resyncs. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
 a restart, or older than the replay buffer reaches) is released. A hold the mirror never saw
 (the prompt could not be tokenized, or its blocks carry extra hash keys) cannot be verified: it
