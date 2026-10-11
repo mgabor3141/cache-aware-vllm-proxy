@@ -139,7 +139,11 @@ hold its place on the engine.
 `readiness.interval` (5 s); the engine is ready while it lists a model. While it is not,
 requests wait in the queue rather than fail. Nothing is retried: a request that fails once it
 reached the engine returns its error (for a stream, as an SSE error event after the last
-complete event: an event the engine left half written is dropped, never relayed).
+complete event: an event the engine left half written is dropped, never relayed). A running
+request whose engine has failed the probe for three intervals in a row, and which received
+nothing from the engine in that time, is given up with a 502 (an error event on a stream), so a
+dead or hung engine cannot hold permits forever. This is not a request timeout: on a live
+engine, or while the engine keeps sending, a request runs as long as it takes.
 
 **Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
 status, or 502 with an `error` when it failed or ended without `[DONE]`; `status` 499 for a

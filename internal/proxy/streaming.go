@@ -34,9 +34,9 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 
 	// A failed write (client gone, or stalled past writeStallTimeout) cancels ctx, which
 	// ends the wait or the upstream request.
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	sw := &sseWriter{w: w, cancel: cancel}
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	sw := &sseWriter{w: w, cancel: func() { cancel(nil) }}
 	sw.flush()
 	defer sw.keepalive(p.keepalive)()
 
@@ -57,6 +57,9 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 		}
 		release()
 	}()
+	// A request stuck on a down engine is given up (watchEngine).
+	heard := heardNow()
+	defer p.watchEngine(ctx, cancel, heard)()
 
 	req, err := p.upstreamRequest(ctx, r, r.URL.Path, body)
 	if err != nil {
@@ -66,9 +69,12 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && context.Cause(ctx) != errEngineDown {
 			ev.Status, ev.Error = statusClientGone, "client went away"
 			return
+		}
+		if context.Cause(ctx) == errEngineDown {
+			err = errEngineDown
 		}
 		ev.Status, ev.Error = http.StatusBadGateway, "engine request failed: "+err.Error()
 		sw.errorEvent("inference upstream request failed", ev.Status)
@@ -90,6 +96,7 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			heard.Store(time.Now().UnixNano())
 			scan.Write(buf[:n])
 			if werr := sw.relay(buf[:n]); werr != nil {
 				ev.Status, ev.Error = statusClientGone, "client went away mid-stream: "+werr.Error()
@@ -109,6 +116,9 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 			if r.Context().Err() != nil {
 				ev.Status, ev.Error = statusClientGone, "client went away mid-stream"
 				return
+			}
+			if context.Cause(ctx) == errEngineDown {
+				rerr = errEngineDown
 			}
 			ev.Status, ev.Error = http.StatusBadGateway, "engine stream cut: "+rerr.Error()
 			sw.errorEvent("the engine stream failed", http.StatusBadGateway)

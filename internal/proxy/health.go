@@ -24,6 +24,7 @@ type readiness struct {
 
 	mu      sync.Mutex
 	ready   bool
+	since   time.Time     // when ready last changed
 	changed chan struct{} // closed and replaced on every change of ready
 
 	waiting atomic.Int64 // requests in Wait while the engine is not ready
@@ -74,7 +75,7 @@ func (h *readiness) set(ready bool, why string) {
 		h.mu.Unlock()
 		return
 	}
-	h.ready = ready
+	h.ready, h.since = ready, time.Now()
 	close(h.changed)
 	h.changed = make(chan struct{})
 	h.mu.Unlock()
@@ -130,4 +131,17 @@ func (h *readiness) probe(ctx context.Context) error {
 		return fmt.Errorf("/v1/models lists no model")
 	}
 	return nil
+}
+
+// downFor is how long the engine has been not ready; 0 while it is ready.
+func (h *readiness) downFor() time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ready {
+		return 0
+	}
+	if h.since.IsZero() {
+		return 0 // never probed yet
+	}
+	return time.Since(h.since)
 }

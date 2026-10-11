@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/internal/auth"
@@ -67,6 +68,8 @@ type Proxy struct {
 
 	keepalive  time.Duration
 	writeStall time.Duration
+	// engineDownAfter: see watchEngine.
+	engineDownAfter time.Duration
 
 	closing   chan struct{} // closed when the server shuts down
 	closeOnce sync.Once
@@ -83,14 +86,15 @@ func NewProxy(cfg *Config, logger *EventLogger) (*Proxy, error) {
 	}
 	return &Proxy{
 		cfg: cfg, upstream: u, logger: logger, auth: authn,
-		client:         &http.Client{},
-		admission:      NewAdmissionQueue(cfg.Admission),
-		ready:          newReadiness(cfg.Upstream, cfg.Readiness.Interval),
-		tokenizeClient: &http.Client{},
-		tokenizeSem:    make(chan struct{}, 4),
-		keepalive:      keepaliveInterval,
-		writeStall:     writeStallTimeout,
-		closing:        make(chan struct{}),
+		client:          &http.Client{},
+		admission:       NewAdmissionQueue(cfg.Admission),
+		ready:           newReadiness(cfg.Upstream, cfg.Readiness.Interval),
+		tokenizeClient:  &http.Client{},
+		tokenizeSem:     make(chan struct{}, 4),
+		keepalive:       keepaliveInterval,
+		writeStall:      writeStallTimeout,
+		engineDownAfter: engineDownProbes * cfg.Readiness.Interval,
+		closing:         make(chan struct{}),
 	}, nil
 }
 
@@ -183,7 +187,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch route {
 	case "models":
-		p.forwardTo(w, r, ev, "/v1/models", nil, nil)
+		p.forwardTo(r.Context(), w, r, ev, "/v1/models", nil, nil, nil)
 	case "tokenize":
 		release, err := p.tokenizeSlot(r.Context())
 		if err != nil {
@@ -191,7 +195,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer release()
-		p.forwardTo(w, r, ev, "/tokenize", body, nil)
+		p.forwardTo(r.Context(), w, r, ev, "/tokenize", body, nil, nil)
 	default:
 		p.serveInference(w, r, ev, who, body)
 	}
@@ -318,7 +322,12 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 		}
 		release()
 	}()
-	p.forwardTo(w, r, ev, r.URL.Path, out, keep)
+	// A request stuck on a down engine is given up (watchEngine).
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	heard := heardNow()
+	defer p.watchEngine(ctx, cancel, heard)()
+	p.forwardTo(ctx, w, r, ev, r.URL.Path, out, keep, heard)
 }
 
 var (
@@ -414,11 +423,11 @@ func (p *Proxy) upstreamRequest(ctx context.Context, r *http.Request, path strin
 	return req, nil
 }
 
-// forwardTo sends the request to the engine and relays the response. keep, when set,
-// also receives the response body. A response cut short aborts the client's connection,
+// forwardTo sends the request to the engine, under ctx, and relays the response. keep,
+// when set, also receives the response body; heard, when set, the time of its last bytes. A response cut short aborts the client's connection,
 // so the client cannot mistake it for a complete one.
-func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte, keep *bodyKeeper) {
-	req, err := p.upstreamRequest(r.Context(), r, path, body)
+func (p *Proxy) forwardTo(ctx context.Context, w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte, keep *bodyKeeper, heard *atomic.Int64) {
+	req, err := p.upstreamRequest(ctx, r, path, body)
 	if err != nil {
 		ev.Status, ev.Error = http.StatusInternalServerError, err.Error()
 		writeError(w, ev.Status, "internal error")
@@ -429,6 +438,9 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 		if r.Context().Err() != nil {
 			ev.Status, ev.Error = statusClientGone, "client went away"
 			return
+		}
+		if context.Cause(ctx) == errEngineDown {
+			err = errEngineDown
 		}
 		ev.Status, ev.Error = http.StatusBadGateway, "engine request failed: "+err.Error()
 		writeError(w, ev.Status, "inference upstream request failed")
@@ -448,6 +460,9 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if heard != nil {
+				heard.Store(time.Now().UnixNano())
+			}
 			keep.Write(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				ev.Status, ev.Error = statusClientGone, "client went away: "+werr.Error()
@@ -458,6 +473,9 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 			return
 		}
 		if rerr != nil {
+			if context.Cause(ctx) == errEngineDown {
+				rerr = errEngineDown
+			}
 			ev.Status, ev.Error = http.StatusBadGateway, "engine response cut: "+rerr.Error()
 			if r.Context().Err() != nil {
 				ev.Status, ev.Error = statusClientGone, "client went away"
@@ -711,4 +729,48 @@ func (p *Proxy) tokenizeSlot(ctx context.Context) (release func(), err error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// errEngineDown cancels a running request whose engine went down (watchEngine).
+var errEngineDown = errors.New("the engine stopped answering its readiness probe while the request ran")
+
+// engineDownProbes: a running request is given up once the engine has failed its
+// readiness probe for this many probe intervals, and nothing came from the engine for
+// the request in that time.
+const engineDownProbes = 3
+
+// watchEngine cancels a running request (with errEngineDown) when the engine has been
+// down for engineDownAfter and the request heard nothing from it (heard, unix nanos of
+// the last bytes) for as long. This is not a request timeout: a request on a live engine
+// runs as long as it takes. It frees the permit of a request stuck on a dead or hung
+// engine, whose connection may never fail on its own.
+func (p *Proxy) watchEngine(ctx context.Context, cancel context.CancelCauseFunc, heard *atomic.Int64) (stop func()) {
+	quit := make(chan struct{})
+	go func() {
+		t := time.NewTicker(max(p.engineDownAfter/4, time.Millisecond))
+		defer t.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			silent := time.Since(time.Unix(0, heard.Load()))
+			if d := p.ready.downFor(); d >= p.engineDownAfter && silent >= p.engineDownAfter {
+				log.Printf("level=warn msg=\"gave up a running request: the engine is down and sent nothing for it\" down_s=%.0f silent_s=%.0f", d.Seconds(), silent.Seconds())
+				cancel(errEngineDown)
+				return
+			}
+		}
+	}()
+	return func() { close(quit) }
+}
+
+// heardNow returns a clock of the last bytes from the engine, started now.
+func heardNow() *atomic.Int64 {
+	var h atomic.Int64
+	h.Store(time.Now().UnixNano())
+	return &h
 }
