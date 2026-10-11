@@ -102,7 +102,7 @@ cavp serves a small, fixed set of routes; everything else is 404:
 | Route | |
 |---|---|
 | `POST /v1/chat/completions`, `POST /v1/completions` | admitted, then forwarded |
-| `POST /v1/tokenize`, `POST /tokenize` | forwarded to the engine's `/tokenize`, not admitted |
+| `POST /v1/tokenize`, `POST /tokenize` | forwarded to the engine's `/tokenize`, not admitted; shares the proxy's 4 tokenize slots (it waits for one) |
 | `GET /v1/models` | the engine's model list, unchanged |
 | `GET /healthz` | the process is up |
 | `GET /readyz` | the engine is ready (see below) |

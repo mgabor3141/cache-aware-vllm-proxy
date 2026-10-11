@@ -38,7 +38,7 @@ const (
 	// writeStallTimeout bounds one write to a client. A client that stops reading
 	// (without disconnecting) would otherwise hold its admission permit forever.
 	writeStallTimeout = 5 * time.Minute
-	// tokenizeTimeout bounds sizing a prompt with /tokenize, including the wait for a slot.
+	// tokenizeTimeout bounds one sizing call to /tokenize, once it has a slot.
 	tokenizeTimeout = 10 * time.Second
 	// A caller-chosen priority is clamped to this range.
 	minCallerPriority, maxCallerPriority = -10, 100
@@ -175,6 +175,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "models":
 		p.forwardTo(w, r, ev, "/v1/models", nil, nil)
 	case "tokenize":
+		release, err := p.tokenizeSlot(r.Context())
+		if err != nil {
+			ev.Status, ev.Error = statusClientGone, errClientGone.Error()
+			return
+		}
+		defer release()
 		p.forwardTo(w, r, ev, "/tokenize", body, nil)
 	default:
 		p.serveInference(w, r, ev, who, body)
@@ -630,16 +636,15 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any) 
 	if err != nil {
 		return nil, err
 	}
-	// The timeout covers waiting for a slot too.
+	// Wait for a slot as long as it takes (the request has to wait anyway); only the
+	// call itself is bounded, so a busy slot does not push a prompt onto the estimate.
+	releaseSlot, err := p.tokenizeSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 	ctx, cancel := context.WithTimeout(ctx, tokenizeTimeout)
 	defer cancel()
-	// Bounded: tokenizing runs on the engine's API server, next to every stream.
-	select {
-	case p.tokenizeSem <- struct{}{}:
-		defer func() { <-p.tokenizeSem }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	u := *p.upstream
 	u.Path = strings.TrimRight(u.Path, "/") + "/tokenize"
 	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(buf))
@@ -662,4 +667,16 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any) 
 		return nil, err
 	}
 	return out.Tokens, nil
+}
+
+// tokenizeSlot waits for one of the tokenize slots, shared by the proxy's own sizing
+// calls and the callers' /tokenize: both are work on the engine's API server, next to
+// every stream. The wait is unbounded; it ends early only if ctx does.
+func (p *Proxy) tokenizeSlot(ctx context.Context) (release func(), err error) {
+	select {
+	case p.tokenizeSem <- struct{}{}:
+		return func() { <-p.tokenizeSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
