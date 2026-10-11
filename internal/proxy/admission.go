@@ -202,6 +202,9 @@ func (q *AdmissionQueue) enqueue(ar AdmissionRequest) (*admissionWaiter, bool, A
 			w.enqueued = s.gaveUpSince
 		}
 		s.gaveUpAt = time.Time{}
+		if s.waiting == 0 {
+			s.waitingSince = now
+		}
 		s.waiting++
 	}
 	snap := q.snapshotLocked()

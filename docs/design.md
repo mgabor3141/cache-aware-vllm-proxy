@@ -93,7 +93,8 @@ decoding). A non-streaming request is charged its expected output until it finis
 admitted on top of it. It stays counted while the conversation's next request runs (the session is
 charged the larger of the two, which share the prefix). A hold is firm (cannot be displaced by work of the same or lower
 priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
-that prefill would slow, and at least 5 s so a quick tool call always comes back warm. After that
+that prefill would slow, and at least 5 s so a quick tool call always comes back warm, and as
+long again from when its conversation's next request starts waiting. After that
 it is expendable: it stays while nothing needs the room. A hold has the priority of the turn that
 left it; a turn that ends without usage (client gone, engine error) keeps the previous hold.
 

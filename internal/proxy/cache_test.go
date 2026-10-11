@@ -559,8 +559,8 @@ func TestCacheAdmissionMinHold(t *testing.T) {
 	mustAdmit(t, tc, "c after minHold")
 }
 
-// A thread that is back and waiting is never displaced by equal priority, however long
-// others wait.
+// A thread that is back and waiting keeps its hold firm for the hold window, counted from
+// when it started waiting.
 func TestCacheAdmissionWaitingOwnerKeepsHold(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	ta := q.start("a", 0, 200000)
@@ -570,7 +570,7 @@ func TestCacheAdmissionWaitingOwnerKeepsHold(t *testing.T) {
 	clk.add(10 * time.Minute)
 	ta2 := q.start("a", 0, 260000) // back, but too big to run beside b
 	tc := q.start("c", 0, 150000)  // would fit by taking a's hold
-	clk.add(time.Hour)
+	clk.add(10 * time.Second)
 	q.tick()
 	mustWait(t, ta2, "a")
 	mustWait(t, tc, "c, a's owner is waiting")

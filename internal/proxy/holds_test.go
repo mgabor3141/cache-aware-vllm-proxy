@@ -75,3 +75,25 @@ func TestUnverifiedHoldReleasedOnMirrorReset(t *testing.T) {
 		t.Errorf("a still holds %d after a mirror reset it was never seen through", h)
 	}
 }
+
+// A waiter that cannot run does not keep its session's idle hold firm forever: firmness
+// from a waiting thread lasts the hold window, counted from when it started waiting
+// (attacker #1).
+func TestParkedWaiterDoesNotPinHold(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	ta := q.start("att", 0, 200000)
+	ta.finish(mustAdmit(t, ta, "att's turn"), 200000, 0)
+	r1 := mustAdmit(t, q.start("r1", 0, 1000), "r1")
+	v := q.start("v", 0, 500000) // needs att's hold displaced
+	mustWait(t, v, "v while att's hold is firm")
+	parked := q.start("att", 0, 900000) // can never run beside r1
+	mustWait(t, parked, "att's oversized request")
+	clk.add(time.Hour)
+	q.tick()
+	rel := v.waitAdmitted(time.Second)
+	if rel == nil {
+		t.Fatal("v starved an hour: att's parked waiter keeps its hold firm")
+	}
+	rel()
+	r1()
+}

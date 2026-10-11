@@ -22,8 +22,8 @@ package proxy
 // prompts, then cold ones, each by arrival.
 //
 // Releasing an idle session: its hold is firm for as long as re-prefilling it would take
-// (with the decoding that prefill stalls), at least minHold, and while its own thread
-// waits (holdFor, firm). After that it is expendable: an equal-priority waiter may
+// (with the decoding that prefill stalls), at least minHold, and as long again once its own thread
+// starts waiting (holdFor, firm). After that it is expendable: an equal-priority waiter may
 // displace it while fewer than evictBelowRunning requests run. A higher-priority waiter
 // may displace any lower-priority hold (fitLocked). Waiting long forces nothing, so many
 // waiters cannot start thrashing together.
@@ -215,6 +215,7 @@ type cacheSession struct {
 
 	gaveUpSince, gaveUpAt time.Time // a waiter whose client left: since when it waited, and when it left
 	waiting               int       // requests of this session in the queue
+	waitingSince          time.Time // when waiting last went from 0 to 1
 	lastSeen              time.Time
 }
 
@@ -426,9 +427,12 @@ func (q *AdmissionQueue) holdFor(s *cacheSession) time.Duration {
 }
 
 // firm: an idle hold no equal or lower priority waiter may displace, because its
-// thread is back and waiting, or is likely back soon.
+// thread is likely back soon, or is back and waiting. Either lasts holdFor: from the turn
+// that left the hold, or from when the thread started waiting, so a waiter that cannot
+// run does not pin its hold.
 func (q *AdmissionQueue) firm(s *cacheSession, now time.Time) bool {
-	return s.waiting > 0 || now.Sub(s.lastDone) < q.holdFor(s)
+	hold := q.holdFor(s)
+	return now.Sub(s.lastDone) < hold || (s.waiting > 0 && now.Sub(s.waitingSince) < hold)
 }
 
 // tier orders waiters within a priority: a thread whose prefix is cached first (nothing
