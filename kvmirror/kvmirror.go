@@ -59,6 +59,7 @@
 package kvmirror
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -128,9 +129,9 @@ type Mirror struct {
 	units           map[uint64]*unitEntry            // engine hash -> unit entry
 	unitsByContent  map[uint64]map[uint64]*unitEntry // unitHash -> engine hash -> unit entry
 	// tails are where prompts the mirror keyed end (NewPromptKeys): facts about prompts,
-	// not about the engine, so they outlive resets; the oldest go first.
-	tails     map[uint64]end
-	tailOrder []uint64
+	// not about the engine, so they outlive resets; the least recently used go first.
+	tails     map[uint64]*list.Element // of *tail
+	tailOrder *list.List
 	lastSeq   int64
 	// After a replay, live delivery repeats the batches the replay already applied, once,
 	// in order, and at once (they queued while the replay ran): for overlapWindow after
@@ -208,7 +209,13 @@ type end struct {
 	attn, ckpt bool
 }
 
+type tail struct {
+	key uint64
+	end
+}
+
 // maxTails bounds the prompt ends remembered: far more than an engine's cache holds.
+// The least recently remembered or looked up go first.
 const maxTails = 1 << 15
 
 // NewPromptKeys computes a prompt's keys at the mirror's block size (none while it is
@@ -249,17 +256,16 @@ func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
 }
 
 func (m *Mirror) rememberLocked(key, content uint64, attn, ckpt bool) {
-	if e, ok := m.tails[key]; ok {
-		e.attn, e.ckpt = e.attn || attn, e.ckpt || ckpt
-		m.tails[key] = e
+	if el, ok := m.tails[key]; ok {
+		t := el.Value.(*tail)
+		t.attn, t.ckpt = t.attn || attn, t.ckpt || ckpt
+		m.tailOrder.MoveToBack(el)
 		return
 	}
-	if len(m.tailOrder) == maxTails {
-		delete(m.tails, m.tailOrder[0])
-		m.tailOrder = m.tailOrder[1:]
+	if m.tailOrder.Len() == maxTails {
+		delete(m.tails, m.tailOrder.Remove(m.tailOrder.Front()).(*tail).key)
 	}
-	m.tails[key] = end{content: content, attn: attn, ckpt: ckpt}
-	m.tailOrder = append(m.tailOrder, key)
+	m.tails[key] = m.tailOrder.PushBack(&tail{key: key, end: end{content: content, attn: attn, ckpt: ckpt}})
 }
 
 // SetSpeculative tells the mirror the engine runs speculative decoding (EAGLE, MTP), so
@@ -318,7 +324,7 @@ type Stats struct {
 }
 
 func New() *Mirror {
-	m := &Mirror{tails: map[uint64]end{}}
+	m := &Mirror{tails: map[uint64]*list.Element{}, tailOrder: list.New()}
 	m.resetLocked()
 	return m
 }
@@ -723,8 +729,12 @@ func (m *Mirror) endLocked(k PromptKeys, x int) (end, bool) {
 	if !ok {
 		return end{}, false
 	}
-	e, ok := m.tails[key]
-	return e, ok
+	el, ok := m.tails[key]
+	if !ok {
+		return end{}, false
+	}
+	m.tailOrder.MoveToBack(el) // looked up: a conversation that comes back keeps its ends
+	return el.Value.(*tail).end, true
 }
 
 // heldLocked reports whether a unit entry with these tokens is held in every group of mask.

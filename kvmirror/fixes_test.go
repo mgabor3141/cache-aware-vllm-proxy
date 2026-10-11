@@ -59,3 +59,32 @@ func TestFixFullReportIsNotACopy(t *testing.T) {
 		t.Fatalf("%d blocks still cached after their only eviction", st.Blocks)
 	}
 }
+
+// The prompt ends table is an LRU, not a FIFO: a conversation whose ends keep being looked
+// up (its hold judged, its next turn scored) keeps its unit hit however many other turns
+// pass (review r4-86 #5).
+func TestFixTailsAreLRU(t *testing.T) {
+	m := New()
+	m.SetSpeculative(true)
+	m.SetGeometry(ubs, unit)
+	toks := fixtureTokens(t)[:10260]
+	tk := m.NewPromptKeys(toks).Tail()
+	m.Apply(0, fullBlocks(toks, 2))
+	m.Apply(1, tailEntries(toks, len(toks), 900, 901, uint64(899)))
+	if got := m.Cached(tk); got != 10176 {
+		t.Fatalf("cached %d, want 10176", got)
+	}
+	m.mu.Lock()
+	for i := uint64(0); i < 2*maxTails; i++ {
+		m.rememberLocked(1<<40+i, 0, true, false)
+		if i%1000 == 0 {
+			m.mu.Unlock()
+			m.Cached(tk)
+			m.mu.Lock()
+		}
+	}
+	m.mu.Unlock()
+	if got := m.Cached(tk); got != 10176 {
+		t.Fatalf("after %d other ends: cached %d, want 10176", 2*maxTails, got)
+	}
+}
