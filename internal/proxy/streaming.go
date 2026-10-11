@@ -48,7 +48,15 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 		}
 		return
 	}
-	defer release() // runs after the usage below is recorded: admission reads it
+	// One deferred step, in this order: the stream's usage is recorded on ev, then the
+	// permit is released, and admission reads ev (Observe) as it releases.
+	scan := &usageScanner{chunks: ev.generated}
+	defer func() {
+		if scan.found {
+			ev.setUsage(scan.usage)
+		}
+		release()
+	}()
 
 	req, err := p.upstreamRequest(ctx, r, r.URL.Path, body)
 	if err != nil {
@@ -78,12 +86,6 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 		return
 	}
 
-	scan := &usageScanner{chunks: ev.generated}
-	defer func() {
-		if scan.found {
-			ev.setUsage(scan.usage)
-		}
-	}()
 	buf := make([]byte, 32<<10)
 	for {
 		n, rerr := resp.Body.Read(buf)

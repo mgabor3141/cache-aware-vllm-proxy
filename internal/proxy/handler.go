@@ -283,14 +283,19 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 		}
 		return
 	}
-	defer release() // runs after the usage below is recorded: admission reads it
+	// One deferred step, in this order (it also runs when forwardTo aborts): the
+	// response's usage is recorded on ev, then the permit is released, and admission
+	// reads ev (Observe) as it releases.
 	keep := &bodyKeeper{limit: maxUsageBodyBytes}
-	p.forwardTo(w, r, ev, r.URL.Path, out, keep)
-	if ev.Status == http.StatusOK && !keep.over {
-		if u, ok := parseResponseUsage(keep.buf); ok {
-			ev.setUsage(u)
+	defer func() {
+		if ev.Status == http.StatusOK && !keep.over {
+			if u, ok := parseResponseUsage(keep.buf); ok {
+				ev.setUsage(u)
+			}
 		}
-	}
+		release()
+	}()
+	p.forwardTo(w, r, ev, r.URL.Path, out, keep)
 }
 
 var (
