@@ -149,8 +149,9 @@ type Mirror struct {
 	// unsupported is a group kind the mirror cannot model (only full and MLA attention and
 	// mamba are); while set, Cached returns 0.
 	unsupported string
-	sizeWarned  bool // a block of another size than blockSize was logged
-	unitWarned  bool // an unusable prefix_match_unit was logged
+	sizeWarned  bool            // a block of another size than blockSize was logged
+	unitWarned  bool            // an unusable prefix_match_unit was logged
+	skipWarned  map[string]bool // kinds of skipped events already logged
 	// dropLast applies the EAGLE drop (speculative decoding on): the last block, or the
 	// last unit of a unit hit.
 	dropLast bool
@@ -332,6 +333,9 @@ func (m *Mirror) isUnitLocked(size int) bool {
 type Stats struct {
 	// Reports are reuse reports of a recurrent group (parent-less, several blocks): not stored.
 	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps, Reports uint64
+	// SkippedNoGroup are BlockStored events without a usable group_idx (missing, or 64 and
+	// up): not stored.
+	SkippedNoGroup uint64
 }
 
 func New() *Mirror {
@@ -493,10 +497,18 @@ func (m *Mirror) applyLocked(e *Event) {
 		m.clearLocked()
 		m.stats.Cleared++
 	case "BlockRemoved":
-		if e.GroupIdx == nil {
+		g, ok := groupOf(e)
+		if !ok {
+			// Which group lost a copy is unknown: forget the hash in every group, as only
+			// forgetting under-reports.
+			m.warnSkipLocked("no_group", "kv events BlockRemoved without a usable group_idx: the hash is forgotten in every group")
+			for _, h := range e.BlockHashes {
+				if u, ok := hashToUint(h); ok {
+					m.forgetLocked(u)
+				}
+			}
 			return
 		}
-		g := uint(*e.GroupIdx)
 		for _, h := range e.BlockHashes {
 			u, ok := hashToUint(h)
 			if !ok {
@@ -518,10 +530,15 @@ func (m *Mirror) applyLocked(e *Event) {
 			}
 		}
 	case "BlockStored":
-		if e.GroupIdx == nil || e.BlockSize <= 0 {
+		if e.BlockSize <= 0 {
 			return
 		}
-		g := uint(*e.GroupIdx)
+		g, ok := groupOf(e)
+		if !ok {
+			m.stats.SkippedNoGroup++
+			m.warnSkipLocked("no_group", "kv events BlockStored without a usable group_idx: not stored")
+			return
+		}
 		bit := uint64(1) << g
 		switch e.Kind {
 		case "mamba":
@@ -608,6 +625,40 @@ func (m *Mirror) applyLocked(e *Event) {
 			}
 		}
 	}
+}
+
+// groupOf is the event's KV cache group, if it has one the masks can hold.
+func groupOf(e *Event) (uint, bool) {
+	if e.GroupIdx == nil || *e.GroupIdx < 0 || *e.GroupIdx >= 64 {
+		return 0, false
+	}
+	return uint(*e.GroupIdx), true
+}
+
+// forgetLocked drops every copy held under engine hash u.
+func (m *Mirror) forgetLocked(u uint64) {
+	if b := m.byEngine[u]; b != nil {
+		m.stats.Removed++
+		delete(m.byEngine, u)
+		if m.byKey[b.key] == b {
+			delete(m.byKey, b.key)
+		}
+	} else if f := m.units[u]; f != nil {
+		m.stats.Removed++
+		m.dropUnitLocked(f)
+	}
+}
+
+// warnSkipLocked logs the first event of each kind the mirror cannot use.
+func (m *Mirror) warnSkipLocked(kind, msg string) {
+	if m.skipWarned[kind] {
+		return
+	}
+	if m.skipWarned == nil {
+		m.skipWarned = map[string]bool{}
+	}
+	m.skipWarned[kind] = true
+	log.Printf("level=warn msg=%q", msg+" (logged once)")
 }
 
 // storeUnitsLocked records a unit-sized BlockStored. An entry whose hash is a known
