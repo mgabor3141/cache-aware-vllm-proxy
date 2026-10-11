@@ -102,6 +102,12 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 				ev.Status, ev.Error = statusClientGone, "client went away mid-stream: "+werr.Error()
 				return
 			}
+			if scan.done {
+				// [DONE] ends the turn. An engine (or something in front of it) may keep
+				// the response open after it; the permit must not wait for that.
+				sw.finish()
+				return
+			}
 		}
 		if rerr == io.EOF {
 			if !scan.done {
