@@ -264,3 +264,46 @@ func TestNoKeepaliveInsideAnEvent(t *testing.T) {
 		t.Fatalf("event corrupted: %q", body)
 	}
 }
+
+// The held-back event is bounded: an engine that sends more than maxPendingEvent
+// without a blank line is relayed as it arrives, and a later error event still starts
+// on a line of its own (rev-3 #3).
+func TestStreamPendingEventIsBounded(t *testing.T) {
+	big := "data: " + strings.Repeat("x", maxPendingEvent+1000)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		sseEngine(sseChunk, big[:maxPendingEvent/2], big[maxPendingEvent/2:])(w, r)
+		<-r.Context().Done()
+	}, nil)
+	resp, err := h.request(context.Background(), "POST", "/v1/chat/completions", streamBody, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got := 0
+	buf := make([]byte, 64<<10)
+	for got < len(sseChunk)+len(big) {
+		n, err := resp.Body.Read(buf)
+		got += n
+		if err != nil {
+			t.Fatalf("after %d bytes: %v", got, err)
+		}
+	}
+	var sw sseWriter
+	sw.raw, sw.open = true, true
+	rec := &recorder{}
+	sw.w, sw.cancel = rec, func() {}
+	sw.errorEvent("x", 502)
+	if !strings.HasPrefix(rec.String(), "\n\ndata: {\"error\"") {
+		t.Fatalf("error event inside an open event: %q", rec.String())
+	}
+}
+
+type recorder struct {
+	http.ResponseWriter
+	strings.Builder
+}
+
+func (r *recorder) Write(b []byte) (int, error) { return r.Builder.Write(b) }
+func (r *recorder) Header() http.Header         { return http.Header{} }
+func (r *recorder) WriteHeader(int)             {}
+func (r *recorder) Flush()                      {}

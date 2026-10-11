@@ -162,6 +162,8 @@ type sseWriter struct {
 	cancel  context.CancelFunc
 	wrote   bool   // since the last keepalive check
 	pending []byte // engine bytes after the last complete event
+	raw     bool   // past maxPendingEvent: relaying as bytes arrive
+	open    bool   // raw, and the client's stream ends inside an event
 	failed  bool
 }
 
@@ -188,19 +190,38 @@ func (s *sseWriter) write(b []byte) error {
 	return s.writeLocked(b)
 }
 
+// maxPendingEvent bounds the unfinished event held back from the client. An engine
+// whose event outgrows it (or that sends something other than SSE) is relayed as it
+// arrives from then on.
+const maxPendingEvent = 1 << 20
+
 // relay writes the engine bytes up to the last event boundary (a blank line) and holds
-// the rest.
+// the rest. Only the new bytes (and the 3 before them) are scanned for a boundary.
 func (s *sseWriter) relay(b []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.raw {
+		s.open = !endsEvent(b)
+		return s.writeLocked(b)
+	}
+	from := max(len(s.pending)-3, 0)
 	s.pending = append(s.pending, b...)
-	cut := eventBoundary(s.pending)
+	cut := eventBoundary(s.pending, from)
 	if cut == 0 {
-		return nil
+		if len(s.pending) <= maxPendingEvent {
+			return nil
+		}
+		s.raw, s.open = true, true
+		cut = len(s.pending)
 	}
 	err := s.writeLocked(s.pending[:cut])
 	s.pending = append(s.pending[:0], s.pending[cut:]...)
 	return err
+}
+
+// endsEvent reports whether b ends at an event boundary.
+func endsEvent(b []byte) bool {
+	return bytes.HasSuffix(b, []byte("\n\n")) || bytes.HasSuffix(b, []byte("\r\n\r\n"))
 }
 
 // finish writes what the engine sent after its last blank line, for a stream that
@@ -215,14 +236,14 @@ func (s *sseWriter) finish() {
 }
 
 // eventBoundary is the length of b's complete events: up to and including its last
-// blank line ("\n\n" or "\r\n\r\n"), 0 when it has none.
-func eventBoundary(b []byte) int {
+// blank line ("\n\n" or "\r\n\r\n") at or after from, 0 when it has none there.
+func eventBoundary(b []byte, from int) int {
 	cut := 0
-	if i := bytes.LastIndex(b, []byte("\n\n")); i >= 0 {
-		cut = i + 2
+	if i := bytes.LastIndex(b[from:], []byte("\n\n")); i >= 0 {
+		cut = from + i + 2
 	}
-	if i := bytes.LastIndex(b, []byte("\r\n\r\n")); i >= 0 && i+4 > cut {
-		cut = i + 4
+	if i := bytes.LastIndex(b[from:], []byte("\r\n\r\n")); i >= 0 && from+i+4 > cut {
+		cut = from + i + 4
 	}
 	return cut
 }
@@ -235,7 +256,7 @@ func (s *sseWriter) keepaliveTick() error {
 	defer s.mu.Unlock()
 	idle := !s.wrote
 	s.wrote = false
-	if !idle {
+	if !idle || s.open {
 		return nil
 	}
 	return s.writeLocked([]byte(keepaliveLine))
@@ -250,7 +271,11 @@ func (s *sseWriter) errorEvent(msg string, code int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pending = nil
-	_ = s.writeLocked([]byte("data: " + string(payload) + "\n\ndata: [DONE]\n\n"))
+	ev := "data: " + string(payload) + "\n\ndata: [DONE]\n\n"
+	if s.open {
+		ev = "\n\n" + ev // end the event the client is inside of first
+	}
+	_ = s.writeLocked([]byte(ev))
 }
 
 // keepalive sends a comment whenever nothing was written for about an interval, until
