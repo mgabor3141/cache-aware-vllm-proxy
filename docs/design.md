@@ -131,8 +131,9 @@ the prompt behind it, a priority and the time its last turn finished.
   prompt admission priced, so it never exceeds the room the finishing request returns. Without
   usage, a request that streamed output stands in its priced prompt, but only to raise the hold;
   one that streamed nothing changes nothing, not even the hold's firmness. A smaller turn
-  replaces the hold only when its reported prompt differs from the held one by keys (a
-  compacted context); a side call or a prefix of the held prompt keeps it.
+  replaces the hold only when it arrived after the hold was made and its reported prompt differs
+  from the held one by keys (a compacted context); a side call that overlapped the turn behind
+  the hold, or a prefix of the held prompt, keeps it.
 - Modelled use is every hold plus every running request's charge less the leading blocks its
   prompt shares with its own session's hold, by mirror keys. A prompt without keys shares
   nothing. Nothing else is counted, so a block is counted once.

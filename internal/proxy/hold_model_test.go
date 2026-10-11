@@ -122,6 +122,8 @@ type pmReq struct {
 	gen    *OutputCounter
 	obs    CacheObservation
 	ok     bool
+	side   bool // a side call: fresh tokens, not the conversation
+	step   int  // when it arrived
 }
 
 func holdModelRun(t *testing.T, seed int64) {
@@ -131,6 +133,7 @@ func holdModelRun(t *testing.T, seed int64) {
 	conv := map[string][]int64{}
 	held := map[string][]int64{} // the tokens behind each hold, as the test saw them
 	displaced := map[string]bool{}
+	heldStep := map[string]int{} // when the test last saw each hold made
 	var waiting, running []*pmReq
 	next := int64(1)
 	fresh := func(n int) []int64 {
@@ -176,7 +179,7 @@ func holdModelRun(t *testing.T, seed int64) {
 			default:
 				p = fresh(rng.Intn(5000) + 1)
 			}
-			pr := &pmReq{tokens: p, gen: q.NewOutputCounter()}
+			pr := &pmReq{tokens: p, gen: q.NewOutputCounter(), side: len(p) <= 5000 && len(p) != len(conv[s]), step: step}
 			pr.w, _, _ = q.enqueue(AdmissionRequest{Session: s, Priority: rng.Intn(3), PromptTokens: len(p), Tokens: p,
 				MaxTokens: 4000, Generated: pr.gen})
 			waiting = append(waiting, pr)
@@ -200,8 +203,12 @@ func holdModelRun(t *testing.T, seed int64) {
 			snap(1)
 			q.release(pr.w, func() (CacheObservation, bool) { return pr.obs, pr.ok })
 			q.mu.Lock()
-			if s.held != h0 || len(s.heldBlocks.Blocks) != len(b0) || (len(b0) > 0 && &s.heldBlocks.Blocks[0] != &b0[0]) {
+			if s.held > 0 && (s.held != h0 || len(s.heldBlocks.Blocks) != len(b0) || (len(b0) > 0 && &s.heldBlocks.Blocks[0] != &b0[0])) {
 				held[finished] = pr.tokens // the finish replaced the hold
+				if pr.side && h0 > q.roundUp(len(pr.tokens)) && pr.step < heldStep[finished] {
+					t.Fatalf("seed %d step %d: a side call replaced the %d-token hold of a turn that finished after it arrived", seed, step, h0)
+				}
+				heldStep[finished] = step
 				displaced[finished] = false
 			}
 			q.mu.Unlock()

@@ -208,6 +208,7 @@ type cacheSession struct {
 
 	running    int
 	lastDone   time.Time           // when a turn last left or kept the hold
+	heldAt     time.Time           // when the hold was last made or replaced
 	held       int                 // prompt tokens held (whole blocks); 0 when not holding
 	heldBlocks kvmirror.PromptKeys // mirror keys of the held prompt
 	// heldSeen is what the mirror saw cached of the hold: -1 until the mirror is healthy to
@@ -707,8 +708,9 @@ func (q *AdmissionQueue) keysLocked(w *admissionWaiter) {
 // error), a request that streamed output had its prompt prefilled and the size the proxy
 // measured stands in, but only to raise the hold; one that streamed nothing leaves the
 // hold as it was. A smaller turn replaces the hold only when its engine-reported prompt
-// provably differs from the held one by keys (compacted, or another conversation on the
-// session key): a side call, or a prefix of the held prompt, keeps it.
+// provably differs from the held one by keys and it arrived after the hold was made (a
+// compacted next turn): a side call that overlapped the turn behind the hold, or a prefix
+// of the held prompt, keeps it.
 func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObservation, bool)) {
 	now := q.now()
 	delete(q.running, w)
@@ -732,10 +734,11 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 	}
 	s.lastDone = now
 	n := commonBlocks(w.blocks, s.heldBlocks)
-	if h < s.held && !(reported && n < len(w.blocks.Blocks) && n < len(s.heldBlocks.Blocks)) {
+	if h < s.held && !(reported && w.arrived.After(s.heldAt) && n < len(w.blocks.Blocks) && n < len(s.heldBlocks.Blocks)) {
 		return
 	}
 	s.held, s.heldBlocks, s.priority = h, w.blocks, w.priority
+	s.heldAt = now
 	s.heldSeen, s.heldGen = -1, w.mirGen
 	if q.mirror.Healthy() {
 		q.judgeHoldLocked(s, now) // the first look, while the blocks are fresh
