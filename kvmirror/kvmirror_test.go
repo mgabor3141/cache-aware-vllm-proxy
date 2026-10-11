@@ -51,6 +51,7 @@ func loadFixture(t *testing.T) ([][]byte, []fixtureRequest) {
 func TestKVMirrorReplaysCapturedEvents(t *testing.T) {
 	batches, reqs := loadFixture(t)
 	m := New()
+	m.SetSpeculative(true)
 	var after [][]int
 	for _, b := range batches {
 		seq := int64(binary.BigEndian.Uint64(b[:8]))
@@ -88,6 +89,7 @@ func TestKVMirrorReplaysCapturedEvents(t *testing.T) {
 
 func TestKVMirrorRestartClears(t *testing.T) {
 	m := New()
+	m.SetSpeculative(true)
 	g := 0
 	toks := make([]int64, 9)
 	m.Apply(5, []Event{{Type: "BlockStored", BlockHashes: []any{uint64(1), uint64(2)}, TokenIDs: toks[:8], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}})
@@ -103,6 +105,7 @@ func TestKVMirrorRestartClears(t *testing.T) {
 
 func TestKVMirrorHybridRule(t *testing.T) {
 	m := New()
+	m.SetSpeculative(true)
 	attn, mamba := 5, 0
 	toks := make([]int64, 13)
 	for i := range toks {
@@ -134,22 +137,24 @@ func TestKVMirrorHybridRule(t *testing.T) {
 	}
 }
 
-// vLLM can cache two physical copies of one hash; evicting one publishes BlockRemoved
-// while the other stays. The mirror must keep the block until every copy is gone.
+// vLLM can cache two physical copies of one hash (a hybrid model recomputes the attention
+// blocks past its last recurrent checkpoint); evicting one publishes BlockRemoved while the
+// other stays. The mirror must keep the block until every copy is gone.
 func TestKVMirrorDuplicateCopies(t *testing.T) {
 	m := New()
-	m.dropLast = false
 	g := 5
-	toks := make([]int64, 5)
-	st := Event{Type: "BlockStored", BlockHashes: []any{uint64(7)}, TokenIDs: toks[:4], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
-	m.Apply(-1, []Event{st, st})
+	toks := make([]int64, 9)
+	toks[0] = 1
+	first := Event{Type: "BlockStored", BlockHashes: []any{uint64(6)}, TokenIDs: toks[:4], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
+	st := Event{Type: "BlockStored", BlockHashes: []any{uint64(7)}, ParentBlockHash: uint64(6), TokenIDs: toks[4:8], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
+	m.Apply(-1, []Event{first, st, st})
 	m.Apply(-1, []Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(7)}, GroupIdx: &g}})
-	if got := m.CachedTokens(toks); got != 4 {
-		t.Fatalf("one of two copies evicted: got %d, want 4", got)
+	if got := m.CachedTokens(toks); got != 8 {
+		t.Fatalf("one of two copies evicted: got %d, want 8", got)
 	}
 	m.Apply(-1, []Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(7)}, GroupIdx: &g}})
-	if got := m.CachedTokens(toks); got != 0 {
-		t.Fatalf("both copies evicted: got %d, want 0", got)
+	if got := m.CachedTokens(toks); got != 4 {
+		t.Fatalf("both copies evicted: got %d, want 4", got)
 	}
 }
 
@@ -179,6 +184,7 @@ func seqPrompt(n int) []int64 {
 // sequence that goes backwards is a restart, however small the step (review cv-52 #1).
 func TestKVMirrorRestartInsideFormerDuplicateWindow(t *testing.T) {
 	m := New()
+	m.SetSpeculative(true)
 	toks := seqPrompt(9)
 	m.Apply(0, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
 	m.Apply(1, nil)
@@ -205,6 +211,7 @@ func TestKVMirrorRestartInsideFormerDuplicateWindow(t *testing.T) {
 // stream then continues. A repeat that goes backwards is a restart.
 func TestKVMirrorReplayOverlap(t *testing.T) {
 	m := New()
+	m.SetSpeculative(true)
 	toks := seqPrompt(9)
 	m.Apply(14000, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
 	for seq := int64(14001); seq <= 20000; seq++ { // the replay
@@ -245,7 +252,6 @@ func TestKVMirrorReplayOverlap(t *testing.T) {
 // blocks after it.
 func TestKVMirrorOrphanEventSkipsOnlyItself(t *testing.T) {
 	m := New()
-	m.dropLast = false
 	toks := seqPrompt(13)
 	g := 5
 	m.Apply(-1, []Event{
@@ -269,7 +275,6 @@ func TestKVMirrorOrphanEventSkipsOnlyItself(t *testing.T) {
 // nothing rather than being rescaled (review cv-52 #2).
 func TestKVMirrorKeysAtAnotherBlockSizeMatchNothing(t *testing.T) {
 	m := New()
-	m.dropLast = false
 	toks := seqPrompt(9)
 	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
 	keys := m.NewPromptKeys(toks)
@@ -286,7 +291,6 @@ func TestKVMirrorKeysAtAnotherBlockSizeMatchNothing(t *testing.T) {
 // block findable (review cv-52 #5).
 func TestKVMirrorAliasRestoredAfterEviction(t *testing.T) {
 	m := New()
-	m.dropLast = false
 	toks := seqPrompt(5)
 	g := 5
 	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, nil, toks[:4])})
@@ -323,6 +327,7 @@ func TestKVMirrorHealthyOnlyAfterReplay(t *testing.T) {
 		t.Skipf("zmq listen: %v", err)
 	}
 	m := New()
+	m.SetSpeculative(true)
 	rctx, rcancel := context.WithCancel(ctx)
 	go m.Run(rctx, pubEP, "tcp://"+silent.Addr().String())
 	time.Sleep(1500 * time.Millisecond)
@@ -350,6 +355,7 @@ func TestKVMirrorHealthyOnlyAfterReplay(t *testing.T) {
 		router.Send(zmq4.NewMsgFrom(id, []byte{}, []byte{}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, []byte{}))
 	}()
 	m2 := New()
+	m2.SetSpeculative(true)
 	go m2.Run(ctx, pubEP, "tcp://"+router.Addr().String())
 	deadline := time.Now().Add(5 * time.Second)
 	for !m2.Healthy() && time.Now().Before(deadline) {
@@ -374,6 +380,7 @@ func TestKVMirrorRestartInsideReplayedRange(t *testing.T) {
 	}
 	replay := func(from int64) *Mirror {
 		m := New()
+		m.SetSpeculative(true)
 		m.Apply(from, []Event{attnStore(1, nil, old[:4]), attnStore(2, uint64(1), old[4:8])})
 		for seq := from + 1; seq <= 10; seq++ {
 			m.Apply(seq, nil)
@@ -390,11 +397,15 @@ func TestKVMirrorRestartInsideReplayedRange(t *testing.T) {
 
 	m := replay(0)
 	m.replayedAt = time.Now().Add(-overlapWindow) // the engine sat idle, then restarted
-	m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
+	if m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])}) {
+		t.Fatal("a restart did not ask for a resync")
+	}
+	m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])}) // the resync replays it
 	check(m)
 
 	m = replay(5)
 	m.Apply(2, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
+	m.Apply(2, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])}) // the resync replays it
 	check(m)
 }
 
@@ -407,6 +418,7 @@ func TestKVMirrorWarnsOnBlockSizeMismatch(t *testing.T) {
 	log.SetOutput(&logs)
 	defer log.SetOutput(os.Stderr)
 	m := New()
+	m.SetSpeculative(true)
 	m.SetGeometry(8, 2) // 4 is neither the block size nor the unit
 	toks := seqPrompt(9)
 	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})

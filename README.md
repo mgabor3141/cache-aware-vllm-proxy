@@ -33,12 +33,16 @@ logs one JSON line per request with token usage, and exports aggregate metrics.
 
 ## Quick start
 
-You need one vLLM engine, Go 1.23 (or Docker), and a model. The engine needs prefix caching,
+You need one vLLM engine, version 0.24.0 or later (older versions encode KV events in a format
+the proxy cannot read: it logs every batch as undecodable and predicts nothing cached), Go 1.23
+(or Docker), and a model. The engine needs prefix caching,
 KV cache events with a replay socket on the port after the event socket, and priority
 scheduling (cavp sends each request's `priority`; vLLM's default first-come scheduling refuses
 a non-zero one). `--enable-prompt-tokens-details` makes the engine report cached tokens per
 request, which the log and the hit-ratio metrics need. Set `--max-num-seqs` to the same value
-as `admission.max_active`. The engine must not require an API key.
+as `admission.max_active`. The engine must not require an API key. If it runs speculative
+decoding (`--speculative-config`), set `admission.cache.speculative_decoding: true`: such an
+engine serves a cached prefix minus its last block, and the cache mirror must know.
 
 ```sh
 vllm serve Qwen/Qwen3-8B --port 8000 \

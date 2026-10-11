@@ -296,6 +296,7 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 // A request whose prefix the mirror reports cached costs less and goes first.
 func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
+	q.mirror.SetSpeculative(true)
 	m := q.mirror
 	m.SetConnected(true)
 	prompt := make([]int64, 3200*30+10)
@@ -660,7 +661,8 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 		t.Fatal("no hold after the turn")
 	}
 	m.Apply(2, nil)
-	m.Apply(0, nil) // the engine restarted: the mirror starts over
+	m.Apply(0, nil)      // the engine restarted: the mirror starts over
+	m.SetConnected(true) // resubscribed, the replay empty
 	q.tick()
 	if m := q.metrics(); m.held != 0 || m.evictedHolds != 1 {
 		t.Fatalf("hold survived an engine restart: %+v", m)
@@ -860,7 +862,8 @@ func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
 	tr := q.startReq("a", 0, len(prompt), prompt)
 	rel := mustAdmit(t, tr, "a")
 	m.Apply(2, nil)
-	m.Apply(0, nil) // the engine restarted while the turn ran
+	m.Apply(0, nil)      // the engine restarted while the turn ran
+	m.SetConnected(true) // resubscribed, the replay empty
 	tr.finish(rel, len(prompt), 100)
 	for i := 0; i < 5; i++ {
 		clk.add(time.Minute)
@@ -885,6 +888,7 @@ func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
 func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{KVEventsEndpoint: "tcp://vllm:5557"}})
 	q.mirror.SetConnected(true)
+	q.mirror.SetSpeculative(true)
 	prompt := testPrompt(20, 0)
 	rep := &AdmissionReport{}
 	got := make(chan func(), 1)
@@ -909,6 +913,7 @@ func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 func TestCacheAdmissionHoldJudgedByUnitHit(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	m := q.mirror
+	m.SetSpeculative(true)
 	m.SetConnected(true)
 	m.SetGeometry(3200, 64)
 	prompt := testPrompt(3, 0)[:6900]

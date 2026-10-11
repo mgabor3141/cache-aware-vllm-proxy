@@ -10,6 +10,8 @@
 //	BlockRemoved  block_hashes, group_idx
 //	AllBlocksCleared
 //
+// It reads the event format of vLLM 0.24.0 and later (events as maps tagged by "type").
+//
 // Engine block hashes are opaque (sha256 over pickled keys), so the mirror keys blocks by
 // its own chain hash of token IDs: key(b) = H(key(parent), tokens(b)). An event's parent
 // hash is mapped to a key through blocks the mirror has already seen; a block whose
@@ -59,6 +61,7 @@
 package kvmirror
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -128,9 +131,9 @@ type Mirror struct {
 	units           map[uint64]*unitEntry            // engine hash -> unit entry
 	unitsByContent  map[uint64]map[uint64]*unitEntry // unitHash -> engine hash -> unit entry
 	// tails are where prompts the mirror keyed end (NewPromptKeys): facts about prompts,
-	// not about the engine, so they outlive resets; the oldest go first.
-	tails     map[uint64]end
-	tailOrder []uint64
+	// not about the engine, so they outlive resets; the least recently used go first.
+	tails     map[uint64]*list.Element // of *tail
+	tailOrder *list.List
 	lastSeq   int64
 	// After a replay, live delivery repeats the batches the replay already applied, once,
 	// in order, and at once (they queued while the replay ran): for overlapWindow after
@@ -142,8 +145,11 @@ type Mirror struct {
 	connected                     bool
 	// generation counts resets: subscriptions, engine restarts, AllBlocksCleared.
 	generation uint64
-	sizeWarned bool // a block of another size than blockSize was logged
-	unitWarned bool // an unusable prefix_match_unit was logged
+	// unsupported is a group kind the mirror cannot model (only full and MLA attention and
+	// mamba are); while set, Cached returns 0.
+	unsupported string
+	sizeWarned  bool // a block of another size than blockSize was logged
+	unitWarned  bool // an unusable prefix_match_unit was logged
 	// dropLast applies the EAGLE drop (speculative decoding on): the last block, or the
 	// last unit of a unit hit.
 	dropLast bool
@@ -208,7 +214,13 @@ type end struct {
 	attn, ckpt bool
 }
 
+type tail struct {
+	key uint64
+	end
+}
+
 // maxTails bounds the prompt ends remembered: far more than an engine's cache holds.
+// The least recently remembered or looked up go first.
 const maxTails = 1 << 15
 
 // NewPromptKeys computes a prompt's keys at the mirror's block size (none while it is
@@ -249,17 +261,25 @@ func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
 }
 
 func (m *Mirror) rememberLocked(key, content uint64, attn, ckpt bool) {
-	if e, ok := m.tails[key]; ok {
-		e.attn, e.ckpt = e.attn || attn, e.ckpt || ckpt
-		m.tails[key] = e
+	if el, ok := m.tails[key]; ok {
+		t := el.Value.(*tail)
+		t.attn, t.ckpt = t.attn || attn, t.ckpt || ckpt
+		m.tailOrder.MoveToBack(el)
 		return
 	}
-	if len(m.tailOrder) == maxTails {
-		delete(m.tails, m.tailOrder[0])
-		m.tailOrder = m.tailOrder[1:]
+	if m.tailOrder.Len() == maxTails {
+		delete(m.tails, m.tailOrder.Remove(m.tailOrder.Front()).(*tail).key)
 	}
-	m.tails[key] = end{content: content, attn: attn, ckpt: ckpt}
-	m.tailOrder = append(m.tailOrder, key)
+	m.tails[key] = m.tailOrder.PushBack(&tail{key: key, end: end{content: content, attn: attn, ckpt: ckpt}})
+}
+
+// SetSpeculative tells the mirror the engine runs speculative decoding (EAGLE, MTP), so
+// a hit loses its last block, or its last unit with a prefix-match unit, as the engine's
+// does. Off by default: plain vLLM serves every cached block.
+func (m *Mirror) SetSpeculative(on bool) {
+	m.mu.Lock()
+	m.dropLast = on
+	m.mu.Unlock()
 }
 
 // SetGeometry sets the engine's block size and prefix-match unit (from its metrics), so
@@ -304,17 +324,18 @@ func (m *Mirror) isUnitLocked(size int) bool {
 }
 
 type Stats struct {
-	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps uint64
+	// Reports are reuse reports (kv_cache_report_mode "full"), not counted as copies.
+	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps, Reports uint64
 }
 
 func New() *Mirror {
-	m := &Mirror{dropLast: true, tails: map[uint64]end{}}
+	m := &Mirror{tails: map[uint64]*list.Element{}, tailOrder: list.New()}
 	m.resetLocked()
 	return m
 }
 
-// errSeqGap ends a subscription so it restarts with a replay.
-var errSeqGap = fmt.Errorf("kv events sequence gap")
+// errResync ends a subscription so it restarts with a replay (a gap or an engine restart).
+var errResync = fmt.Errorf("kv events sequence gap or restart: resyncing")
 
 var rootKey BlockKey
 
@@ -395,8 +416,10 @@ func decodeBatch(payload []byte) ([]Event, error) {
 
 // Apply ingests one batch. seq is the publisher's sequence number (-1: unknown). Live
 // delivery repeating what a replay applied is skipped; any other sequence that goes
-// backwards means the engine restarted, so the mirror starts over. It returns false on a
-// gap: batches were lost and the mirror can no longer be trusted until it resyncs.
+// backwards means the engine restarted, so the mirror starts over. It returns false, and
+// the mirror is unhealthy, on a gap (batches were lost) or a restart: either way the
+// mirror can no longer be trusted until it resyncs from a replay. A restart's batch is
+// not applied; the replay brings it.
 func (m *Mirror) Apply(seq int64, events []Event) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -409,12 +432,15 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 		m.replayedTo = -1
 		switch {
 		case seq <= m.lastSeq:
-			log.Printf("level=warn msg=\"kv events sequence went back: engine restarted, mirror cleared\" seq=%d last=%d", seq, m.lastSeq)
+			log.Printf("level=warn msg=\"kv events sequence went back: engine restarted, mirror cleared, resyncing\" seq=%d last=%d", seq, m.lastSeq)
 			m.resetLocked()
 			m.stats.Restarts++
+			m.connected = false
+			return false
 		case seq > m.lastSeq+1:
 			m.stats.SeqGaps++
 			m.lastSeq = seq
+			m.connected = false
 			return false
 		}
 	}
@@ -438,6 +464,7 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 func (m *Mirror) resetLocked() {
 	m.clearLocked()
 	m.attnMask, m.mambaMask = 0, 0
+	m.unsupported = ""
 	m.eventUnit = 0
 	m.firstSeq, m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1, -1
 }
@@ -490,10 +517,20 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		g := uint(*e.GroupIdx)
 		bit := uint64(1) << g
-		if e.Kind == "mamba" {
+		switch e.Kind {
+		case "mamba":
 			m.mambaMask |= bit
-		} else {
+		case "full_attention", "mla_attention", "":
 			m.attnMask |= bit
+		default:
+			// sliding_window, chunked_local_attention, cross_attention and the like hit
+			// with gaps (vLLM single_type_kv_cache_manager.py); the mirror does not model
+			// them, so it predicts nothing cached rather than something wrong.
+			if m.unsupported == "" {
+				log.Printf("level=error msg=\"kv cache group kind not supported: the mirror predicts nothing cached\" kind=%q group=%d", e.Kind, g)
+			}
+			m.unsupported = e.Kind
+			return
 		}
 		if m.blockSize == 0 {
 			m.blockSize = e.BlockSize
@@ -512,6 +549,14 @@ func (m *Mirror) applyLocked(e *Event) {
 				m.sizeWarned = true
 				log.Printf("level=warn msg=\"kv events block size differs from the engine's and its unit: those blocks never match\" event_block_size=%d block_size=%d unit=%d group=%d", e.BlockSize, m.blockSize, m.unitLocked(), g)
 			}
+		}
+		if e.ParentBlockHash == nil && m.allHeldLocked(e.BlockHashes, g) {
+			// A reuse report (kv_cache_report_mode "full", block_pool.py
+			// emit_cached_block_events): blocks a request hit, from block 0, with no
+			// BlockRemoved ever to match. Not new copies. A real second copy of block 0
+			// is missed too, which only makes the mirror under-report.
+			m.stats.Reports++
+			return
 		}
 		parent := rootKey
 		if e.ParentBlockHash != nil {
@@ -591,6 +636,17 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 	}
 }
 
+// allHeldLocked reports whether every hash is a block the mirror holds in group g.
+func (m *Mirror) allHeldLocked(hashes []any, g uint) bool {
+	for _, h := range hashes {
+		u, ok := hashToUint(h)
+		if !ok || m.byEngine[u] == nil || m.byEngine[u].groups&(1<<g) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *Mirror) dropUnitLocked(f *unitEntry) {
 	delete(m.units, f.engine)
 	if c := m.unitsByContent[f.content]; c != nil {
@@ -629,7 +685,7 @@ func PromptBlockKeys(prompt []int64, blockSize int) []BlockKey {
 func (m *Mirror) Cached(k PromptKeys) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if k.BlockSize <= 0 || k.BlockSize != m.blockSize || m.attnMask == 0 {
+	if k.BlockSize <= 0 || k.BlockSize != m.blockSize || m.attnMask == 0 || m.unsupported != "" {
 		return 0
 	}
 	bs := k.BlockSize
@@ -694,8 +750,12 @@ func (m *Mirror) endLocked(k PromptKeys, x int) (end, bool) {
 	if !ok {
 		return end{}, false
 	}
-	e, ok := m.tails[key]
-	return e, ok
+	el, ok := m.tails[key]
+	if !ok {
+		return end{}, false
+	}
+	m.tailOrder.MoveToBack(el) // looked up: a conversation that comes back keeps its ends
+	return el.Value.(*tail).end, true
 }
 
 // heldLocked reports whether a unit entry with these tokens is held in every group of mask.
@@ -727,6 +787,7 @@ type Status struct {
 	BlockSize     int     `json:"block_size"`
 	Unit          int     `json:"unit"`
 	UnitEntries   int     `json:"unit_entries"`
+	Unsupported   string  `json:"unsupported_kind,omitempty"` // a group kind the mirror cannot model: nothing is predicted cached
 	LastEventAgeS float64 `json:"last_event_age_s"`
 	Stats         Stats   `json:"stats"`
 }
@@ -734,7 +795,7 @@ type Status struct {
 func (m *Mirror) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := Status{Connected: m.connected, Blocks: len(m.byKey), BlockSize: m.blockSize, Unit: m.unitLocked(), UnitEntries: len(m.units), Stats: m.stats}
+	s := Status{Connected: m.connected, Blocks: len(m.byKey), BlockSize: m.blockSize, Unit: m.unitLocked(), UnitEntries: len(m.units), Unsupported: m.unsupported, Stats: m.stats}
 	if !m.lastEvent.IsZero() {
 		s.LastEventAgeS = time.Since(m.lastEvent).Seconds()
 	}
@@ -813,7 +874,7 @@ func (m *Mirror) subscribe(ctx context.Context, endpoint, replay string) error {
 			continue
 		}
 		if !m.Apply(seq, events) {
-			return errSeqGap
+			return errResync
 		}
 	}
 }
@@ -830,18 +891,31 @@ func parseFrames(frames [][]byte) (int64, []Event, bool) {
 	}
 	events, err := decodeBatch(payload)
 	if err != nil {
-		log.Printf("level=warn msg=\"kv events decode\" err=%v", err)
-		return seq, nil, false
+		// Skipped, but its sequence is consumed: a resync would meet it again.
+		log.Printf("level=warn msg=\"kv events batch undecodable, skipped (vLLM older than 0.24?)\" seq=%d err=%v", seq, err)
+		return seq, nil, seq >= 0
 	}
 	return seq, events, true
+}
+
+// skipHole accepts that the batches from up to (not including) to are lost for good.
+func (m *Mirror) skipHole(from, to int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	log.Printf("level=warn msg=\"kv events replay buffer has a hole, skipped\" from=%d to=%d", from, to)
+	m.stats.SeqGaps++
+	if m.lastSeq >= 0 {
+		m.lastSeq = to - 1
+	}
 }
 
 // replay rebuilds recent state from the publisher's replay buffer (its last
 // buffer_steps batches). The publisher's ROUTER queues at most ~1,000 messages for a
 // reader and drops the rest silently, so a replay is read in rounds: each takes the
 // batches that arrive in sequence, stops at the first gap or a quiet second, and asks
-// again from the next missing sequence, until the end-of-sequence marker (seq -1). A
-// replay that does not reach the marker is an error.
+// again from the next missing sequence, until the end-of-sequence marker (seq -1). A round
+// whose first batch is past the sequence asked for skips the hole: those batches are gone.
+// Undecodable batches are skipped too. A replay that does not reach the marker is an error.
 func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 	total := 0
 	from := int64(0)
@@ -913,11 +987,17 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 			if !ok {
 				continue
 			}
-			if seq != next && next != 0 {
-				return n, next, false, nil // the publisher dropped batches: ask again from here
-			}
 			if seq < next {
 				continue
+			}
+			if seq > next && n > 0 {
+				return n, next, false, nil // the publisher dropped batches: ask again from here
+			}
+			if seq > next && next != 0 {
+				// Asked from next, the buffer's first batch is later: those batches are
+				// gone for good (dropped at the publisher's high-water mark). Skip them;
+				// the mirror under-reports what they stored.
+				m.skipHole(next, seq)
 			}
 			m.Apply(seq, events)
 			n++

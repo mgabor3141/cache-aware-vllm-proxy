@@ -46,7 +46,13 @@ In live runs the prediction matched the engine's reported `cached_tokens` on ove
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
 attention blocks: a hit at position p also needs a saved recurrent state at exactly p. The mirror
-tracks each KV group separately and only counts a hit where every group has it.
+tracks each KV group separately and only counts a hit where every group has it. It models full
+and MLA attention groups and mamba groups only: a sliding-window, chunked-local or other group
+is logged as an error and the mirror then predicts nothing cached. With
+speculative decoding (EAGLE, MTP) vLLM drops the last block of a hit; the mirror does the same
+only when `speculative_decoding` is set, as nothing in the event stream says so.
+A store that only repeats blocks the mirror holds, from the first block (vLLM's reuse report
+under `kv_cache_report_mode: "full"`), is not counted as a new copy.
 
 Engines that cache hybrid-model prefixes at a finer unit than the block, such as halt95's vLLM
 fork (`--block-size 4096 --prefix-match-unit 64`), save a recurrent state where each prompt ends,
@@ -70,8 +76,11 @@ an earlier version of the matching had a median and p90 error of 0 under the sam
 
 The mirror is only as good as the stream. On every (re)subscription it starts empty and rebuilds
 from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
-replay that fails ends the subscription so it is retried. A sequence number that goes backwards
-outside the replay overlap means the engine restarted, and the mirror starts over. Holds are
+replay that fails ends the subscription so it is retried. Batches missing from the replay
+buffer, or that cannot be decoded, are skipped (the mirror under-reports what they stored)
+rather than failing every retry. A sequence number that goes backwards
+outside the replay overlap means the engine restarted: the mirror starts over, resyncs from the
+replay, and its generation moves so admission sees its holds may be gone. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
 a restart, or older than the replay buffer reaches) is released. A hold the mirror never saw
 (the prompt could not be tokenized, or its blocks carry extra hash keys) cannot be verified: it
