@@ -108,7 +108,8 @@ it runs.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
 admitted on top of it. It stays counted while the conversation's next request runs (the session is
-charged the larger of the two, which share the prefix). A hold is firm (cannot be displaced by work of the same or lower
+charged the larger of the two, which share the prefix); a higher-priority waiter may still
+displace it then. A hold is firm (cannot be displaced by work of the same or lower
 priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
 that prefill would slow, and at least 5 s so a quick tool call always comes back warm, and as
 long again from when its conversation's next request starts waiting. After that
@@ -120,7 +121,8 @@ half cached, or whose own conversation holds its context; then small prompts; th
 by arrival. A blocked waiter reserves the room it still needs, so smaller work cannot starve it.
 Two exceptions: a waiter that could not run even with every hold it may displace gone (larger
 than the pool less the holds of higher priority) reserves nothing, as holding room back for it
-protects nothing; and a request its conversation's hold already covers takes no room, so no
+protects nothing; and a request that resends a prefix of its conversation's held prompt and fits
+inside the hold takes no room, so no
 reservation holds it back.
 
 **Eviction.** An expendable hold is displaced only while fewer than 4 requests run. On a busy

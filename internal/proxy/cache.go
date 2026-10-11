@@ -25,7 +25,7 @@ package proxy
 // (with the decoding that prefill stalls), at least minHold, and as long again once its own thread
 // starts waiting (holdFor, firm). After that it is expendable: an equal-priority waiter may
 // displace it while fewer than evictBelowRunning requests run. A higher-priority waiter
-// may displace any lower-priority hold (fitLocked). Waiting long forces nothing, so many
+// may displace any lower-priority hold, idle or not (displaceable). Waiting long forces nothing, so many
 // waiters cannot start thrashing together.
 //
 // Holds steer admission only. The engine evicts free blocks least recently used first,
@@ -479,11 +479,16 @@ func (q *AdmissionQueue) grantStateLocked(now time.Time) *grantState {
 }
 
 // displaceable: a waiter at priority p may displace s. A higher priority may displace any
-// lower-priority idle hold. Otherwise only expendable holds (past holdFor) go, and only
-// while the engine is under-used. With nothing running, the head waiter may take any
-// equal-priority hold: nothing else will free room, so this guarantees progress.
+// lower-priority hold, even while its session runs a request (the running request stays
+// charged; only the hold goes), so an agent that overlaps calls cannot pin its hold.
+// Otherwise only idle, expendable holds (past holdFor) go, and only while the engine is
+// under-used. With nothing running, the head waiter may take any equal-priority hold:
+// nothing else will free room, so this guarantees progress.
 func (q *AdmissionQueue) displaceable(p int, s *cacheSession, now time.Time) bool {
-	return s.holding(now) && (p < s.priority || (q.active == 0 && p == s.priority) ||
+	if s.held > 0 && p < s.priority {
+		return true
+	}
+	return s.holding(now) && ((q.active == 0 && p == s.priority) ||
 		(!q.firm(s, now) && q.active < evictBelowRunning))
 }
 
@@ -507,10 +512,10 @@ func (q *AdmissionQueue) reachLocked(g *grantState, w *admissionWaiter, now time
 // fitLocked decides whether w can run now within free room (budget minus running work,
 // holds, and what earlier blocked waiters reserved), and which idle holds it displaces.
 func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved int, g *grantState) (plan []displacement, ok bool) {
-	// A waiter its session's hold already covers takes no room: reservations do not hold
-	// it back.
+	// A waiter its session's hold already covers (it resends a prefix of the held prompt
+	// and fits inside it) takes no room: reservations do not hold it back.
 	adds := q.addsLocked(w)
-	if adds <= 0 {
+	if adds <= 0 && q.sharesHold(w) {
 		return nil, true
 	}
 	need := adds - g.free + reserved
@@ -761,4 +766,22 @@ func (q *AdmissionQueue) PoolKnown() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.budget() > 0
+}
+
+// sharesHold: w's prompt is a prefix of its session's held prompt, by mirror keys.
+func (q *AdmissionQueue) sharesHold(w *admissionWaiter) bool {
+	s := q.sessions[w.session]
+	if s == nil || s.held == 0 {
+		return false
+	}
+	a, b := w.blocks, s.heldBlocks
+	if len(a.Blocks) == 0 || a.BlockSize != b.BlockSize || len(a.Blocks) > len(b.Blocks) {
+		return false
+	}
+	for i, k := range a.Blocks {
+		if b.Blocks[i] != k {
+			return false
+		}
+	}
+	return true
 }
