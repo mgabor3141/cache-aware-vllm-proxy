@@ -112,7 +112,7 @@ func (q *AdmissionQueue) metrics() admissionMetrics {
 		displaced: q.displaced, evictedHolds: q.evictedHolds,
 	}
 	for _, w := range q.waiters {
-		m.oldestWait = max(m.oldestWait, now.Sub(w.enqueued))
+		m.oldestWait = max(m.oldestWait, now.Sub(w.arrived))
 	}
 	m.engineMetricsErrors = q.engineMetricsErrors.Load()
 	mirror := q.mirror

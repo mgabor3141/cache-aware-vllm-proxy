@@ -169,7 +169,7 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 	}
 	select {
 	case <-w.ready:
-		return q.releaseFunc(w, observe), Admitted{q.now().Sub(w.enqueued), snap}, true
+		return q.releaseFunc(w, observe), Admitted{q.now().Sub(w.arrived), snap}, true
 	case <-ctx.Done():
 		q.mu.Lock()
 		if w.granted {
@@ -183,7 +183,7 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 			q.grantLocked()
 			q.mu.Unlock()
 		}
-		return nil, Admitted{q.now().Sub(w.enqueued), snap}, false
+		return nil, Admitted{q.now().Sub(w.arrived), snap}, false
 	}
 }
 
