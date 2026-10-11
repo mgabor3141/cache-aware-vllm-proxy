@@ -32,7 +32,8 @@ func (c AdmissionConfig) validate() error { return c.Cache.validate() }
 
 type admissionWaiter struct {
 	priority int
-	enqueued time.Time
+	enqueued time.Time // its place in the queue: arrival, or an earlier attempt's (retryMemory)
+	arrived  time.Time
 	sequence uint64
 	ready    chan struct{}
 	granted  bool
@@ -166,7 +167,7 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 			q.release(w, observe)
 		} else {
 			if s := q.sessions[w.session]; s != nil {
-				s.gaveUpSince, s.gaveUpAt = w.enqueued, q.now()
+				s.gaveUpSince, s.gaveUpAt = w.arrived, q.now()
 			}
 			q.removeWaiterLocked(w)
 			q.grantLocked()
@@ -189,14 +190,16 @@ func (q *AdmissionQueue) enqueue(ar AdmissionRequest) (*admissionWaiter, bool, A
 	defer q.mu.Unlock()
 	now := q.now()
 	w := &admissionWaiter{
-		priority: ar.Priority, enqueued: now,
+		priority: ar.Priority, enqueued: now, arrived: now,
 		sequence: q.sequence, ready: make(chan struct{}), session: ar.Session,
 		prompt: max(ar.PromptTokens, 0), blocks: keys, tokens: tokens, maxOut: ar.MaxTokens,
 		report: ar.Report, gen: ar.Generated,
 	}
 	q.sequence++
 	// A client that timed out and retried keeps its place: its wait counts from the
-	// first attempt, so a retry is not sent to the back.
+	// previous attempt's arrival (not from what that attempt inherited, so giving up and
+	// returning again and again cannot push a session ahead of everyone), so a retry is
+	// not sent to the back.
 	if s := q.session(ar.Session, now); s != nil {
 		if !s.gaveUpAt.IsZero() && now.Sub(s.gaveUpAt) < retryMemory {
 			w.enqueued = s.gaveUpSince

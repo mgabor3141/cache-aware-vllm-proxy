@@ -107,7 +107,7 @@ func (c *OutputCounter) Usage(completionTokens int64) { c.n.Store(completionToke
 func (c *OutputCounter) Load() int64 { return c.n.Load() }
 
 // retryMemory: a session's request that arrives within this long after its previous
-// waiter's client gave up inherits that waiter's start time.
+// waiter's client gave up inherits that waiter's arrival time (one attempt's, never a chain).
 const retryMemory = 5 * time.Minute
 
 // minHold: an idle thread keeps its cache at least this long, so the quick tool calls

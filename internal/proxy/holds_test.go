@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -96,4 +97,30 @@ func TestParkedWaiterDoesNotPinHold(t *testing.T) {
 	}
 	rel()
 	r1()
+}
+
+// Retry memory carries one attempt's wait, not a chain: a session that gives up and
+// returns again and again does not keep moving ahead of honest waiters (attacker #8).
+func TestRetryMemoryDoesNotCompound(t *testing.T) {
+	q, clk := newCacheQueue(t, func(c *AdmissionConfig) { c.MaxActive = 1 })
+	mustAdmit(t, q.start("z", 0, 3200), "blocker")
+	for i := 0; i < 6; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if rel, _, ok := q.Acquire(ctx, AdmissionRequest{Session: "pinger", PromptTokens: 20000}); ok {
+				rel()
+			}
+		}()
+		waitForQueued(t, q, 1)
+		clk.add(10 * time.Second)
+		cancel()
+		<-done
+		clk.add(time.Minute)
+	}
+	q.start("pinger", 0, 20000)
+	if w := q.waiterWait("pinger"); w > 2*time.Minute {
+		t.Errorf("pinger credited %v of waiting after six 10 s attempts", w)
+	}
 }

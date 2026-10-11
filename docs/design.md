@@ -25,7 +25,8 @@ of its time recomputing.
   queued or preempted inside the engine loses its cache and blocks others; one waiting in the
   proxy costs nothing.
 - **No timeouts and no queue limit.** Agents retry. Timeouts that fire for many waiters at once
-  only add load. A retry from the same conversation keeps its place in the queue.
+  only add load. A retry from the same conversation (within 5 min) keeps the place
+  its previous attempt had on arrival; giving up and returning again does not add up.
 - **One job.** The proxy decides when a chat request reaches the engine, and nothing else: no
   model aliases, no request rewriting beyond priority and usage reporting, no replays. Deployment
   concerns (external identity, rate limits, CORS) belong to a gateway in front, which names the
