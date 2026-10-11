@@ -143,8 +143,11 @@ type Mirror struct {
 	connected                     bool
 	// generation counts resets: subscriptions, engine restarts, AllBlocksCleared.
 	generation uint64
-	sizeWarned bool // a block of another size than blockSize was logged
-	unitWarned bool // an unusable prefix_match_unit was logged
+	// unsupported is a group kind the mirror cannot model (only full and MLA attention and
+	// mamba are); while set, Cached returns 0.
+	unsupported string
+	sizeWarned  bool // a block of another size than blockSize was logged
+	unitWarned  bool // an unusable prefix_match_unit was logged
 	// dropLast applies the EAGLE drop (speculative decoding on): the last block, or the
 	// last unit of a unit hit.
 	dropLast bool
@@ -459,6 +462,7 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 func (m *Mirror) resetLocked() {
 	m.clearLocked()
 	m.attnMask, m.mambaMask = 0, 0
+	m.unsupported = ""
 	m.eventUnit = 0
 	m.firstSeq, m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1, -1
 }
@@ -511,10 +515,20 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		g := uint(*e.GroupIdx)
 		bit := uint64(1) << g
-		if e.Kind == "mamba" {
+		switch e.Kind {
+		case "mamba":
 			m.mambaMask |= bit
-		} else {
+		case "full_attention", "mla_attention", "":
 			m.attnMask |= bit
+		default:
+			// sliding_window, chunked_local_attention, cross_attention and the like hit
+			// with gaps (vLLM single_type_kv_cache_manager.py); the mirror does not model
+			// them, so it predicts nothing cached rather than something wrong.
+			if m.unsupported == "" {
+				log.Printf("level=error msg=\"kv cache group kind not supported: the mirror predicts nothing cached\" kind=%q group=%d", e.Kind, g)
+			}
+			m.unsupported = e.Kind
+			return
 		}
 		if m.blockSize == 0 {
 			m.blockSize = e.BlockSize
@@ -669,7 +683,7 @@ func PromptBlockKeys(prompt []int64, blockSize int) []BlockKey {
 func (m *Mirror) Cached(k PromptKeys) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if k.BlockSize <= 0 || k.BlockSize != m.blockSize || m.attnMask == 0 {
+	if k.BlockSize <= 0 || k.BlockSize != m.blockSize || m.attnMask == 0 || m.unsupported != "" {
 		return 0
 	}
 	bs := k.BlockSize
@@ -771,6 +785,7 @@ type Status struct {
 	BlockSize     int     `json:"block_size"`
 	Unit          int     `json:"unit"`
 	UnitEntries   int     `json:"unit_entries"`
+	Unsupported   string  `json:"unsupported_kind,omitempty"` // a group kind the mirror cannot model: nothing is predicted cached
 	LastEventAgeS float64 `json:"last_event_age_s"`
 	Stats         Stats   `json:"stats"`
 }
@@ -778,7 +793,7 @@ type Status struct {
 func (m *Mirror) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := Status{Connected: m.connected, Blocks: len(m.byKey), BlockSize: m.blockSize, Unit: m.unitLocked(), UnitEntries: len(m.units), Stats: m.stats}
+	s := Status{Connected: m.connected, Blocks: len(m.byKey), BlockSize: m.blockSize, Unit: m.unitLocked(), UnitEntries: len(m.units), Unsupported: m.unsupported, Stats: m.stats}
 	if !m.lastEvent.IsZero() {
 		s.LastEventAgeS = time.Since(m.lastEvent).Seconds()
 	}

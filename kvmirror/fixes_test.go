@@ -105,3 +105,20 @@ func TestFixRestartResyncs(t *testing.T) {
 		t.Fatalf("after a restart: healthy %v, generation %d (was %d), cached %d", m.Healthy(), m.Generation(), gen, m.CachedTokens(toks))
 	}
 }
+
+// Only full and MLA attention need a contiguous prefix and only mamba keeps checkpoints;
+// a sliding-window (or other) group is not modelled, and says so instead of being taken
+// for full attention (review r4-83 #7).
+func TestFixUnsupportedKindPredictsNothing(t *testing.T) {
+	p := fixPrompt(2*16 + 1)
+	m := New()
+	m.SetGeometry(16, 0)
+	storeChain(m, 0, p, 16, 2, 1)
+	if got := m.CachedTokens(p); got != 32 {
+		t.Fatalf("full attention: cached %d, want 32", got)
+	}
+	m.Apply(1, []Event{fixStored(1, "sliding_window", 16, 50, nil, p[16:32])})
+	if st := m.Status(); st.Unsupported != "sliding_window" || m.CachedTokens(p) != 0 {
+		t.Fatalf("sliding window group: status %+v, cached %d", st, m.CachedTokens(p))
+	}
+}

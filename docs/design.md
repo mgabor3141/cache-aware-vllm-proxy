@@ -45,7 +45,9 @@ In live runs the prediction matched the engine's reported `cached_tokens` on ove
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
 attention blocks: a hit at position p also needs a saved recurrent state at exactly p. The mirror
-tracks each KV group separately and only counts a hit where every group has it. With
+tracks each KV group separately and only counts a hit where every group has it. It models full
+and MLA attention groups and mamba groups only: a sliding-window, chunked-local or other group
+is logged as an error and the mirror then predicts nothing cached. With
 speculative decoding (EAGLE, MTP) vLLM drops the last block of a hit; the mirror does the same
 only when `speculative_decoding` is set, as nothing in the event stream says so.
 A store that only repeats blocks the mirror holds, from the first block (vLLM's reuse report
