@@ -132,6 +132,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	}
 	gauge("cavp_engine_ready", "1 while the engine's readiness probe succeeds.", b2i(p.ready.Ready()))
 	gauge("cavp_ready_wait_requests", "Requests waiting for the engine to become ready (not in cavp_queue_length).", int(p.ready.waiting.Load()))
+	gauge("cavp_tokenize_wait_requests", "Requests and /tokenize calls waiting for a tokenize slot, before admission (not in cavp_queue_length).", int(p.tokenizeWait.Load()))
 	gauge("cavp_queue_length", "Requests waiting for admission.", a.queued)
 	fmt.Fprintf(w, "# HELP cavp_queue_oldest_wait_seconds How long the longest waiting request has waited for admission (0: none waiting).\n# TYPE cavp_queue_oldest_wait_seconds gauge\ncavp_queue_oldest_wait_seconds %g\n", a.oldestWait.Seconds())
 	gauge("cavp_active_requests", "Admitted requests running on the engine.", a.active)

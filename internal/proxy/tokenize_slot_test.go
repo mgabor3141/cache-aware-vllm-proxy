@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -68,5 +69,33 @@ func TestUserTokenizeSharesTheSlots(t *testing.T) {
 	wg.Wait()
 	if n := peak.Load(); n > int64(cap(h.p.tokenizeSem)) {
 		t.Fatalf("engine saw %d concurrent /tokenize, slots are %d", n, cap(h.p.tokenizeSem))
+	}
+}
+
+// A request waiting for a tokenize slot shows in cavp_tokenize_wait_requests (v5-99 F2).
+func TestTokenizeSlotWaitIsVisible(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	for i := 0; i < cap(h.p.tokenizeSem); i++ {
+		h.p.tokenizeSem <- struct{}{}
+	}
+	freed := false
+	free := func() {
+		if !freed {
+			freed = true
+			for i := 0; i < cap(h.p.tokenizeSem); i++ {
+				<-h.p.tokenizeSem
+			}
+		}
+	}
+	t.Cleanup(free)
+	go h.do("POST", "/v1/chat/completions", chatBody, nil)
+	waitFor(t, "the wait in /metrics", func() bool {
+		_, m := h.do("GET", "/metrics", "", nil)
+		return strings.Contains(m, "\ncavp_tokenize_wait_requests 1\n")
+	})
+	free()
+	h.event(1)
+	if _, m := h.do("GET", "/metrics", "", nil); !strings.Contains(m, "\ncavp_tokenize_wait_requests 0\n") {
+		t.Fatalf("wait not cleared:\n%s", m)
 	}
 }

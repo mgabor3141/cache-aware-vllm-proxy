@@ -65,6 +65,7 @@ type Proxy struct {
 
 	tokenizeClient *http.Client
 	tokenizeSem    chan struct{}
+	tokenizeWait   atomic.Int64 // calls waiting for a tokenize slot (cavp_tokenize_wait_requests)
 
 	keepalive  time.Duration
 	writeStall time.Duration
@@ -746,6 +747,8 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any) 
 // calls and the callers' /tokenize: both are work on the engine's API server, next to
 // every stream. The wait is unbounded; it ends early only if ctx does.
 func (p *Proxy) tokenizeSlot(ctx context.Context) (release func(), err error) {
+	p.tokenizeWait.Add(1)
+	defer p.tokenizeWait.Add(-1)
 	select {
 	case p.tokenizeSem <- struct{}{}:
 		return func() { <-p.tokenizeSem }, nil

@@ -86,7 +86,8 @@ curl -N localhost:4001/v1/chat/completions \
 ```
 
 Each request logs one JSON line on stdout; `curl localhost:4001/metrics` shows the queue and
-the cache: requests waiting for the engine (`cavp_ready_wait_requests`) and for admission
+the cache: requests waiting for the engine (`cavp_ready_wait_requests`), for a tokenize slot
+(`cavp_tokenize_wait_requests`) and for admission
 (`cavp_queue_length`, `cavp_queue_oldest_wait_seconds`, the `cavp_queue_wait_seconds` histogram),
 and failures to size prompts or read the engine's metrics (`cavp_tokenize_errors_total`,
 `cavp_engine_metrics_errors_total`). Clients need no changes: a conversation is identified by
