@@ -557,14 +557,6 @@ func (m *Mirror) applyLocked(e *Event) {
 				log.Printf("level=warn msg=\"kv events block size differs from the engine's and its unit: those blocks never match\" event_block_size=%d block_size=%d unit=%d group=%d", e.BlockSize, m.blockSize, m.unitLocked(), g)
 			}
 		}
-		if e.ParentBlockHash == nil && m.allHeldLocked(e.BlockHashes, g) {
-			// A reuse report (kv_cache_report_mode "full", block_pool.py
-			// emit_cached_block_events): blocks a request hit, from block 0, with no
-			// BlockRemoved ever to match. Not new copies. A real second copy of block 0
-			// is missed too, which only makes the mirror under-report.
-			m.stats.Reports++
-			return
-		}
 		parent := rootKey
 		if e.ParentBlockHash != nil {
 			pu, ok := hashToUint(e.ParentBlockHash)
@@ -591,6 +583,14 @@ func (m *Mirror) applyLocked(e *Event) {
 			u, ok := hashToUint(h)
 			if !ok {
 				continue // its key still chains the blocks after it
+			}
+			if e.ParentBlockHash == nil && m.hashHeldLocked(u, g) {
+				// A reuse report (kv_cache_report_mode "full", block_pool.py
+				// emit_cached_block_events) lists the blocks a request hit, from block 0,
+				// with no BlockRemoved ever to match: not new copies. A real second copy
+				// of a block stored from 0 is missed too, which only under-reports.
+				m.stats.Reports++
+				continue
 			}
 			b := m.byKey[key]
 			if b == nil {
@@ -624,6 +624,8 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 		u, ok := hashToUint(h)
 		switch {
 		case !ok || i < len(e.ExtraKeys) && e.ExtraKeys[i] != nil:
+		case e.ParentBlockHash == nil && m.hashHeldLocked(u, g):
+			m.stats.Reports++ // a reuse report, as in applyLocked
 		case m.byEngine[u] != nil:
 			m.byEngine[u].add(g, 1)
 			m.stats.Stored++
@@ -643,15 +645,13 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 	}
 }
 
-// allHeldLocked reports whether every hash is a block the mirror holds in group g.
-func (m *Mirror) allHeldLocked(hashes []any, g uint) bool {
-	for _, h := range hashes {
-		u, ok := hashToUint(h)
-		if !ok || m.byEngine[u] == nil || m.byEngine[u].groups&(1<<g) == 0 {
-			return false
-		}
+// hashHeldLocked reports whether the engine hash is a block or unit entry held in group g.
+func (m *Mirror) hashHeldLocked(u uint64, g uint) bool {
+	if b := m.byEngine[u]; b != nil {
+		return b.groups&(1<<g) != 0
 	}
-	return true
+	f := m.units[u]
+	return f != nil && f.groups&(1<<g) != 0
 }
 
 func (m *Mirror) dropUnitLocked(f *unitEntry) {

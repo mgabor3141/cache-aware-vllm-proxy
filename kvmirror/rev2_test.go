@@ -29,3 +29,19 @@ func TestFixRevMambaReportFalseHit(t *testing.T) {
 		t.Fatalf("report changed prediction %d -> %d (false hit)", before, after)
 	}
 }
+
+// P3: report covering a block the mirror missed re-adds copies of held blocks.
+func TestFixRevPartialReportDoubleCount(t *testing.T) {
+	bs := 4
+	p := seqPrompt(3*bs + 1)
+	m := New()
+	m.Apply(0, []Event{attnStore(1, nil, p[:bs]), attnStore(2, uint64(1), p[bs:2*bs])})
+	g := 5
+	// engine holds 1,2,3 (3's store missed); report all three
+	m.Apply(1, []Event{{Type: "BlockStored", BlockHashes: []any{uint64(1), uint64(2), uint64(3)},
+		TokenIDs: p[:3*bs], BlockSize: bs, GroupIdx: &g, Kind: "full_attention"}})
+	m.Apply(2, []Event{removed(5, 1), removed(5, 2), removed(5, 3)})
+	if got := m.CachedTokens(p); got != 0 {
+		t.Fatalf("all evicted, mirror still says %d cached", got)
+	}
+}
