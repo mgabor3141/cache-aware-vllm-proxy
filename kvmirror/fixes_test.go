@@ -1,6 +1,10 @@
 package kvmirror
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 func fixPrompt(n int) []int64 {
 	p := make([]int64, n)
@@ -120,5 +124,17 @@ func TestFixUnsupportedKindPredictsNothing(t *testing.T) {
 	m.Apply(1, []Event{fixStored(1, "sliding_window", 16, 50, nil, p[16:32])})
 	if st := m.Status(); st.Unsupported != "sliding_window" || m.CachedTokens(p) != 0 {
 		t.Fatalf("sliding window group: status %+v, cached %d", st, m.CachedTokens(p))
+	}
+}
+
+// The README states the oldest vLLM whose KV events the mirror can read: 0.24.0, where
+// events became maps tagged by "type" (review r4-87 F1).
+func TestFixREADMEStatesVLLMVersion(t *testing.T) {
+	b, err := os.ReadFile("../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "vLLM engine, version 0.24.0 or later") {
+		t.Fatal("README does not state the minimum vLLM version")
 	}
 }

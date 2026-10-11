@@ -10,6 +10,8 @@
 //	BlockRemoved  block_hashes, group_idx
 //	AllBlocksCleared
 //
+// It reads the event format of vLLM 0.24.0 and later (events as maps tagged by "type").
+//
 // Engine block hashes are opaque (sha256 over pickled keys), so the mirror keys blocks by
 // its own chain hash of token IDs: key(b) = H(key(parent), tokens(b)). An event's parent
 // hash is mapped to a key through blocks the mirror has already seen; a block whose
