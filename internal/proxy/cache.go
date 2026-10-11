@@ -13,10 +13,13 @@ package proxy
 // Space, in tokens against the engine's pool:
 //   running request  its prompt plus the larger of its output so far and its expected
 //                    output, in whole blocks, plus a per-request overhead (guard.go).
-//   session hold     its last prompt, held until displaced, and still counted while
-//                    its own next request runs (the larger of the two). Displacing it is all
-//                    or nothing: with speculative decoding the engine drops a prompt's last
-//                    cached block before matching, so losing the tail loses the whole hit.
+//   session hold     the prompt of its last finished turn, no larger than admission priced
+//                    it, held until displaced, and still counted while its own next request
+//                    runs. That request is charged only the blocks it does not share with
+//                    the hold, by mirror keys (sharedLocked). Displacing a hold is all or
+//                    nothing and for good: with speculative decoding the engine drops a
+//                    prompt's last cached block before matching, so losing the tail loses
+//                    the whole hit. See docs/design.md, "The hold model".
 //
 // Order: priority (lower first), then a request whose prefix is cached, then small
 // prompts, then cold ones, each by arrival.
@@ -37,7 +40,6 @@ package proxy
 
 import (
 	"fmt"
-	"log"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -204,18 +206,14 @@ type cacheSession struct {
 	priority int // of its hold: the request that left it
 	outputs  []int
 
-	running int
-	// Largest observation of the current busy period (overlapping requests).
-	busyFootprint, busyPrompt, busyPriority int
-	busyBlocks                              kvmirror.PromptKeys
-	lastDone                                time.Time
-	held                                    int                 // prompt tokens protected while idle (whole blocks); 0 when not holding
-	heldBlocks                              kvmirror.PromptKeys // mirror keys of the held prompt
+	running    int
+	lastDone   time.Time           // when a turn last left or kept the hold
+	held       int                 // prompt tokens held (whole blocks); 0 when not holding
+	heldBlocks kvmirror.PromptKeys // mirror keys of the held prompt
 	// heldSeen is what the mirror saw cached of the hold: -1 until the mirror is healthy to
 	// ask, 0 when it saw nothing (the hold cannot be verified).
 	heldSeen int
 	heldGen  uint64 // the mirror's generation when the turn that left the hold was admitted
-	busyGen  uint64
 
 	gaveUpSince, gaveUpAt time.Time // a waiter whose client left: since when it waited, and when it left
 	waiting               int       // requests of this session in the queue
@@ -274,10 +272,11 @@ func (q *AdmissionQueue) session(key string, now time.Time) *cacheSession {
 }
 
 // pruneSessionsLocked forgets sessions idle past sessionRetention. With force (the table
-// is full), it also forgets the least recently seen idle sessions, those holding nothing
-// first, down to sessionCap less a sixteenth, so a full table is not scanned for every
-// new session. A session with running or queued requests is never forgotten; a hold
-// forgotten that way counts as displaced, and is logged.
+// is full), it also forgets the least recently seen sessions holding nothing, down to
+// sessionCap less a sixteenth, so a full table is not scanned for every new session. A
+// session with running or queued requests, or with a hold, is only forgotten at
+// retention: holds are bounded by the pool, and queued requests by nothing, so neither
+// may turn table pressure into lost holds.
 func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 	var idle []string
 	for k, s := range q.sessions {
@@ -286,7 +285,7 @@ func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 		}
 		if now.Sub(s.lastSeen) > sessionRetention {
 			delete(q.sessions, k)
-		} else if force {
+		} else if force && s.held == 0 {
 			idle = append(idle, k)
 		}
 	}
@@ -296,25 +295,13 @@ func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 	}
 	sort.Slice(idle, func(i, j int) bool {
 		a, b := q.sessions[idle[i]], q.sessions[idle[j]]
-		if (a.held > 0) != (b.held > 0) {
-			return a.held == 0
-		}
 		if !a.lastSeen.Equal(b.lastSeen) {
 			return a.lastSeen.Before(b.lastSeen)
 		}
 		return idle[i] < idle[j]
 	})
-	forgotten, held := 0, 0
 	for _, k := range idle[:min(excess, len(idle))] {
-		if h := q.sessions[k].held; h > 0 {
-			forgotten++
-			held += h
-		}
 		delete(q.sessions, k)
-	}
-	if forgotten > 0 {
-		q.displaced += held
-		log.Printf("level=warn msg=\"session table full: forgot idle holds\" holds=%d tokens=%d sessions=%d", forgotten, held, len(q.sessions))
 	}
 }
 
@@ -372,33 +359,33 @@ func (q *AdmissionQueue) runningLocked() int {
 	return model
 }
 
-// cacheUsedLocked is the modelled occupancy: running requests and holds, a session with
-// both charged the larger of its hold and its running requests (they share its prefix).
+// cacheUsedLocked is the modelled occupancy: every hold, and every running request less
+// the blocks it shares with its own session's hold (counted once, in the hold).
 func (q *AdmissionQueue) cacheUsedLocked(now time.Time) int {
 	used := q.heldLocked(now)
-	own := map[*cacheSession]int{}
 	for w := range q.running {
-		if s := q.sessions[w.session]; s != nil && s.held > 0 {
-			own[s] += q.liveCharge(w)
-		} else {
-			used += q.liveCharge(w)
-		}
-	}
-	for s, run := range own {
-		used += max(run, s.held) - s.held
+		used += q.liveCharge(w) - q.sharedLocked(w)
 	}
 	return used
 }
 
-// sessionRunningLocked is the live charge of a session's running requests.
-func (q *AdmissionQueue) sessionRunningLocked(s *cacheSession) int {
-	run := 0
-	for w := range q.running {
-		if q.sessions[w.session] == s {
-			run += q.liveCharge(w)
-		}
+// sharedLocked is the part of w's prompt its session's hold already counts: the leading
+// blocks the two have in common by mirror keys (chained, so equal keys mean an equal
+// prefix). A prompt without keys shares nothing.
+func (q *AdmissionQueue) sharedLocked(w *admissionWaiter) int {
+	s := q.sessions[w.session]
+	if s == nil || s.held == 0 {
+		return 0
 	}
-	return run
+	return min(commonBlocks(w.blocks, s.heldBlocks)*w.blocks.BlockSize, s.held)
+}
+
+func commonBlocks(a, b kvmirror.PromptKeys) int {
+	n := 0
+	for a.BlockSize > 0 && a.BlockSize == b.BlockSize && n < len(a.Blocks) && n < len(b.Blocks) && a.Blocks[n] == b.Blocks[n] {
+		n++
+	}
+	return n
 }
 
 // cachedLocked is the waiter's prefix the engine holds now, per the mirror.
@@ -420,17 +407,11 @@ type displacement struct {
 	tokens int
 }
 
-// addsLocked is the room w would add to the modelled use if admitted now: its charge, of
-// which its session's hold already covers part, clamped to the budget so a request larger
-// than the pool can still run alone.
+// addsLocked is the room w would add to the modelled use if admitted now: its charge,
+// clamped to the budget so a request larger than the pool can still run alone, less what
+// its session's hold already counts.
 func (q *AdmissionQueue) addsLocked(w *admissionWaiter) int {
-	charge := min(q.chargeLocked(w), q.budget())
-	if own := q.sessions[w.session]; own != nil && own.held > 0 {
-		// The session is charged the larger of its hold and its running requests.
-		run := q.sessionRunningLocked(own)
-		charge = max(own.held, run+charge) - max(own.held, run)
-	}
-	return charge
+	return max(min(q.chargeLocked(w), q.budget())-q.sharedLocked(w), 0)
 }
 
 // holdFor is how long an idle hold is firm: as long as its re-prefill would take, with
@@ -457,7 +438,7 @@ func (q *AdmissionQueue) tier(w *admissionWaiter, cached int, now time.Time) int
 	own := q.sessions[w.session]
 	switch {
 	case cached > 0 && cached*2 >= w.prompt,
-		own != nil && own.holding(now) && own.held*2 >= w.prompt:
+		own != nil && own.holding(now) && q.sharedLocked(w)*2 >= w.prompt:
 		return 0
 	case w.prompt < smallPrompt:
 		return 1
@@ -485,14 +466,13 @@ func (q *AdmissionQueue) grantStateLocked(now time.Time) *grantState {
 // lower-priority hold, even while its session runs a request (the running request stays
 // charged; only the hold goes), so an agent that overlaps calls cannot pin its hold.
 // Otherwise only idle, expendable holds (past holdFor) go, and only while the engine is
-// under-used. With nothing running, the head waiter may take any equal-priority hold:
-// nothing else will free room, so this guarantees progress.
+// under-used. A firm hold waits out its window even with nothing running: a tick re-runs
+// the grant pass, so the head waiter gets in once it is expendable.
 func (q *AdmissionQueue) displaceable(p int, s *cacheSession, now time.Time) bool {
 	if p < s.priority && q.freesLocked(s) > 0 {
 		return true
 	}
-	return s.holding(now) && ((q.active == 0 && p == s.priority) ||
-		(!q.firm(s, now) && q.active < evictBelowRunning))
+	return s.holding(now) && !q.firm(s, now) && q.active < evictBelowRunning
 }
 
 // reachLocked is how much room w may free by displacing holds.
@@ -509,56 +489,66 @@ func (q *AdmissionQueue) reachLocked(g *grantState, w *admissionWaiter, now time
 	if own := q.sessions[w.session]; own != nil && q.displaceable(w.priority, own, now) {
 		r -= q.freesLocked(own)
 	}
-	return r
+	return r + q.ownFreesLocked(w)
+}
+
+// ownFreesLocked is the room w frees by displacing its own session's hold, which it may
+// always do (its conversation's next turn is this request): the hold less what running
+// requests and w itself share with it.
+func (q *AdmissionQueue) ownFreesLocked(w *admissionWaiter) int {
+	if own := q.sessions[w.session]; own != nil {
+		return max(q.freesLocked(own)-q.sharedLocked(w), 0)
+	}
+	return 0
 }
 
 // fitLocked decides whether w can run now within free room (budget minus running work,
 // holds, and what earlier blocked waiters reserved), and which idle holds it displaces.
 func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved int, g *grantState) (plan []displacement, ok bool) {
-	// A waiter its session's hold already covers (it resends a prefix of the held prompt
-	// and fits inside it) takes no room: reservations do not hold it back.
-	adds := q.addsLocked(w)
-	if adds <= 0 && q.sharesHold(w) {
-		return nil, true
-	}
-	need := adds - g.free + reserved
+	need := q.addsLocked(w) - g.free + reserved
 	if need <= 0 {
 		return nil, true
 	}
 	if need > q.reachLocked(g, w, now) {
 		return nil, false
 	}
-	var cands []*cacheSession
+	var cands []displacement
 	for k, s := range q.sessions {
-		if k != w.session && q.displaceable(w.priority, s, now) && q.freesLocked(s) > 0 {
-			cands = append(cands, s)
+		f := q.freesLocked(s)
+		if k == w.session {
+			f = q.ownFreesLocked(w)
+		} else if !q.displaceable(w.priority, s, now) {
+			continue
+		}
+		if f > 0 {
+			cands = append(cands, displacement{s, f})
 		}
 	}
 	// Best fit: the smallest single hold that covers the need; otherwise the holds idle
 	// longest (least likely back) until it is covered. Ties go to the longest idle, then
 	// to the session key, so the same state always displaces the same holds.
 	sort.Slice(cands, func(i, j int) bool {
-		a, b := cands[i], cands[j]
+		a, b := cands[i].s, cands[j].s
 		if !a.lastDone.Equal(b.lastDone) {
 			return a.lastDone.Before(b.lastDone)
 		}
 		return a.key < b.key
 	})
-	var single *cacheSession
-	for _, s := range cands {
-		if f := q.freesLocked(s); f >= need && (single == nil || f < q.freesLocked(single)) {
-			single = s
+	var single *displacement
+	for i, d := range cands {
+		if d.tokens >= need && (single == nil || d.tokens < single.tokens) {
+			single = &cands[i]
 		}
 	}
 	if single != nil {
-		return []displacement{{single, q.freesLocked(single)}}, true
+		return []displacement{*single}, true
 	}
-	for _, s := range cands {
+	for _, d := range cands {
 		if need <= 0 {
 			break
 		}
-		plan = append(plan, displacement{s, q.freesLocked(s)})
-		need -= q.freesLocked(s)
+		plan = append(plan, d)
+		need -= d.tokens
 	}
 	if need > 0 {
 		return nil, false
@@ -711,13 +701,14 @@ func (q *AdmissionQueue) keysLocked(w *admissionWaiter) {
 	}
 }
 
-// finishLocked returns a request's charge and records what the engine reported. While
-// a session has overlapping requests, the largest observation wins: a side call does not
-// shrink what the main thread left cached, nor lend the hold its priority. Without usage
-// (client gone mid-stream, upstream error), a request that streamed output had its prompt
-// prefilled, and the size the proxy measured stands in. A busy period with nothing to
-// show keeps the session's previous hold, whose prefix a retry resends; a session
-// without one holds nothing.
+// finishLocked returns a request's charge and leaves its session a hold: its prompt as
+// the engine reported it, bounded by the prompt admission priced, so a hold never exceeds
+// the room its request just returned. Without usage (client gone mid-stream, upstream
+// error), a request that streamed output had its prompt prefilled and the size the proxy
+// measured stands in, but only to raise the hold; one that streamed nothing leaves the
+// hold as it was. A smaller turn replaces the hold only when its engine-reported prompt
+// provably differs from the held one by keys (compacted, or another conversation on the
+// session key): a side call, or a prefix of the held prompt, keeps it.
 func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObservation, bool)) {
 	now := q.now()
 	delete(q.running, w)
@@ -725,37 +716,30 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 	if s == nil {
 		return
 	}
-	o, ok := obs()
-	if ok && o.PromptTokens > 0 {
-		s.outputs = pushInt(s.outputs, o.CompletionTokens/max(w.seqs, 1)) // per sequence
-	} else if g := w.generated(); g > 0 && w.prompt > 0 {
-		o, ok = CacheObservation{PromptTokens: w.prompt, CompletionTokens: g}, true
-	} else {
-		ok = false
-	}
-	if fp := o.PromptTokens + o.CompletionTokens; ok && fp > s.busyFootprint {
-		s.busyFootprint, s.busyPrompt, s.busyBlocks, s.busyPriority = fp, o.PromptTokens, w.blocks, w.priority
-		s.busyGen = w.mirGen
-	}
 	if s.running > 0 {
 		s.running--
 	}
-	if s.running > 0 {
+	o, reported := obs()
+	prompt := o.PromptTokens
+	if reported = reported && prompt > 0; reported {
+		s.outputs = pushInt(s.outputs, o.CompletionTokens/max(w.seqs, 1)) // per sequence
+	} else if prompt = 0; w.generated() > 0 {
+		prompt = w.prompt
+	}
+	h := q.roundUp(min(prompt, w.prompt))
+	if h == 0 {
 		return
 	}
 	s.lastDone = now
-	if s.busyFootprint > 0 {
-		// The next turn resends the prompt, not the completion (thinking is dropped), so
-		// the prompt is what stays useful in the cache.
-		s.held = q.roundUp(s.busyPrompt)
-		s.heldBlocks = s.busyBlocks
-		s.heldSeen, s.heldGen = -1, s.busyGen
-		s.priority = s.busyPriority
-		if q.mirror.Healthy() {
-			q.judgeHoldLocked(s, now) // the first look, while the blocks are fresh
-		}
+	n := commonBlocks(w.blocks, s.heldBlocks)
+	if h < s.held && !(reported && n < len(w.blocks.Blocks) && n < len(s.heldBlocks.Blocks)) {
+		return
 	}
-	s.busyFootprint, s.busyPrompt, s.busyBlocks = 0, 0, kvmirror.PromptKeys{}
+	s.held, s.heldBlocks, s.priority = h, w.blocks, w.priority
+	s.heldSeen, s.heldGen = -1, w.mirGen
+	if q.mirror.Healthy() {
+		q.judgeHoldLocked(s, now) // the first look, while the blocks are fresh
+	}
 }
 
 // CacheObservation is the engine's usage for one finished request.
@@ -771,30 +755,14 @@ func (q *AdmissionQueue) PoolKnown() bool {
 	return q.budget() > 0
 }
 
-// sharesHold: w's prompt is a prefix of its session's held prompt, by mirror keys.
-func (q *AdmissionQueue) sharesHold(w *admissionWaiter) bool {
-	s := q.sessions[w.session]
-	if s == nil || s.held == 0 {
-		return false
-	}
-	a, b := w.blocks, s.heldBlocks
-	if len(a.Blocks) == 0 || a.BlockSize != b.BlockSize || len(a.Blocks) > len(b.Blocks) {
-		return false
-	}
-	for i, k := range a.Blocks {
-		if b.Blocks[i] != k {
-			return false
+// freesLocked is the room displacing s's hold frees: the hold less what its running
+// requests share with it (they are then charged in full).
+func (q *AdmissionQueue) freesLocked(s *cacheSession) int {
+	f := s.held
+	for w := range q.running {
+		if q.sessions[w.session] == s {
+			f -= q.sharedLocked(w)
 		}
 	}
-	return true
-}
-
-// freesLocked is the room displacing s's hold frees: the whole hold while the session is
-// idle, else only what its running requests do not already cover (it is charged the
-// larger of the two).
-func (q *AdmissionQueue) freesLocked(s *cacheSession) int {
-	if s.running == 0 {
-		return s.held
-	}
-	return max(0, s.held-q.sessionRunningLocked(s))
+	return max(f, 0)
 }

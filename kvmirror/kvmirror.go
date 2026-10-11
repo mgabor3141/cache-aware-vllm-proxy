@@ -61,6 +61,7 @@
 package kvmirror
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/sha256"
@@ -148,8 +149,9 @@ type Mirror struct {
 	// unsupported is a group kind the mirror cannot model (only full and MLA attention and
 	// mamba are); while set, Cached returns 0.
 	unsupported string
-	sizeWarned  bool // a block of another size than blockSize was logged
-	unitWarned  bool // an unusable prefix_match_unit was logged
+	sizeWarned  bool            // a block of another size than blockSize was logged
+	unitWarned  bool            // an unusable prefix_match_unit was logged
+	skipWarned  map[string]bool // kinds of skipped events already logged
 	// dropLast applies the EAGLE drop (speculative decoding on): the last block, or the
 	// last unit of a unit hit.
 	dropLast bool
@@ -162,6 +164,9 @@ type Mirror struct {
 // size than the mirror's match nothing, at another unit no unit hit.
 type PromptKeys struct {
 	BlockSize int
+	// Limit is the prompt's token count: the engine bounds its lookup at Limit-1, as it
+	// recomputes the last token. 0 leaves the unit probe unbounded.
+	Limit     int
 	Blocks    []BlockKey
 	Unit      int
 	UnitsFrom int
@@ -183,7 +188,9 @@ func (k PromptKeys) unitKey(x int) (uint64, bool) {
 // on: where the engine registers this prompt's own end, the one unit hit it can have once
 // it has run. Call it when the prompt is admitted, so a running request or an idle session
 // keeps at most a block's worth of unit keys (66 at 4096/64) whatever the prompt's length.
+// The keys then stand for the session's next turn, which extends the prompt, so Limit is cleared.
 func (k PromptKeys) Tail() PromptKeys {
+	k.Limit = 0
 	if k.Unit <= 0 {
 		return k
 	}
@@ -232,7 +239,7 @@ func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
 	m.mu.Lock()
 	bs, unit, drop := m.blockSize, m.unitLocked(), m.dropLast
 	m.mu.Unlock()
-	k := PromptKeys{BlockSize: bs, Blocks: PromptBlockKeys(prompt, bs)}
+	k := PromptKeys{BlockSize: bs, Limit: len(prompt), Blocks: PromptBlockKeys(prompt, bs)}
 	if unit <= 0 || bs <= 0 {
 		return k
 	}
@@ -326,6 +333,25 @@ func (m *Mirror) isUnitLocked(size int) bool {
 type Stats struct {
 	// Reports are reuse reports of a recurrent group (parent-less, several blocks): not stored.
 	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps, Reports uint64
+	// SkippedNoGroup are BlockStored events without a usable group_idx (missing, or 64 and
+	// up): not stored.
+	SkippedNoGroup uint64
+	// SkippedHash are block hashes of a type the mirror cannot read: those blocks are not
+	// stored or removed.
+	SkippedHash uint64
+	// SkippedMedium are events about another medium than the GPU (CPU or disk offload):
+	// the engine serves no prefix hit from them directly, so they are not applied.
+	SkippedMedium uint64
+}
+
+// Counts are the counters by name (snake case), for metrics.
+func (s Stats) Counts() map[string]uint64 {
+	return map[string]uint64{
+		"stored": s.Stored, "removed": s.Removed, "cleared": s.Cleared, "restarts": s.Restarts,
+		"skipped_orphan": s.SkippedOrphan, "skipped_empty": s.SkippedEmpty, "batches": s.Batches,
+		"duplicates": s.Duplicates, "seq_gaps": s.SeqGaps, "reports": s.Reports,
+		"skipped_no_group": s.SkippedNoGroup, "skipped_hash": s.SkippedHash, "skipped_medium": s.SkippedMedium,
+	}
 }
 
 func New() *Mirror {
@@ -396,6 +422,16 @@ func hashToUint(v any) (uint64, bool) {
 		return u, true
 	}
 	return 0, false
+}
+
+// hashLocked reads an engine block hash, counting and logging one it cannot read.
+func (m *Mirror) hashLocked(v any) (uint64, bool) {
+	u, ok := hashToUint(v)
+	if !ok {
+		m.stats.SkippedHash++
+		m.warnSkipLocked("hash", fmt.Sprintf("kv events block hash of type %T cannot be read: its block is skipped", v))
+	}
+	return u, ok
 }
 
 // decodeBatch parses one payload into events.
@@ -480,6 +516,8 @@ func (m *Mirror) clearLocked() {
 
 func (m *Mirror) applyLocked(e *Event) {
 	if e.Medium != nil && *e.Medium != "" && *e.Medium != "GPU" {
+		m.stats.SkippedMedium++
+		m.warnSkipLocked("medium", fmt.Sprintf("kv events for medium %q (KV offload) are not mirrored: only GPU blocks are", *e.Medium))
 		return
 	}
 	switch e.Type {
@@ -487,12 +525,20 @@ func (m *Mirror) applyLocked(e *Event) {
 		m.clearLocked()
 		m.stats.Cleared++
 	case "BlockRemoved":
-		if e.GroupIdx == nil {
+		g, ok := groupOf(e)
+		if !ok {
+			// Which group lost a copy is unknown: forget the hash in every group, as only
+			// forgetting under-reports.
+			m.warnSkipLocked("no_group", "kv events BlockRemoved without a usable group_idx: the hash is forgotten in every group")
+			for _, h := range e.BlockHashes {
+				if u, ok := m.hashLocked(h); ok {
+					m.forgetLocked(u)
+				}
+			}
 			return
 		}
-		g := uint(*e.GroupIdx)
 		for _, h := range e.BlockHashes {
-			u, ok := hashToUint(h)
+			u, ok := m.hashLocked(h)
 			if !ok {
 				continue
 			}
@@ -512,10 +558,15 @@ func (m *Mirror) applyLocked(e *Event) {
 			}
 		}
 	case "BlockStored":
-		if e.GroupIdx == nil || e.BlockSize <= 0 {
+		if e.BlockSize <= 0 {
 			return
 		}
-		g := uint(*e.GroupIdx)
+		g, ok := groupOf(e)
+		if !ok {
+			m.stats.SkippedNoGroup++
+			m.warnSkipLocked("no_group", "kv events BlockStored without a usable group_idx: not stored")
+			return
+		}
 		bit := uint64(1) << g
 		switch e.Kind {
 		case "mamba":
@@ -559,7 +610,7 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		parent := rootKey
 		if e.ParentBlockHash != nil {
-			pu, ok := hashToUint(e.ParentBlockHash)
+			pu, ok := m.hashLocked(e.ParentBlockHash)
 			pb := m.byEngine[pu]
 			if !ok || pb == nil {
 				// The rest of this event chains from the unknown parent; the batch's other
@@ -580,7 +631,7 @@ func (m *Mirror) applyLocked(e *Event) {
 			}
 			key := chainKey(parent, e.TokenIDs[i*bs:(i+1)*bs], extra)
 			parent = key
-			u, ok := hashToUint(h)
+			u, ok := m.hashLocked(h)
 			if !ok {
 				continue // its key still chains the blocks after it
 			}
@@ -604,6 +655,40 @@ func (m *Mirror) applyLocked(e *Event) {
 	}
 }
 
+// groupOf is the event's KV cache group, if it has one the masks can hold.
+func groupOf(e *Event) (uint, bool) {
+	if e.GroupIdx == nil || *e.GroupIdx < 0 || *e.GroupIdx >= 64 {
+		return 0, false
+	}
+	return uint(*e.GroupIdx), true
+}
+
+// forgetLocked drops every copy held under engine hash u.
+func (m *Mirror) forgetLocked(u uint64) {
+	if b := m.byEngine[u]; b != nil {
+		m.stats.Removed++
+		delete(m.byEngine, u)
+		if m.byKey[b.key] == b {
+			delete(m.byKey, b.key)
+		}
+	} else if f := m.units[u]; f != nil {
+		m.stats.Removed++
+		m.dropUnitLocked(f)
+	}
+}
+
+// warnSkipLocked logs the first event of each kind the mirror cannot use.
+func (m *Mirror) warnSkipLocked(kind, msg string) {
+	if m.skipWarned[kind] {
+		return
+	}
+	if m.skipWarned == nil {
+		m.skipWarned = map[string]bool{}
+	}
+	m.skipWarned[kind] = true
+	log.Printf("level=warn msg=%q", msg+" (logged once)")
+}
+
 // storeUnitsLocked records a unit-sized BlockStored. An entry whose hash is a known
 // block's (a checkpoint at a block's end) is a copy of that block; entries with extra
 // keys are skipped, as tokens alone never match them.
@@ -613,7 +698,7 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 		if (i+1)*size > len(e.TokenIDs) {
 			return
 		}
-		u, ok := hashToUint(h)
+		u, ok := m.hashLocked(h)
 		switch {
 		case !ok || i < len(e.ExtraKeys) && e.ExtraKeys[i] != nil:
 		case m.byEngine[u] != nil:
@@ -708,7 +793,13 @@ func (m *Mirror) Cached(k PromptKeys) int {
 // cached full blocks) whose attention entry the engine holds, or 0.
 func (m *Mirror) attentionReachLocked(k PromptKeys, c int) int {
 	u, bs := k.Unit, k.BlockSize
-	for q := (c+1)*bs - u; q > c*bs; q -= u {
+	top := (c+1)*bs - u
+	if k.Limit > 0 {
+		// The engine reads no boundary past Limit-1: the entry an aligned prompt
+		// registers at its own end serves only longer prompts, not a resend of it.
+		top = min(top, (k.Limit-1)/u*u)
+	}
+	for q := top; q > c*bs; q -= u {
 		if e, ok := m.endLocked(k, q); ok && e.attn && m.heldLocked(e.content, m.attnMask) {
 			return q
 		}
@@ -906,12 +997,15 @@ func (m *Mirror) skipHole(from, to int64) {
 // again from the next missing sequence, until the end-of-sequence marker (seq -1). A round
 // whose first batch is past the sequence asked for skips the hole and clears the mirror:
 // those batches are gone, and may have removed blocks.
+// A later round asks from one batch earlier, the last one already applied: a publisher that
+// does not send that batch back unchanged is a restarted engine, and the replay fails.
 // Undecodable batches are skipped too. A replay that does not reach the marker is an error.
 func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 	total := 0
 	from := int64(0)
+	var last []byte // the payload of batch from-1
 	for round := 0; round < 64; round++ {
-		n, next, done, err := m.replayRound(ctx, endpoint, from)
+		n, next, l, done, err := m.replayRound(ctx, endpoint, from, last)
 		total += n
 		if err != nil || done {
 			return total, err
@@ -919,25 +1013,29 @@ func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 		if n == 0 {
 			return total, fmt.Errorf("replay round from %d returned nothing", from)
 		}
-		from = next
+		from, last = next, l
 	}
 	return total, fmt.Errorf("replay did not finish in 64 rounds")
 }
 
-func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (n int, next int64, done bool, err error) {
+func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64, prev []byte) (n int, next int64, last []byte, done bool, err error) {
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	d := zmq4.NewDealer(rctx)
 	defer d.Close()
 	if err := d.Dial(endpoint); err != nil {
-		return 0, from, false, err
+		return 0, from, prev, false, err
 	}
 	// The connection handshake completes asynchronously; a request sent before it is lost.
 	time.Sleep(300 * time.Millisecond)
 	start := make([]byte, 8)
-	binary.BigEndian.PutUint64(start, uint64(from))
+	ask := from
+	if prev != nil {
+		ask-- // the last batch applied, to check the publisher is the same engine
+	}
+	binary.BigEndian.PutUint64(start, uint64(ask))
 	if err := d.Send(zmq4.NewMsgFrom([]byte{}, start)); err != nil {
-		return 0, from, false, err
+		return 0, from, prev, false, err
 	}
 	msgs := make(chan zmq4.Msg, 64)
 	go func() {
@@ -954,35 +1052,54 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 			}
 		}
 	}()
-	next = from
+	next, last = from, prev
+	checked := prev == nil
+	restarted := func(why string) (int, int64, []byte, bool, error) {
+		log.Printf("level=warn msg=\"kv events replay does not continue the batches applied: engine restarted, resyncing\" from=%d why=%q", from, why)
+		return n, next, last, false, errResync
+	}
 	idle := time.NewTimer(replayFirstWait)
 	defer idle.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return n, next, false, ctx.Err()
+			return n, next, last, false, ctx.Err()
 		case <-idle.C:
-			return n, next, false, nil
+			return n, next, last, false, nil
 		case msg, ok := <-msgs:
 			if !ok {
-				return n, next, false, nil
+				return n, next, last, false, nil
 			}
 			f := msg.Frames
 			if len(f) > 0 && len(f[0]) == 0 {
 				f = f[1:] // delimiter
 			}
 			if len(f) >= 2 && len(f[len(f)-2]) == 8 && int64(binary.BigEndian.Uint64(f[len(f)-2])) == -1 {
-				return n, next, true, nil
+				if !checked {
+					// The buffer would still hold the newest batch applied.
+					return restarted("the last batch applied is gone")
+				}
+				return n, next, last, true, nil
 			}
 			seq, events, ok := parseFrames(f)
 			if !ok {
 				continue
 			}
+			if !checked {
+				checked = true
+				if seq == ask {
+					if !bytes.Equal(f[len(f)-1], prev) {
+						return restarted("the last batch applied changed")
+					}
+					continue
+				}
+			}
 			if seq < next {
-				continue
+				// The publisher answers from the start asked for.
+				return restarted("a batch below the start asked for")
 			}
 			if seq > next && n > 0 {
-				return n, next, false, nil // the publisher dropped batches: ask again from here
+				return n, next, last, false, nil // the publisher dropped batches: ask again from here
 			}
 			if seq > next && next != 0 {
 				// Asked from next, the buffer's first batch is later: those batches are
@@ -992,7 +1109,7 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 			}
 			m.Apply(seq, events)
 			n++
-			next = seq + 1
+			next, last = seq+1, f[len(f)-1]
 			idle.Reset(time.Second)
 		}
 	}

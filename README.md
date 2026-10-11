@@ -90,7 +90,9 @@ the cache: requests waiting for the engine (`cavp_ready_wait_requests`), for a t
 (`cavp_tokenize_wait_requests`) and for admission
 (`cavp_queue_length`, `cavp_queue_oldest_wait_seconds`, the `cavp_queue_wait_seconds` histogram),
 and failures to size prompts or read the engine's metrics (`cavp_tokenize_errors_total`,
-`cavp_engine_metrics_errors_total`). Clients need no changes: a conversation is identified by
+`cavp_engine_metrics_errors_total`), and the KV event mirror (`cavp_kv_mirror_connected`,
+`cavp_kv_mirror_blocks`, `cavp_kv_mirror_unsupported`, and `cavp_kv_mirror_events_total` by kind,
+whose `skipped_*` kinds count events it could not use). Clients need no changes: a conversation is identified by
 its first two messages.
 
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
@@ -146,7 +148,8 @@ hold its place on the engine.
 from admission, since their output is not seen until they finish. A client that sends a large
 `max_tokens` (often the context length) is charged up to the whole pool: it still runs, but
 nothing runs beside it. Prefer streaming, whose output is charged as it arrives, or a realistic
-`max_tokens`. Several choices (`n`) or a batched `/v1/completions` prompt are several
+`max_tokens`. The cap is read as the engine reads it: `60000`, `60000.0`, `6e4` and `"60000"` are
+the same cap. Several choices (`n`) or a batched `/v1/completions` prompt are several
 sequences, each charged its own expected output.
 
 **Engine restarts.** A readiness probe asks the engine's `/v1/models` every

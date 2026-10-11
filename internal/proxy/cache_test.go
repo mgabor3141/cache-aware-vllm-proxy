@@ -765,8 +765,8 @@ func TestCacheAdmissionHoldPriorityFromItsTurn(t *testing.T) {
 	mustWait(t, q.start("c", 0, 220000), "c may not displace a's firm hold")
 }
 
-// A full session table forgets idle sessions that hold nothing first, never a session
-// with queued requests, and accounts for any hold it forgets (reviews cv-51 MED-12,
+// A full session table forgets only idle sessions that hold nothing, never a session
+// with queued requests or a hold (reviews cv-51 MED-12,
 // cv-53 #8, cv-58 #15). It prunes below the cap, so it does not rescan per new session.
 func TestCacheAdmissionSessionCapSparesHolds(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
@@ -790,21 +790,19 @@ func TestCacheAdmissionSessionCapSparesHolds(t *testing.T) {
 	if n := len(q.sessions); n > sessionCap-sessionCap/16+1 {
 		t.Fatalf("%d sessions after pruning", n)
 	}
-	// With only holders left to forget, the forgotten hold counts as displaced.
+	// Parked waiters cannot turn table pressure onto holds: with the table full of
+	// sessions that have a queued request, no hold is forgotten (v5-93 #6).
 	for k, s := range q.sessions {
 		if k != "waiter" && k != "holder" {
-			s.held = 3200
+			s.waiting = 1
 		}
 	}
 	for i := 0; len(q.sessions) < sessionCap; i++ {
-		q.sessions[fmt.Sprintf("m%05d", i)] = &cacheSession{lastSeen: now, held: 3200}
+		q.sessions[fmt.Sprintf("m%05d", i)] = &cacheSession{lastSeen: now, waiting: 1}
 	}
 	q.session("newcomer2", now)
-	if q.displaced == 0 {
-		t.Fatal("forgotten holds not accounted")
-	}
-	if _, ok := q.sessions["waiter"]; !ok {
-		t.Fatal("forgot a session with a queued request")
+	if _, ok := q.sessions["holder"]; !ok || q.displaced != 0 {
+		t.Fatal("a full table of parked waiters forgot a hold")
 	}
 }
 

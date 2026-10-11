@@ -32,9 +32,9 @@ func TestUsageRecordedBeforeRelease(t *testing.T) {
 				t.Fatalf("%d sessions", len(q.sessions))
 			}
 			for _, s := range q.sessions {
-				if s.held != q.roundUp(tc.prompt) || len(s.outputs) != 1 || s.outputs[0] != tc.complete {
-					t.Fatalf("session history held=%d outputs=%v, want %d and [%d]: usage reached admission after the release",
-						s.held, s.outputs, q.roundUp(tc.prompt), tc.complete)
+				if s.held == 0 || len(s.outputs) != 1 || s.outputs[0] != tc.complete {
+					t.Fatalf("session history held=%d outputs=%v, want a hold and [%d]: usage reached admission after the release",
+						s.held, s.outputs, tc.complete)
 				}
 			}
 		})

@@ -68,7 +68,8 @@ next turn resumes there, at for example 2 blocks and 31 units (10,176 tokens), n
 full block. The mirror matches these events. It takes the unit from `prefix_match_unit` in
 `vllm:cache_config_info`, else from the size of the unit events, and follows the engine's rule:
 the attention layers reach through the contiguous cached full blocks and then the next block's
-unit boundaries, probed from the top; speculative decoding drops one unit rather than a block;
+unit boundaries, probed from the top but never past the prompt's last token (the engine recomputes it, so
+a prompt that ends on a unit boundary cannot read the entry it registers there; a longer one can); speculative decoding drops one unit rather than a block;
 the hit is the newest boundary at or below that with a recurrent checkpoint, which may lie a
 block or more lower (a turn whose decode filled the block its prompt ended in leaves its
 checkpoint below a block the next turn matches whole). Unit matching only adds boundaries to
@@ -84,9 +85,13 @@ The mirror is only as good as the stream. On every (re)subscription it starts em
 from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
 replay that fails ends the subscription so it is retried. Batches missing from the replay
 buffer are skipped and the mirror starts over from the batch after them (they may have removed
-blocks); undecodable batches are skipped. Neither fails every retry. A sequence number that goes backwards
+blocks); undecodable batches are skipped. Neither fails every retry. Events the mirror cannot
+use are counted and logged once, never applied: blocks on another medium than the GPU (CPU or
+disk KV offload), events without a usable `group_idx`, and block hashes of an unknown type. A sequence number that goes backwards
 outside the replay overlap means the engine restarted: the mirror starts over, resyncs from the
-replay, and its generation moves so admission sees its holds may be gone. Holds are
+replay, and its generation moves so admission sees its holds may be gone. The same goes for a
+restart seen inside the replay: each later round asks from the last batch already applied, and a
+publisher that does not send it back unchanged fails the replay, which resyncs. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
 a restart, or older than the replay buffer reaches) is released. A hold the mirror never saw
 (the prompt could not be tokenized, or its blocks carry extra hash keys) cannot be verified: it
@@ -109,8 +114,8 @@ it runs. The expected output is per sequence: a request with `n` choices or a ba
 prompt is charged it once per sequence.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
-admitted on top of it. It stays counted while the conversation's next request runs (the session is
-charged the larger of the two, which share the prefix); a higher-priority waiter may still
+admitted on top of it. It stays counted while the conversation's next request runs, which is
+charged only the blocks it does not share with the hold; a higher-priority waiter may still
 displace it then. A hold is firm (cannot be displaced by work of the same or lower
 priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
 that prefill would slow, and at least 5 s so a quick tool call always comes back warm, and as
@@ -118,14 +123,36 @@ long again from when its conversation's next request starts waiting. After that
 it is expendable: it stays while nothing needs the room. A hold has the priority of the turn that
 left it; a turn that ends without usage (client gone, engine error) keeps the previous hold.
 
+**The hold model.** A session has at most one hold: a size in whole blocks, the mirror keys of
+the prompt behind it, a priority and the time its last turn finished.
+
+- A hold is made or replaced only when a request of the session finishes, at once (also while
+  other requests of the session run). Its size is the prompt the engine reported, bounded by the
+  prompt admission priced, so it never exceeds the room the finishing request returns. Without
+  usage, a request that streamed output stands in its priced prompt, but only to raise the hold;
+  one that streamed nothing changes nothing, not even the hold's firmness. A smaller turn
+  replaces the hold only when its reported prompt differs from the held one by keys (a
+  compacted context); a side call or a prefix of the held prompt keeps it.
+- Modelled use is every hold plus every running request's charge less the leading blocks its
+  prompt shares with its own session's hold, by mirror keys. A prompt without keys shares
+  nothing. Nothing else is counted, so a block is counted once.
+- A waiter is admitted only if modelled use after it, and after the holds it displaces, is
+  within the budget (a request larger than the pool runs alone).
+- Displacing a hold removes it for good; nothing recreates it except a later finish of its own
+  session, sized by that request's own charge. A waiter may always displace its own session's
+  hold (it is that conversation's next turn). Other holds are displaced by higher-priority work,
+  or, when idle and no longer firm, by equal-priority work while fewer than 4 requests run.
+  A firm hold is never displaced by work of the same or lower priority.
+
+These are checked over random sequences of arrivals, finishes, streamed output and time
+(`TestHoldModelProperties`).
+
 **Order.** Priority first (lower runs first, as in vLLM). Then a waiter whose prompt is at least
 half cached, or whose own conversation holds its context; then small prompts; then cold ones; each
 by arrival. A blocked waiter reserves the room it still needs, so smaller work cannot starve it.
-Two exceptions: a waiter that could not run even with every hold it may displace gone (larger
+The exception: a waiter that could not run even with every hold it may displace gone (larger
 than the pool less the holds of higher priority) reserves nothing, as holding room back for it
-protects nothing; and a request that resends a prefix of its conversation's held prompt and fits
-inside the hold takes no room, so no
-reservation holds it back.
+protects nothing.
 
 **Eviction.** An expendable hold is displaced only while fewer than 4 requests run. On a busy
 engine displacing a context only adds prefill work.

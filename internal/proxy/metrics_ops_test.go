@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
 func metricValueOf(t *testing.T, h *harness, name string) float64 {
@@ -90,5 +92,28 @@ func TestMetricsCountsTokenizeAndEngineMetricsFailures(t *testing.T) {
 	time.Sleep(1300 * time.Millisecond)
 	if v := metricValueOf(t, h, "cavp_engine_metrics_errors_total"); v < 1 {
 		t.Fatalf("engine metrics errors %g after a failed read", v)
+	}
+}
+
+// The KV mirror's counters reach /metrics, so a mirror that is connected but skipping
+// every event (offloaded tiers, unreadable hashes) is visible (load3 #100 F9, F10).
+func TestMetricsExportMirrorStats(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	g, cpu := 0, "CPU"
+	toks := make([]int64, 16)
+	h.p.admission.mirror.Apply(-1, []kvmirror.Event{
+		{Type: "BlockStored", BlockHashes: []any{uint64(1)}, TokenIDs: toks, BlockSize: 16, GroupIdx: &g, Kind: "full_attention"},
+		{Type: "BlockStored", BlockHashes: []any{uint64(2)}, TokenIDs: toks, BlockSize: 16, GroupIdx: &g, Medium: &cpu},
+	})
+	for name, want := range map[string]float64{
+		"cavp_kv_mirror_blocks":                              1,
+		"cavp_kv_mirror_unsupported":                         0,
+		`cavp_kv_mirror_events_total{kind="stored"}`:         1,
+		`cavp_kv_mirror_events_total{kind="skipped_medium"}`: 1,
+		`cavp_kv_mirror_events_total{kind="skipped_hash"}`:   0,
+	} {
+		if got := metricValueOf(t, h, name); got != want {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
 	}
 }

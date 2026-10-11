@@ -26,6 +26,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -630,11 +631,21 @@ func sequencesOf(body map[string]any) int {
 	return n
 }
 
-// maxTokensOf returns the request's output cap, or 0 when it has none.
+// maxTokensOf returns the request's output cap, or 0 when it has none. It reads the cap
+// as the engine will: its validator takes an integral float or a numeric string for an
+// int (60000.0, 6e4, "60000"), and the body is forwarded as sent. Anything else the engine
+// rejects, so it allocates nothing and reads as no cap.
 func maxTokensOf(body map[string]any) int {
 	for _, k := range []string{"max_completion_tokens", "max_tokens"} {
-		if v, ok := intField(body, k); ok && v > 0 {
-			return v
+		var s string
+		switch v := body[k].(type) {
+		case json.Number:
+			s = string(v)
+		case string:
+			s = strings.TrimSpace(v)
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil && f >= 1 && f <= math.MaxInt32 && f == math.Trunc(f) {
+			return int(f)
 		}
 	}
 	return 0
