@@ -139,6 +139,12 @@ Streaming clients get SSE keepalive comments while they wait and whenever the st
 A client that stops reading for 5 minutes during a single write is disconnected, so it cannot
 hold its place on the engine.
 
+**Non-streaming requests** are charged their whole `max_tokens` (else `default_output_tokens`)
+from admission, since their output is not seen until they finish. A client that sends a large
+`max_tokens` (often the context length) is charged up to the whole pool: it still runs, but
+nothing runs beside it. Prefer streaming, whose output is charged as it arrives, or a realistic
+`max_tokens`.
+
 **Engine restarts.** A readiness probe asks the engine's `/v1/models` every
 `readiness.interval` (5 s); the engine is ready while it lists a model. While it is not,
 requests wait in the queue rather than fail. Nothing is retried: a request that fails once it
