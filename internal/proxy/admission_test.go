@@ -9,7 +9,7 @@ import (
 // slotQueue is a queue on a known pool large enough that only max_active binds.
 func slotQueue(maxActive int) *AdmissionQueue {
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: maxActive})
-	q.SetPool(1001, 3200)
+	q.SetPool(1001, 3200, 0)
 	return q
 }
 
@@ -108,7 +108,7 @@ func TestAdmissionWaitsForThePool(t *testing.T) {
 		t.Fatal("admitted before the pool was known")
 	case <-time.After(50 * time.Millisecond):
 	}
-	q.SetPool(201, 3200)
+	q.SetPool(201, 3200, 0)
 	select {
 	case r := <-got:
 		r()
@@ -136,7 +136,7 @@ func TestAdmissionWaitingCountDrains(t *testing.T) {
 	if waiting() != 1 {
 		t.Fatalf("waiting=%d while queued", waiting())
 	}
-	q.SetPool(201, 3200)
+	q.SetPool(201, 3200, 0)
 	rel := <-first
 	if waiting() != 0 {
 		t.Fatalf("waiting=%d after admission from the queue", waiting())

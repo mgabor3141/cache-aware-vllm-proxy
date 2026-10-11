@@ -15,8 +15,8 @@
 // hash is mapped to a key through blocks the mirror has already seen; a block whose
 // parent is unknown (stored before the proxy subscribed) is skipped, which only makes the
 // mirror under-report hits. Blocks with extra_keys (images, LoRA, cache salt) hash with
-// those keys too, so token IDs alone never match them. Only full blocks are tracked: a
-// prompt's keys are built at one block size and match only blocks stored at that size.
+// those keys too, so token IDs alone never match them. A prompt's keys are built at one
+// block size and match only blocks stored at that size.
 //
 // Hybrid models (measured on Qwen3.8 Flash-Next, 2026-10-07): attention groups store a block as soon
 // as it is prefilled; each recurrent (mamba) group keeps a state checkpoint at about one
@@ -24,6 +24,37 @@
 // find_longest_cache_hit) takes the contiguous attention blocks, drops the last one when
 // speculative decoding is on (the EAGLE drop; MTP flags every group), then
 // the newest block at or below that where every mamba group holds a checkpoint.
+//
+// Unit hits. Engines that cache hybrid-model prefixes at a finer unit than the block
+// (vLLM's --prefix-match-unit; halt95's vLLM fork serves Qwen3.8 Flash-Next with
+// --block-size 4096 --prefix-match-unit 64) hash a prompt at every unit boundary, each
+// hash chained over the whole prefix, and register where each prompt ends as unit
+// entries. With speculative decoding that is an attention entry at the prompt's last unit
+// boundary q and a recurrent checkpoint one unit lower, at p = q - unit; without it, both
+// at the last unit boundary before the last token. Each is published as a BlockStored of
+// block_size = unit carrying the last unit of tokens before it, its parent being the hash
+// one unit lower. A later prompt that extends the prefix finds them: the engine
+// (single_type_kv_cache_manager.py FullAttentionManager.find_longest_cache_hit) matches
+// the contiguous full blocks, probes the unit boundaries inside the next block highest
+// first, drops one unit (not a block) for speculative decoding, and the recurrent groups
+// need a checkpoint there. A turn resuming at a previous turn's tail is so cached to, for
+// example, 2 blocks and 31 units (10,176 tokens) rather than 2 blocks.
+//
+// The parents of unit entries are spans the engine never announces, so the mirror cannot
+// chain them, and their tokens alone do not say where in a prompt they are (agent
+// conversations repeat themselves). The mirror therefore anchors unit hits on prompts it
+// has keyed: NewPromptKeys chains a key over every unit boundary of a prompt and
+// remembers, under the key at its end, the tokens of the entries the engine will register
+// there. A prompt hits at p when every full block before p's block is cached (the
+// engine's rule), its unit key at p + unit is a remembered end (so its whole prefix up to
+// there is that earlier prompt's), and the engine holds that end: an attention entry with
+// those tokens whose parent is a checkpoint with those tokens (at a block boundary, the
+// prompt's own cached block). An earlier prompt that ended on a block boundary has its
+// checkpoint one unit below the block's end and no attention entry. Without the
+// speculative drop one entry at p in every group stands for both. What is not verified is
+// that the engine's entries are that earlier prompt's and not another's ending in the same
+// two units; a prompt the mirror never keyed (sent around the proxy, or before it started)
+// gets no unit hit.
 package kvmirror
 
 import (
@@ -43,22 +74,63 @@ import (
 
 type BlockKey [16]byte
 
+// copies is what the engine holds under one hash: a bit per KV cache group holding at
+// least one copy, and the copies per group. vLLM can hold several physical blocks with one
+// hash (a hybrid model recomputes attention blocks past its last recurrent checkpoint),
+// and evicting one copy publishes BlockRemoved for the hash while another stays cached.
+type copies struct {
+	groups uint64
+	n      map[uint]int32
+}
+
+func (c *copies) add(g uint, n int32) {
+	if c.n == nil {
+		c.n = map[uint]int32{}
+	}
+	c.n[g] += n
+	c.groups |= 1 << g
+}
+
+// remove drops one copy of group g and reports whether any copy of any group is left.
+func (c *copies) remove(g uint) bool {
+	if c.n[g] > 1 {
+		c.n[g]--
+		return true
+	}
+	delete(c.n, g)
+	c.groups &^= 1 << g
+	return c.groups != 0
+}
+
 type mirrorBlock struct {
-	key    BlockKey
-	groups uint64 // bit per KV cache group holding at least one copy
-	// copies per group: vLLM can hold several physical blocks with one hash (a hybrid
-	// model recomputes attention blocks past its last recurrent checkpoint), and evicting
-	// one copy publishes BlockRemoved for the hash while another stays cached.
-	copies map[uint]int32
+	key BlockKey
+	copies
+}
+
+// unitEntry is one unit entry: where a prompt ended, in attention or recurrent groups.
+type unitEntry struct {
+	engine, parent uint64
+	hasParent      bool
+	content        uint64 // unitHash of its tokens
+	copies
 }
 
 type Mirror struct {
 	mu        sync.Mutex
-	blockSize int                     // set by SetBlockSize, else learned from the first stored block
+	blockSize int                     // set by SetGeometry, else learned from the first stored block
 	byEngine  map[uint64]*mirrorBlock // engine block hash -> block
 	byKey     map[BlockKey]*mirrorBlock
 	attnMask  uint64 // groups that are attention (need a contiguous prefix)
 	mambaMask uint64 // groups that are recurrent state (need the hit block only)
+	// unit is the engine's prefix-match unit from its metrics (SetGeometry); without it,
+	// eventUnit is the size of the first unit-sized blocks the events showed.
+	unit, eventUnit int
+	units           map[uint64]*unitEntry            // engine hash -> unit entry
+	unitsByContent  map[uint64]map[uint64]*unitEntry // unitHash -> engine hash -> unit entry
+	// tails are where prompts the mirror keyed end (NewPromptKeys): facts about prompts,
+	// not about the engine, so they outlive resets; the oldest go first.
+	tails     map[uint64]tail
+	tailOrder []uint64
 	lastSeq   int64
 	// After a replay, live delivery repeats the batches the replay already applied, once,
 	// in order, and at once (they queued while the replay ran): for overlapWindow after
@@ -71,35 +143,156 @@ type Mirror struct {
 	// generation counts resets: subscriptions, engine restarts, AllBlocksCleared.
 	generation uint64
 	sizeWarned bool // a block of another size than blockSize was logged
-	// dropLast applies the EAGLE last-block drop (speculative decoding on).
+	unitWarned bool // an unusable prefix_match_unit was logged
+	// dropLast applies the EAGLE drop (speculative decoding on): the last block, or the
+	// last unit of a unit hit.
 	dropLast bool
 	stats    Stats
 }
 
 // PromptKeys are a prompt's mirror keys: one chained key per full block, at the block
-// size they were built with. Keys built at another size than the mirror's match nothing.
+// size they were built with, and with a prefix-match unit one chained key per unit
+// boundary (Units[i] is the boundary (UnitsFrom+i+1)*Unit). Keys built at another block
+// size than the mirror's match nothing, at another unit no unit hit.
 type PromptKeys struct {
 	BlockSize int
 	Blocks    []BlockKey
+	Unit      int
+	UnitsFrom int
+	Units     []uint64
 }
 
-func (k PromptKeys) Empty() bool { return len(k.Blocks) == 0 }
+func (k PromptKeys) Empty() bool { return len(k.Blocks) == 0 && len(k.Units) == 0 }
+
+// unitKey returns the prompt's key at unit boundary x, if the keys hold it.
+func (k PromptKeys) unitKey(x int) (uint64, bool) {
+	i := x/k.Unit - 1 - k.UnitsFrom
+	if i < 0 || i >= len(k.Units) {
+		return 0, false
+	}
+	return k.Units[i], true
+}
+
+// Tail keeps only the unit keys from the prompt's last full block boundary on: where the
+// engine registers this prompt's own end, the one unit hit it can have once it has run.
+// Call it when the prompt is admitted, so a running request or an idle session keeps at
+// most a block's worth of unit keys (65 at 4096/64) whatever the prompt's length.
+func (k PromptKeys) Tail() PromptKeys {
+	if k.Unit <= 0 {
+		return k
+	}
+	from := len(k.Blocks)*k.BlockSize/k.Unit - 1
+	if cut := from - k.UnitsFrom; cut > 0 {
+		k.Units = append([]uint64(nil), k.Units[min(cut, len(k.Units)):]...)
+		k.UnitsFrom = from
+	}
+	return k
+}
+
+func unitHash(tokens []int64) uint64 {
+	h := sha256.New()
+	var b [8]byte
+	for _, t := range tokens {
+		binary.LittleEndian.PutUint64(b[:], uint64(t))
+		h.Write(b[:])
+	}
+	return binary.LittleEndian.Uint64(h.Sum(nil))
+}
+
+// tail is where the engine will register a prompt's end, keyed by the prompt's unit key
+// there: the token hashes of the unit before the attention entry (y) and of the one
+// before the checkpoint (x); without the speculative drop, x is the one entry's.
+type tail struct{ x, y uint64 }
+
+// maxTails bounds the prompt ends remembered: far more than an engine's cache holds.
+const maxTails = 1 << 15
 
 // NewPromptKeys computes a prompt's keys at the mirror's block size (none while it is
-// unknown).
+// unknown) and prefix-match unit, and remembers where the engine will register the
+// prompt's end, so a later prompt extending it can be matched there. Unit keys run up to
+// the last boundary a hit can use: the prompt's last full unit with the speculative drop,
+// else the last before its last token.
 func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
-	bs := m.BlockSize()
-	return PromptKeys{BlockSize: bs, Blocks: PromptBlockKeys(prompt, bs)}
+	m.mu.Lock()
+	bs, unit, drop := m.blockSize, m.unitLocked(), m.dropLast
+	m.mu.Unlock()
+	k := PromptKeys{BlockSize: bs, Blocks: PromptBlockKeys(prompt, bs)}
+	if unit <= 0 || bs <= 0 {
+		return k
+	}
+	limit := len(prompt)
+	if !drop {
+		limit--
+	}
+	k.Unit = unit
+	key := rootKey
+	for i := 0; (i+1)*unit <= limit; i++ {
+		key = chainKey(key, prompt[i*unit:(i+1)*unit], nil)
+		k.Units = append(k.Units, binary.LittleEndian.Uint64(key[:8]))
+	}
+	end := limit / unit * unit // the attention entry with the drop, else the one entry
+	switch {
+	case drop && end >= 2*unit:
+		m.rememberTail(k.Units[end/unit-1], tail{x: unitHash(prompt[end-2*unit : end-unit]), y: unitHash(prompt[end-unit : end])})
+	case !drop && end >= unit:
+		m.rememberTail(k.Units[end/unit-1], tail{x: unitHash(prompt[end-unit : end])})
+	}
+	return k
 }
 
-// SetBlockSize sets the engine's block size (from its metrics), so prompt keys are built
-// at the right size before the first event shows it.
-func (m *Mirror) SetBlockSize(blockSize int) {
+func (m *Mirror) rememberTail(key uint64, t tail) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if blockSize > 0 {
-		m.blockSize = blockSize
+	if _, ok := m.tails[key]; ok {
+		return
 	}
+	if len(m.tailOrder) == maxTails {
+		delete(m.tails, m.tailOrder[0])
+		m.tailOrder = m.tailOrder[1:]
+	}
+	m.tails[key] = t
+	m.tailOrder = append(m.tailOrder, key)
+}
+
+// SetGeometry sets the engine's block size and prefix-match unit (from its metrics), so
+// prompt keys are built right before the first event shows them. A unit that is not a
+// proper divisor of the block size is ignored (and logged once); 0 leaves the unit to
+// the events.
+func (m *Mirror) SetGeometry(blockSize, unit int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if blockSize <= 0 {
+		return
+	}
+	m.blockSize = blockSize
+	if unit > 0 && (unit >= blockSize || blockSize%unit != 0) {
+		if unit != blockSize && !m.unitWarned {
+			m.unitWarned = true
+			log.Printf("level=warn msg=\"prefix_match_unit is not a divisor of the block size: no unit hits\" prefix_match_unit=%d block_size=%d", unit, blockSize)
+		}
+		unit = 0
+	}
+	m.unit = unit
+}
+
+// unitLocked is the engine's prefix-match unit: from its metrics, else from its events;
+// 0 when there is none.
+func (m *Mirror) unitLocked() int {
+	if m.unit > 0 {
+		return m.unit
+	}
+	return m.eventUnit
+}
+
+// isUnitLocked reports whether blocks of size are unit entries. Without a unit from the
+// metrics, the first size that divides the block size is taken for the unit (until the
+// mirror resets).
+func (m *Mirror) isUnitLocked(size int) bool {
+	if m.unitLocked() == 0 && size < m.blockSize && m.blockSize%size == 0 {
+		m.eventUnit = size
+		log.Printf("level=info msg=\"kv events show a prefix-match unit\" unit=%d block_size=%d", size, m.blockSize)
+	}
+	return size == m.unitLocked()
 }
 
 type Stats struct {
@@ -107,7 +300,7 @@ type Stats struct {
 }
 
 func New() *Mirror {
-	m := &Mirror{dropLast: true}
+	m := &Mirror{dropLast: true, tails: map[uint64]tail{}}
 	m.resetLocked()
 	return m
 }
@@ -231,14 +424,23 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 	return true
 }
 
-// resetLocked forgets every block and what the groups are (a restarted engine may serve
-// another model); the block size set from metrics stays.
+// resetLocked forgets every block and unit entry, what the groups are and the unit the
+// events showed (a restarted engine may serve another model); the geometry set from
+// metrics stays.
 func (m *Mirror) resetLocked() {
+	m.clearLocked()
+	m.attnMask, m.mambaMask = 0, 0
+	m.eventUnit = 0
+	m.firstSeq, m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1, -1
+}
+
+// clearLocked forgets every block and unit entry.
+func (m *Mirror) clearLocked() {
 	m.generation++
 	m.byEngine = map[uint64]*mirrorBlock{}
 	m.byKey = map[BlockKey]*mirrorBlock{}
-	m.attnMask, m.mambaMask = 0, 0
-	m.firstSeq, m.lastSeq, m.replayedTo, m.liveSeq = -1, -1, -1, -1
+	m.units = map[uint64]*unitEntry{}
+	m.unitsByContent = map[uint64]map[uint64]*unitEntry{}
 }
 
 func (m *Mirror) applyLocked(e *Event) {
@@ -247,9 +449,7 @@ func (m *Mirror) applyLocked(e *Event) {
 	}
 	switch e.Type {
 	case "AllBlocksCleared":
-		m.generation++
-		m.byEngine = map[uint64]*mirrorBlock{}
-		m.byKey = map[BlockKey]*mirrorBlock{}
+		m.clearLocked()
 		m.stats.Cleared++
 	case "BlockRemoved":
 		if e.GroupIdx == nil {
@@ -258,21 +458,21 @@ func (m *Mirror) applyLocked(e *Event) {
 		g := uint(*e.GroupIdx)
 		for _, h := range e.BlockHashes {
 			u, ok := hashToUint(h)
-			b := m.byEngine[u]
-			if !ok || b == nil {
+			if !ok {
 				continue
 			}
-			m.stats.Removed++
-			if b.copies[g] > 1 {
-				b.copies[g]--
-				continue
-			}
-			delete(b.copies, g)
-			b.groups &^= 1 << g
-			if b.groups == 0 {
-				delete(m.byEngine, u)
-				if m.byKey[b.key] == b {
-					delete(m.byKey, b.key)
+			if b := m.byEngine[u]; b != nil {
+				m.stats.Removed++
+				if !b.remove(g) {
+					delete(m.byEngine, u)
+					if m.byKey[b.key] == b {
+						delete(m.byKey, b.key)
+					}
+				}
+			} else if f := m.units[u]; f != nil {
+				m.stats.Removed++
+				if !f.remove(g) {
+					m.dropUnitLocked(f)
 				}
 			}
 		}
@@ -289,14 +489,21 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		if m.blockSize == 0 {
 			m.blockSize = e.BlockSize
-		} else if e.BlockSize != m.blockSize && !m.sizeWarned {
-			// Keys are built at the engine's block size; blocks of another size never match.
-			m.sizeWarned = true
-			log.Printf("level=warn msg=\"kv events block size differs from the engine's: those blocks never match\" event_block_size=%d block_size=%d group=%d", e.BlockSize, m.blockSize, g)
 		}
 		if len(e.BlockHashes) == 0 {
 			m.stats.SkippedEmpty++
 			return
+		}
+		if e.BlockSize != m.blockSize {
+			if m.isUnitLocked(e.BlockSize) {
+				m.storeUnitsLocked(e, g)
+				return
+			}
+			if !m.sizeWarned {
+				// Keys are built at the engine's block size; blocks of another size never match.
+				m.sizeWarned = true
+				log.Printf("level=warn msg=\"kv events block size differs from the engine's and its unit: those blocks never match\" event_block_size=%d block_size=%d unit=%d group=%d", e.BlockSize, m.blockSize, m.unitLocked(), g)
+			}
 		}
 		parent := rootKey
 		if e.ParentBlockHash != nil {
@@ -327,13 +534,66 @@ func (m *Mirror) applyLocked(e *Event) {
 			}
 			b := m.byKey[key]
 			if b == nil {
-				b = &mirrorBlock{key: key, copies: map[uint]int32{}}
+				b = &mirrorBlock{key: key}
 				m.byKey[key] = b
 			}
 			m.byEngine[u] = b
-			b.copies[g]++
-			b.groups |= bit
+			b.add(g, 1)
 			m.stats.Stored++
+			if f := m.units[u]; f != nil {
+				// A unit entry at a block's end (a checkpoint there) has the block's hash:
+				// its copies are the block's.
+				for fg, n := range f.n {
+					b.add(fg, n)
+				}
+				m.dropUnitLocked(f)
+			}
+		}
+	}
+}
+
+// storeUnitsLocked records a unit-sized BlockStored. An entry whose hash is a known
+// block's (a checkpoint at a block's end) is a copy of that block; entries with extra
+// keys are skipped, as tokens alone never match them.
+func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
+	size := e.BlockSize
+	parent, hasParent := uint64(0), false
+	if e.ParentBlockHash != nil {
+		parent, hasParent = hashToUint(e.ParentBlockHash)
+	}
+	for i, h := range e.BlockHashes {
+		if (i+1)*size > len(e.TokenIDs) {
+			return
+		}
+		u, ok := hashToUint(h)
+		switch {
+		case !ok || i < len(e.ExtraKeys) && e.ExtraKeys[i] != nil:
+		case m.byEngine[u] != nil:
+			m.byEngine[u].add(g, 1)
+			m.stats.Stored++
+		default:
+			f := m.units[u]
+			if f == nil {
+				f = &unitEntry{engine: u, parent: parent, hasParent: hasParent, content: unitHash(e.TokenIDs[i*size : (i+1)*size])}
+				m.units[u] = f
+				if m.unitsByContent[f.content] == nil {
+					m.unitsByContent[f.content] = map[uint64]*unitEntry{}
+				}
+				m.unitsByContent[f.content][u] = f
+			}
+			f.add(g, 1)
+			m.stats.Stored++
+		}
+		parent, hasParent = u, ok
+	}
+}
+
+func (m *Mirror) dropUnitLocked(f *unitEntry) {
+	delete(m.units, f.engine)
+	if c := m.unitsByContent[f.content]; c != nil {
+		delete(c, f.engine)
+		if len(c) == 0 {
+			delete(m.unitsByContent, f.content)
 		}
 	}
 }
@@ -371,6 +631,9 @@ func (m *Mirror) Cached(k PromptKeys) int {
 		}
 		contiguous++
 	}
+	if hit := m.unitHitLocked(k, contiguous); hit > 0 {
+		return hit
+	}
 	if m.dropLast {
 		contiguous--
 	}
@@ -380,6 +643,78 @@ func (m *Mirror) Cached(k PromptKeys) int {
 		}
 	}
 	return 0
+}
+
+// unitHitLocked is the longest unit hit past c cached full blocks, or 0. Like the engine
+// it probes the unit boundaries q inside block c, highest first, and a boundary counts
+// only where a prompt the mirror keyed ended with this prompt's prefix (its unit key
+// there). With the speculative drop, the engine's attention entry at q, whose parent is a
+// checkpoint at q - unit, makes a hit at q - unit; failing those, q = c blocks is the
+// cached block itself and a checkpoint one unit below it is enough. Without the drop, an
+// entry at q in every group makes a hit at q. Engine entries are found by their tokens,
+// the checkpoint through the attention entry's parent. Any hit beats the block-level one,
+// which ends a block lower. The cost is a map lookup per boundary, and at a remembered
+// end one per engine entry holding the same tokens.
+func (m *Mirror) unitHitLocked(k PromptKeys, c int) int {
+	u, bs := k.Unit, k.BlockSize
+	if u <= 0 || u != m.unitLocked() || m.mambaMask == 0 || len(m.units) == 0 {
+		return 0
+	}
+	lowest := c * bs
+	if m.dropLast {
+		lowest = max(lowest, u) // the checkpoint is a unit below
+	}
+	for q := (c+1)*bs - u; q > lowest; q -= u {
+		key, ok := k.unitKey(q)
+		if !ok {
+			continue
+		}
+		t, ok := m.tails[key]
+		if !ok {
+			continue
+		}
+		if !m.dropLast {
+			if m.entryLocked(t.x, m.attnMask|m.mambaMask) {
+				return q
+			}
+			continue
+		}
+		for _, a := range m.unitsByContent[t.y] {
+			if a.groups&m.attnMask == m.attnMask && a.hasParent && m.checkpointLocked(k, a.parent, q-u, t.x) {
+				return q - u
+			}
+		}
+	}
+	if m.dropLast && c > 0 {
+		if key, ok := k.unitKey(c * bs); ok {
+			if t, ok := m.tails[key]; ok && m.entryLocked(t.x, m.mambaMask) {
+				return c*bs - u
+			}
+		}
+	}
+	return 0
+}
+
+// entryLocked reports whether a unit entry with these tokens is held in every group of mask.
+func (m *Mirror) entryLocked(content, mask uint64) bool {
+	for _, f := range m.unitsByContent[content] {
+		if f.groups&mask == mask {
+			return true
+		}
+	}
+	return false
+}
+
+// checkpointLocked reports whether the engine hash h is a checkpoint in every recurrent
+// group at the prompt's boundary p: a unit entry holding the tokens x, or at a block
+// boundary the prompt's own block ending there.
+func (m *Mirror) checkpointLocked(k PromptKeys, h uint64, p int, x uint64) bool {
+	if p%k.BlockSize == 0 {
+		b := m.byEngine[h]
+		return b != nil && b.key == k.Blocks[p/k.BlockSize-1] && b.groups&m.mambaMask == m.mambaMask
+	}
+	f := m.units[h]
+	return f != nil && f.content == x && f.groups&m.mambaMask == m.mambaMask
 }
 
 // BlockSize is the engine's block size once set or shown by an event, else 0.
@@ -399,6 +734,8 @@ type Status struct {
 	Connected     bool    `json:"connected"`
 	Blocks        int     `json:"blocks"`
 	BlockSize     int     `json:"block_size"`
+	Unit          int     `json:"unit"`
+	UnitEntries   int     `json:"unit_entries"`
 	LastEventAgeS float64 `json:"last_event_age_s"`
 	Stats         Stats   `json:"stats"`
 }
@@ -406,7 +743,7 @@ type Status struct {
 func (m *Mirror) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := Status{Connected: m.connected, Blocks: len(m.byKey), BlockSize: m.blockSize, Stats: m.stats}
+	s := Status{Connected: m.connected, Blocks: len(m.byKey), BlockSize: m.blockSize, Unit: m.unitLocked(), UnitEntries: len(m.units), Stats: m.stats}
 	if !m.lastEvent.IsZero() {
 		s.LastEventAgeS = time.Since(m.lastEvent).Seconds()
 	}

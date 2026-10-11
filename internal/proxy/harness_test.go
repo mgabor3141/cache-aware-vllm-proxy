@@ -106,7 +106,7 @@ func newHarnessEngine(t *testing.T, engine http.Handler, mutate func(*Config)) *
 		t.Fatal(err)
 	}
 	p.ready.set(true, "")
-	p.admission.SetPool(1000, 16) // as the engine pool loop would; until then nothing is admitted
+	p.admission.SetPool(1000, 16, 0) // as the engine pool loop would; until then nothing is admitted
 	srv := httptest.NewServer(p)
 	t.Cleanup(srv.Close)
 	return &harness{t: t, p: p, srv: srv, eng: eng, logs: logs}

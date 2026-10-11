@@ -44,7 +44,7 @@ func newCacheQueuePool(t *testing.T, pool int, mutate func(*AdmissionConfig)) (*
 	if err := q.cfg.validate(); err != nil {
 		t.Fatal(err)
 	}
-	q.SetPool(pool/3200+1, 3200)
+	q.SetPool(pool/3200+1, 3200, 0)
 	clk := &fakeClock{t: time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)}
 	q.now = clk.now
 	return q, clk
@@ -463,18 +463,21 @@ func TestCacheAdmissionPriorityDisplacesBestFit(t *testing.T) {
 func TestParseEnginePool(t *testing.T) {
 	m := "# HELP x\nvllm:num_requests_running{engine=\"0\"} 0.0\n" +
 		`vllm:cache_config_info{_block_size_resolved="True",block_size="3200",mamba_block_size="16",num_gpu_blocks="201",num_gpu_blocks_override="None",prefix_match_unit="64"} 1.0` + "\n"
-	b, s, err := parseEnginePool(strings.NewReader(m))
-	if err != nil || b != 201 || s != 3200 {
-		t.Fatalf("got %d x %d, %v", b, s, err)
+	b, s, u, err := parseEnginePool(strings.NewReader(m))
+	if err != nil || b != 201 || s != 3200 || u != 64 {
+		t.Fatalf("got %d x %d unit %d, %v", b, s, u, err)
 	}
-	if _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
+	if _, _, u, _ := parseEnginePool(strings.NewReader(strings.Replace(m, `prefix_match_unit="64"`, `prefix_match_unit="None"`, 1))); u != 0 {
+		t.Fatalf("unit None read as %d", u)
+	}
+	if _, _, _, err := parseEnginePool(strings.NewReader("vllm:x 1\n")); err == nil {
 		t.Fatal("want an error without cache_config_info")
 	}
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8})
 	if q.budget() != 0 {
 		t.Fatal("pool should be unknown before SetPool")
 	}
-	q.SetPool(201, 3200)
+	q.SetPool(201, 3200, 0)
 	if q.budget() != 640000 {
 		t.Fatalf("budget %d, want 200 blocks x 3200", q.budget())
 	}
@@ -891,10 +894,11 @@ func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 	}()
 	waitForQueued(t, q, 1)
 	storePrompt(q.mirror, 1, prompt, 1)
-	q.SetPool(223, 3200)
+	q.SetPool(223, 3200, 0)
 	rel := <-got
 	defer rel()
 	if rep.PredictedCached != 19*3200 {
 		t.Fatalf("predicted cached %d, want %d", rep.PredictedCached, 19*3200)
 	}
 }
+

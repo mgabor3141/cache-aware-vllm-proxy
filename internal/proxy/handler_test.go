@@ -522,14 +522,14 @@ func TestWriteDeadlineClearedForNextRequest(t *testing.T) {
 // Until the engine's KV pool is known nothing is admitted: requests wait, then run.
 func TestRequestsWaitForThePool(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(realVLLMChatResponse)) }, nil)
-	h.p.admission.SetPool(0, 16)
+	h.p.admission.SetPool(0, 16, 0)
 	done := make(chan int)
 	go func() {
 		code, _ := h.do("POST", "/v1/chat/completions", chatBody, nil)
 		done <- code
 	}()
 	waitFor(t, "queued", func() bool { return h.p.admission.Snapshot().Queued == 1 })
-	h.p.admission.SetPool(1000, 16)
+	h.p.admission.SetPool(1000, 16, 0)
 	if code := <-done; code != 200 {
 		t.Fatalf("status %d", code)
 	}

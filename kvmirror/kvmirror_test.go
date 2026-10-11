@@ -276,7 +276,7 @@ func TestKVMirrorKeysAtAnotherBlockSizeMatchNothing(t *testing.T) {
 	if got := m.Cached(keys); got != 8 {
 		t.Fatalf("cached %d, want 8", got)
 	}
-	m.SetBlockSize(8)
+	m.SetGeometry(8, 0)
 	if got := m.Cached(keys); got != 0 {
 		t.Fatalf("keys built at 4 read %d under block size 8", got)
 	}
@@ -398,15 +398,16 @@ func TestKVMirrorRestartInsideReplayedRange(t *testing.T) {
 	check(m)
 }
 
-// Blocks stored at another size than the engine's (metrics and events disagreeing) can
-// never match a prompt's keys; that is logged once instead of silently reading 0
-// (review 3, rev-2 #5).
+// Blocks stored at another size than the engine's block size and unit (metrics and events
+// disagreeing) can never match a prompt's keys; that is logged once instead of silently
+// reading 0 (review 3, rev-2 #5). Unit-sized blocks are not a mismatch
+// (TestKVMirrorUnitHitDeployedShape).
 func TestKVMirrorWarnsOnBlockSizeMismatch(t *testing.T) {
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
 	defer log.SetOutput(os.Stderr)
 	m := New()
-	m.SetBlockSize(8)
+	m.SetGeometry(8, 2) // 4 is neither the block size nor the unit
 	toks := seqPrompt(9)
 	m.Apply(-1, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
 	if n := strings.Count(logs.String(), "block size differs"); n != 1 {

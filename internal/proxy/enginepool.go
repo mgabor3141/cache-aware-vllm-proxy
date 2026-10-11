@@ -18,14 +18,17 @@ import (
 //	vllm:cache_config_info{block_size="3200",...,num_gpu_blocks="201",...} 1.0
 //
 // It changes only when the engine restarts with a different model or cache size, so a
-// slow refresh is enough. Until it is known, nothing is admitted.
+// slow refresh is enough. Until it is known, nothing is admitted. An engine that caches
+// at a finer unit than the block (--prefix-match-unit) shows it as prefix_match_unit;
+// "None" or a missing label reads as 0, and the mirror then takes the unit from its events.
 
 var (
 	poolBlocksRe = regexp.MustCompile(`[{,]num_gpu_blocks="(\d+)"`)
 	poolSizeRe   = regexp.MustCompile(`[{,]block_size="(\d+)"`)
+	poolUnitRe   = regexp.MustCompile(`[{,]prefix_match_unit="(\d+)"`)
 )
 
-func parseEnginePool(r io.Reader) (blocks, blockSize int, err error) {
+func parseEnginePool(r io.Reader) (blocks, blockSize, unit int, err error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -35,35 +38,38 @@ func parseEnginePool(r io.Reader) (blocks, blockSize int, err error) {
 		}
 		b, s := poolBlocksRe.FindStringSubmatch(l), poolSizeRe.FindStringSubmatch(l)
 		if b == nil || s == nil {
-			return 0, 0, fmt.Errorf("cache_config_info without num_gpu_blocks or block_size")
+			return 0, 0, 0, fmt.Errorf("cache_config_info without num_gpu_blocks or block_size")
 		}
 		blocks, _ = strconv.Atoi(b[1])
 		blockSize, _ = strconv.Atoi(s[1])
-		if blocks <= 0 || blockSize <= 0 {
-			return 0, 0, fmt.Errorf("cache_config_info: %d blocks of %d", blocks, blockSize)
+		if u := poolUnitRe.FindStringSubmatch(l); u != nil {
+			unit, _ = strconv.Atoi(u[1])
 		}
-		return blocks, blockSize, nil
+		if blocks <= 0 || blockSize <= 0 {
+			return 0, 0, 0, fmt.Errorf("cache_config_info: %d blocks of %d", blocks, blockSize)
+		}
+		return blocks, blockSize, unit, nil
 	}
 	if err := sc.Err(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return 0, 0, fmt.Errorf("no vllm:cache_config_info in metrics")
+	return 0, 0, 0, fmt.Errorf("no vllm:cache_config_info in metrics")
 }
 
-func fetchEnginePool(ctx context.Context, upstream string) (int, int, error) {
+func fetchEnginePool(ctx context.Context, upstream string) (blocks, blockSize, unit int, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream+"/metrics", nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("metrics: %s", resp.Status)
+		return 0, 0, 0, fmt.Errorf("metrics: %s", resp.Status)
 	}
 	return parseEnginePool(resp.Body)
 }
@@ -136,20 +142,20 @@ func fetchPreemptions(ctx context.Context, upstream string) (preemptions map[str
 // runEnginePool keeps q's pool current: every 10 s until known, then every minute. A
 // failed read keeps the last value (the engine restarting looks like this).
 func runEnginePool(ctx context.Context, upstream string, q *AdmissionQueue) {
-	var last [2]int
+	var last [3]int
 	for {
 		wait := time.Minute
-		blocks, size, err := fetchEnginePool(ctx, upstream)
+		blocks, size, unit, err := fetchEnginePool(ctx, upstream)
 		switch {
 		case err != nil:
 			if last[0] == 0 {
 				wait = 10 * time.Second
 				log.Printf("level=warn msg=\"engine KV pool unknown, requests wait\" err=%q", err.Error())
 			}
-		case [2]int{blocks, size} != last:
-			last = [2]int{blocks, size}
-			q.SetPool(blocks, size)
-			log.Printf("level=info msg=\"engine KV pool\" blocks=%d block_size=%d tokens=%d", blocks, size, (blocks-1)*size)
+		case [3]int{blocks, size, unit} != last:
+			last = [3]int{blocks, size, unit}
+			q.SetPool(blocks, size, unit)
+			log.Printf("level=info msg=\"engine KV pool\" blocks=%d block_size=%d prefix_match_unit=%d tokens=%d", blocks, size, unit, (blocks-1)*size)
 		}
 		select {
 		case <-ctx.Done():

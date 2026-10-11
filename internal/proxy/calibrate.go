@@ -44,7 +44,7 @@ func calibrate(cfg *Config, out io.Writer) error {
 	up := strings.TrimRight(cfg.Upstream, "/")
 	c := &calClient{up: up, http: &http.Client{Timeout: 10 * time.Minute}, key: os.Getenv("VLLM_API_KEY")}
 
-	blocks, blockSize, err := fetchEnginePool(ctx, up)
+	blocks, blockSize, _, err := fetchEnginePool(ctx, up)
 	if err != nil {
 		return fmt.Errorf("engine pool: %w", err)
 	}

@@ -165,11 +165,12 @@ func (q *AdmissionQueue) block() int { return q.blockSize }
 func (q *AdmissionQueue) budget() int { return q.roundDown(q.pool) }
 
 // SetPool records the engine's block pool (vllm:cache_config_info num_gpu_blocks x
-// block_size). One block is the engine's reserved null block.
-func (q *AdmissionQueue) SetPool(blocks, blockSize int) {
+// block_size). One block is the engine's reserved null block. unit is its prefix_match_unit
+// (0: none, or not shown), which the mirror needs to match unit hits.
+func (q *AdmissionQueue) SetPool(blocks, blockSize, unit int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.mirror.SetBlockSize(blockSize)
+	q.mirror.SetGeometry(blockSize, unit)
 	q.pool = max(blocks-1, 0) * blockSize
 	q.blockSize = blockSize
 	q.grantLocked()

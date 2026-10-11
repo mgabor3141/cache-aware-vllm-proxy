@@ -25,7 +25,7 @@ func tokenizeProxy(t *testing.T, tokenize http.HandlerFunc) (*Proxy, *atomic.Val
 	}))
 	u, _ := url.Parse(up.URL)
 	q := NewAdmissionQueue(AdmissionConfig{Cache: CacheConfig{KVEventsEndpoint: "tcp://127.0.0.1:1"}})
-	q.SetPool(1000, 4)
+	q.SetPool(1000, 4, 0)
 	return &Proxy{upstream: u, admission: q, tokenizeClient: &http.Client{}, tokenizeSem: make(chan struct{}, 4)}, seen
 }
 
