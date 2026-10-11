@@ -407,18 +407,23 @@ type displacement struct {
 	tokens int
 }
 
-// needLocked is how many held tokens w would have to displace to run now; <= 0 when it
-// fits beside running work and holds.
-func (q *AdmissionQueue) needLocked(w *admissionWaiter, now time.Time) int {
-	budget := q.budget()
-	charge := min(q.chargeLocked(w), budget)
-	free := budget - q.cacheUsedLocked(now)
+// addsLocked is the room w would add to the modelled use if admitted now: its charge, of
+// which its session's hold already covers part, clamped to the budget so a request larger
+// than the pool can still run alone.
+func (q *AdmissionQueue) addsLocked(w *admissionWaiter) int {
+	charge := min(q.chargeLocked(w), q.budget())
 	if own := q.sessions[w.session]; own != nil && own.held > 0 {
 		// The session is charged the larger of its hold and its running requests.
 		run := q.sessionRunningLocked(own)
 		charge = max(own.held, run+charge) - max(own.held, run)
 	}
-	return charge - free
+	return charge
+}
+
+// needLocked is how many held tokens w would have to displace to run now; <= 0 when it
+// fits beside running work and holds.
+func (q *AdmissionQueue) needLocked(w *admissionWaiter, now time.Time) int {
+	return q.addsLocked(w) - (q.budget() - q.cacheUsedLocked(now))
 }
 
 // holdFor is how long an idle hold is firm: as long as its re-prefill would take, with
@@ -458,7 +463,13 @@ func (q *AdmissionQueue) tier(w *admissionWaiter, cached int, now time.Time) int
 // A higher priority may displace any lower-priority idle hold. Otherwise only expendable
 // holds (past holdFor, owner not waiting) go, and only while the engine is under-used.
 func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved int) (plan []displacement, ok bool) {
-	need := q.needLocked(w, now) + reserved
+	// A waiter its session's hold already covers takes no room: reservations do not hold
+	// it back.
+	adds := q.addsLocked(w)
+	if adds <= 0 {
+		return nil, true
+	}
+	need := adds - (q.budget() - q.cacheUsedLocked(now)) + reserved
 	if need <= 0 {
 		return nil, true
 	}
@@ -510,7 +521,7 @@ func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved i
 // queueing happens here; the engine is never sent more than it can run, and nothing
 // until its pool is known. A waiter that
 // does not fit reserves the room it still needs, so later waiters use only what is left
-// beyond it and cannot starve it.
+// beyond it and cannot starve it (unless it cannot run at all; see the reservation below).
 func (q *AdmissionQueue) grantLocked() {
 	if q.budget() == 0 {
 		return
@@ -541,6 +552,7 @@ func (q *AdmissionQueue) grantLocked() {
 		return a.w.sequence < b.w.sequence
 	})
 	reserved := 0
+	var heldAbove map[int]int // held tokens by priority, built at the first blocked waiter
 	for _, o := range order {
 		if q.active >= q.cfg.MaxActive {
 			return
@@ -548,7 +560,28 @@ func (q *AdmissionQueue) grantLocked() {
 		w := o.w
 		plan, ok := q.fitLocked(w, now, reserved)
 		if !ok {
-			reserved += max(q.needLocked(w, now), 0)
+			// A blocked waiter reserves the room it still needs, so later work cannot starve
+			// it, unless it cannot run even once everything it may displace is gone: its
+			// charge exceeds the budget less the holds of higher priority. Holding room back
+			// for it would protect nothing.
+			if heldAbove == nil {
+				heldAbove = map[int]int{}
+				for _, s := range q.sessions {
+					heldAbove[s.priority] += s.held
+				}
+			}
+			ever := q.budget()
+			for p, h := range heldAbove {
+				if p < w.priority {
+					ever -= h
+				}
+			}
+			if own := q.sessions[w.session]; own != nil && own.priority < w.priority {
+				ever += own.held
+			}
+			if q.chargeLocked(w) <= ever {
+				reserved += max(q.needLocked(w, now), 0)
+			}
 			continue
 		}
 		displaced, cost := 0, 0.0

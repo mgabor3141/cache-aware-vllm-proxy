@@ -102,6 +102,10 @@ left it; a turn that ends without usage (client gone, engine error) keeps the pr
 **Order.** Priority first (lower runs first, as in vLLM). Then a waiter whose prompt is at least
 half cached, or whose own conversation holds its context; then small prompts; then cold ones; each
 by arrival. A blocked waiter reserves the room it still needs, so smaller work cannot starve it.
+Two exceptions: a waiter that could not run even with every hold it may displace gone (larger
+than the pool less the holds of higher priority) reserves nothing, as holding room back for it
+protects nothing; and a request its conversation's hold already covers takes no room, so no
+reservation holds it back.
 
 **Eviction.** An expendable hold is displaced only while fewer than 4 requests run. On a busy
 engine displacing a context only adds prefill work.

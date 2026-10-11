@@ -146,3 +146,49 @@ func TestDisplacementVictimsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// A waiter that can never run beside the holds it may not displace reserves nothing, so
+// work behind it that fits is admitted (attacker #2, fairness #1).
+func TestUnsatisfiableWaiterReservesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prompt int
+	}{
+		{"larger than the pool", 900000},
+		{"larger than the pool less higher-priority holds", 500000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, _ := newCacheQueue(t, nil)
+			th := q.start("h", 0, 300000)
+			th.finish(mustAdmit(t, th, "h"), 300000, 0) // a priority-0 hold of 300800
+			r1 := mustAdmit(t, q.start("r1", 0, 1000), "r1")
+			big := q.start("big", 5, tc.prompt)
+			mustWait(t, big, "big")
+			cold := q.start("cold", 5, 100000) // fits in the 313600 free
+			rel := cold.waitAdmitted(time.Second)
+			if rel == nil {
+				t.Fatal("cold work that fits is held back by a waiter that can never run")
+			}
+			rel()
+			r1()
+		})
+	}
+}
+
+// A request its session's hold already covers takes no room, so other waiters'
+// reservations do not hold it back.
+func TestCoveredRequestIgnoresReservations(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	ta := q.start("a", 0, 300000)
+	ta.finish(mustAdmit(t, ta, "a"), 300000, 0)
+	r1 := mustAdmit(t, q.start("r1", 0, 1000), "r1")
+	w1 := q.start("w1", 0, 600000) // waits for r1, reserving more than is free
+	mustWait(t, w1, "w1")
+	side := q.start("a", 1, 2000)
+	rel := side.waitAdmitted(time.Second)
+	if rel == nil {
+		t.Fatal("a's side call, covered by its own hold, is held back by w1's reservation")
+	}
+	rel()
+	r1()
+}
