@@ -73,7 +73,9 @@ an earlier version of the matching had a median and p90 error of 0 under the sam
 
 The mirror is only as good as the stream. On every (re)subscription it starts empty and rebuilds
 from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
-replay that fails ends the subscription so it is retried. A sequence number that goes backwards
+replay that fails ends the subscription so it is retried. Batches missing from the replay
+buffer, or that cannot be decoded, are skipped (the mirror under-reports what they stored)
+rather than failing every retry. A sequence number that goes backwards
 outside the replay overlap means the engine restarted, and the mirror starts over. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
 a restart, or older than the replay buffer reaches) is released.
