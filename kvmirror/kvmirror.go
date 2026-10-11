@@ -42,19 +42,20 @@
 //
 // The parents of unit entries are spans the engine never announces, so the mirror cannot
 // chain them, and their tokens alone do not say where in a prompt they are (agent
-// conversations repeat themselves). The mirror therefore anchors unit hits on prompts it
-// has keyed: NewPromptKeys chains a key over every unit boundary of a prompt and
-// remembers, under the key at its end, the tokens of the entries the engine will register
-// there. A prompt hits at p when every full block before p's block is cached (the
-// engine's rule), its unit key at p + unit is a remembered end (so its whole prefix up to
-// there is that earlier prompt's), and the engine holds that end: an attention entry with
-// those tokens whose parent is a checkpoint with those tokens (at a block boundary, the
-// prompt's own cached block). An earlier prompt that ended on a block boundary has its
-// checkpoint one unit below the block's end and no attention entry. Without the
-// speculative drop one entry at p in every group stands for both. What is not verified is
-// that the engine's entries are that earlier prompt's and not another's ending in the same
-// two units; a prompt the mirror never keyed (sent around the proxy, or before it started)
-// gets no unit hit.
+// conversations repeat themselves). The mirror therefore anchors unit entries on prompts
+// it has keyed: NewPromptKeys chains a key over every unit boundary of a prompt and
+// remembers, under its keys at the two boundaries where it ends, the tokens of the entries
+// the engine will register there. Cached then follows the engine. The attention groups
+// reach through the contiguous cached full blocks, and further to the highest remembered
+// end inside the next block whose attention entry the engine holds; the speculative drop
+// takes one unit off that. The hit is the newest boundary at or below it where every
+// recurrent group has a checkpoint: a cached block's end, or a remembered end whose
+// checkpoint entry the engine holds, in any block. A turn whose predecessor's decode
+// filled the block it ended in reaches past that block (the decoded block matches) and
+// resumes at the checkpoint below it. Unit matching only adds boundaries, so a prediction
+// is never below the block-level rule's. What is not verified is that the engine's entries
+// are that earlier prompt's and not another's with the same unit of tokens; a prompt the
+// mirror never keyed (sent around the proxy, or before it started) gets no unit hit.
 package kvmirror
 
 import (
@@ -109,9 +110,8 @@ type mirrorBlock struct {
 
 // unitEntry is one unit entry: where a prompt ended, in attention or recurrent groups.
 type unitEntry struct {
-	engine, parent uint64
-	hasParent      bool
-	content        uint64 // unitHash of its tokens
+	engine  uint64
+	content uint64 // unitHash of its tokens
 	copies
 }
 
@@ -129,7 +129,7 @@ type Mirror struct {
 	unitsByContent  map[uint64]map[uint64]*unitEntry // unitHash -> engine hash -> unit entry
 	// tails are where prompts the mirror keyed end (NewPromptKeys): facts about prompts,
 	// not about the engine, so they outlive resets; the oldest go first.
-	tails     map[uint64]tail
+	tails     map[uint64]end
 	tailOrder []uint64
 	lastSeq   int64
 	// After a replay, live delivery repeats the batches the replay already applied, once,
@@ -173,15 +173,15 @@ func (k PromptKeys) unitKey(x int) (uint64, bool) {
 	return k.Units[i], true
 }
 
-// Tail keeps only the unit keys from the prompt's last full block boundary on: where the
-// engine registers this prompt's own end, the one unit hit it can have once it has run.
-// Call it when the prompt is admitted, so a running request or an idle session keeps at
-// most a block's worth of unit keys (65 at 4096/64) whatever the prompt's length.
+// Tail keeps only the unit keys from a unit below the prompt's last full block boundary
+// on: where the engine registers this prompt's own end, the one unit hit it can have once
+// it has run. Call it when the prompt is admitted, so a running request or an idle session
+// keeps at most a block's worth of unit keys (66 at 4096/64) whatever the prompt's length.
 func (k PromptKeys) Tail() PromptKeys {
 	if k.Unit <= 0 {
 		return k
 	}
-	from := len(k.Blocks)*k.BlockSize/k.Unit - 1
+	from := len(k.Blocks)*k.BlockSize/k.Unit - 2
 	if cut := from - k.UnitsFrom; cut > 0 {
 		k.Units = append([]uint64(nil), k.Units[min(cut, len(k.Units)):]...)
 		k.UnitsFrom = from
@@ -199,10 +199,14 @@ func unitHash(tokens []int64) uint64 {
 	return binary.LittleEndian.Uint64(h.Sum(nil))
 }
 
-// tail is where the engine will register a prompt's end, keyed by the prompt's unit key
-// there: the token hashes of the unit before the attention entry (y) and of the one
-// before the checkpoint (x); without the speculative drop, x is the one entry's.
-type tail struct{ x, y uint64 }
+// end is an entry the engine will register where a prompt ends, keyed by the prompt's
+// unit key at its boundary: the token hash of the unit before the boundary (what the
+// entry's BlockStored carries), and whether it is the attention entry, the checkpoint,
+// or both (without the speculative drop they share the boundary).
+type end struct {
+	content    uint64
+	attn, ckpt bool
+}
 
 // maxTails bounds the prompt ends remembered: far more than an engine's cache holds.
 const maxTails = 1 << 15
@@ -230,27 +234,31 @@ func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
 		key = chainKey(key, prompt[i*unit:(i+1)*unit], nil)
 		k.Units = append(k.Units, binary.LittleEndian.Uint64(key[:8]))
 	}
-	end := limit / unit * unit // the attention entry with the drop, else the one entry
-	switch {
-	case drop && end >= 2*unit:
-		m.rememberTail(k.Units[end/unit-1], tail{x: unitHash(prompt[end-2*unit : end-unit]), y: unitHash(prompt[end-unit : end])})
-	case !drop && end >= unit:
-		m.rememberTail(k.Units[end/unit-1], tail{x: unitHash(prompt[end-unit : end])})
+	q := limit / unit * unit // the attention entry; with the drop the checkpoint is a unit lower
+	p := q
+	if drop {
+		p -= unit
+	}
+	if p >= unit {
+		m.mu.Lock()
+		m.rememberLocked(k.Units[q/unit-1], unitHash(prompt[q-unit:q]), true, false)
+		m.rememberLocked(k.Units[p/unit-1], unitHash(prompt[p-unit:p]), false, true)
+		m.mu.Unlock()
 	}
 	return k
 }
 
-func (m *Mirror) rememberTail(key uint64, t tail) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.tails[key]; ok {
+func (m *Mirror) rememberLocked(key, content uint64, attn, ckpt bool) {
+	if e, ok := m.tails[key]; ok {
+		e.attn, e.ckpt = e.attn || attn, e.ckpt || ckpt
+		m.tails[key] = e
 		return
 	}
 	if len(m.tailOrder) == maxTails {
 		delete(m.tails, m.tailOrder[0])
 		m.tailOrder = m.tailOrder[1:]
 	}
-	m.tails[key] = t
+	m.tails[key] = end{content: content, attn: attn, ckpt: ckpt}
 	m.tailOrder = append(m.tailOrder, key)
 }
 
@@ -300,7 +308,7 @@ type Stats struct {
 }
 
 func New() *Mirror {
-	m := &Mirror{dropLast: true, tails: map[uint64]tail{}}
+	m := &Mirror{dropLast: true, tails: map[uint64]end{}}
 	m.resetLocked()
 	return m
 }
@@ -557,10 +565,6 @@ func (m *Mirror) applyLocked(e *Event) {
 // keys are skipped, as tokens alone never match them.
 func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 	size := e.BlockSize
-	parent, hasParent := uint64(0), false
-	if e.ParentBlockHash != nil {
-		parent, hasParent = hashToUint(e.ParentBlockHash)
-	}
 	for i, h := range e.BlockHashes {
 		if (i+1)*size > len(e.TokenIDs) {
 			return
@@ -574,7 +578,7 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 		default:
 			f := m.units[u]
 			if f == nil {
-				f = &unitEntry{engine: u, parent: parent, hasParent: hasParent, content: unitHash(e.TokenIDs[i*size : (i+1)*size])}
+				f = &unitEntry{engine: u, content: unitHash(e.TokenIDs[i*size : (i+1)*size])}
 				m.units[u] = f
 				if m.unitsByContent[f.content] == nil {
 					m.unitsByContent[f.content] = map[uint64]*unitEntry{}
@@ -584,7 +588,6 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 			f.add(g, 1)
 			m.stats.Stored++
 		}
-		parent, hasParent = u, ok
 	}
 }
 
@@ -616,105 +619,93 @@ func PromptBlockKeys(prompt []int64, blockSize int) []BlockKey {
 }
 
 // Cached returns how many leading tokens of a prompt the engine would serve from its
-// prefix cache now.
+// prefix cache now. As the engine does, it finds how far the attention groups reach (the
+// contiguous full blocks, with a prefix-match unit then the unit boundaries of the next
+// block, highest first), drops one block (one unit with a unit) for speculative decoding,
+// and returns the newest boundary at or below that where every recurrent group holds a
+// checkpoint: a cached block's end, or with a unit a remembered prompt end whose
+// checkpoint the engine holds, in any block below the reach. Unit matching only adds
+// boundaries to the block-level rule, so it never predicts less.
 func (m *Mirror) Cached(k PromptKeys) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if k.BlockSize <= 0 || k.BlockSize != m.blockSize || m.attnMask == 0 {
 		return 0
 	}
-	contiguous := 0
+	bs := k.BlockSize
+	c := 0
 	for _, key := range k.Blocks {
 		b := m.byKey[key]
 		if b == nil || b.groups&m.attnMask != m.attnMask {
 			break
 		}
-		contiguous++
+		c++
 	}
-	if hit := m.unitHitLocked(k, contiguous); hit > 0 {
-		return hit
+	step := bs
+	if k.Unit > 0 && k.Unit == m.unitLocked() && m.mambaMask != 0 {
+		step = k.Unit // vLLM serves unit hits only to hybrid models (aligned recurrent state)
 	}
-	if m.dropLast {
-		contiguous--
+	reach := c * bs
+	if step < bs {
+		reach = max(reach, m.attentionReachLocked(k, c))
 	}
-	for n := contiguous; n > 0; n-- {
-		if m.mambaMask == 0 || m.byKey[k.Blocks[n-1]].groups&m.mambaMask == m.mambaMask {
-			return n * k.BlockSize
+	if m.dropLast && reach > 0 {
+		reach -= step
+	}
+	for x := reach / step * step; x > 0; x -= step {
+		if m.checkpointLocked(k, x) {
+			return x
 		}
 	}
 	return 0
 }
 
-// unitHitLocked is the longest unit hit past c cached full blocks, or 0. Like the engine
-// it probes the unit boundaries q inside block c, highest first, and a boundary counts
-// only where a prompt the mirror keyed ended with this prompt's prefix (its unit key
-// there). With the speculative drop, the engine's attention entry at q, whose parent is a
-// checkpoint at q - unit, makes a hit at q - unit; failing those, q = c blocks is the
-// cached block itself and a checkpoint one unit below it is enough. Without the drop, an
-// entry at q in every group makes a hit at q. Engine entries are found by their tokens,
-// the checkpoint through the attention entry's parent. Any hit beats the block-level one,
-// which ends a block lower. The cost is a map lookup per boundary, and at a remembered
-// end one per engine entry holding the same tokens.
-func (m *Mirror) unitHitLocked(k PromptKeys, c int) int {
+// attentionReachLocked is the highest remembered prompt end inside block c (past the c
+// cached full blocks) whose attention entry the engine holds, or 0.
+func (m *Mirror) attentionReachLocked(k PromptKeys, c int) int {
 	u, bs := k.Unit, k.BlockSize
-	if u <= 0 || u != m.unitLocked() || m.mambaMask == 0 || len(m.units) == 0 {
-		return 0
-	}
-	lowest := c * bs
-	if m.dropLast {
-		lowest = max(lowest, u) // the checkpoint is a unit below
-	}
-	for q := (c+1)*bs - u; q > lowest; q -= u {
-		key, ok := k.unitKey(q)
-		if !ok {
-			continue
-		}
-		t, ok := m.tails[key]
-		if !ok {
-			continue
-		}
-		if !m.dropLast {
-			if m.entryLocked(t.x, m.attnMask|m.mambaMask) {
-				return q
-			}
-			continue
-		}
-		for _, a := range m.unitsByContent[t.y] {
-			if a.groups&m.attnMask == m.attnMask && a.hasParent && m.checkpointLocked(k, a.parent, q-u, t.x) {
-				return q - u
-			}
-		}
-	}
-	if m.dropLast && c > 0 {
-		if key, ok := k.unitKey(c * bs); ok {
-			if t, ok := m.tails[key]; ok && m.entryLocked(t.x, m.mambaMask) {
-				return c*bs - u
-			}
+	for q := (c+1)*bs - u; q > c*bs; q -= u {
+		if e, ok := m.endLocked(k, q); ok && e.attn && m.heldLocked(e.content, m.attnMask) {
+			return q
 		}
 	}
 	return 0
 }
 
-// entryLocked reports whether a unit entry with these tokens is held in every group of mask.
-func (m *Mirror) entryLocked(content, mask uint64) bool {
+// checkpointLocked reports whether every recurrent group holds a checkpoint at the
+// prompt's boundary x (within its cached prefix): a cached block ending there, or a
+// remembered prompt end whose checkpoint entry the engine holds. A checkpoint at a block's
+// end has the block's hash and so is the block's.
+func (m *Mirror) checkpointLocked(k PromptKeys, x int) bool {
+	if m.mambaMask == 0 {
+		return true
+	}
+	if x%k.BlockSize == 0 {
+		b := m.byKey[k.Blocks[x/k.BlockSize-1]]
+		return b != nil && b.groups&m.mambaMask == m.mambaMask
+	}
+	e, ok := m.endLocked(k, x)
+	return ok && e.ckpt && m.heldLocked(e.content, m.mambaMask)
+}
+
+// endLocked is the remembered prompt end at the prompt's unit boundary x, if any.
+func (m *Mirror) endLocked(k PromptKeys, x int) (end, bool) {
+	key, ok := k.unitKey(x)
+	if !ok {
+		return end{}, false
+	}
+	e, ok := m.tails[key]
+	return e, ok
+}
+
+// heldLocked reports whether a unit entry with these tokens is held in every group of mask.
+func (m *Mirror) heldLocked(content, mask uint64) bool {
 	for _, f := range m.unitsByContent[content] {
 		if f.groups&mask == mask {
 			return true
 		}
 	}
 	return false
-}
-
-// checkpointLocked reports whether the engine hash h is a checkpoint in every recurrent
-// group at the prompt's boundary p: a unit entry holding the tokens x, or at a block
-// boundary the prompt's own block ending there.
-func (m *Mirror) checkpointLocked(k PromptKeys, h uint64, p int, x uint64) bool {
-	if p%k.BlockSize == 0 {
-		b := m.byEngine[h]
-		return b != nil && b.key == k.Blocks[p/k.BlockSize-1] && b.groups&m.mambaMask == m.mambaMask
-	}
-	f := m.units[h]
-	return f != nil && f.content == x && f.groups&m.mambaMask == m.mambaMask
 }
 
 // BlockSize is the engine's block size once set or shown by an event, else 0.

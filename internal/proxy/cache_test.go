@@ -926,7 +926,7 @@ func TestCacheAdmissionHoldJudgedByUnitHit(t *testing.T) {
 	s := q.sessions["a"]
 	seen, units := s.heldSeen, len(s.heldBlocks.Units)
 	q.mu.Unlock()
-	if seen != 6784 || units > 3200/64+1 {
+	if seen != 6784 || units > 3200/64+2 {
 		t.Fatalf("hold seen %d with %d unit keys, want 6784 and at most a block's", seen, units)
 	}
 	m.Apply(3, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(41)}, GroupIdx: &g0}})

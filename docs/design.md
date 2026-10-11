@@ -54,12 +54,15 @@ prompt's last unit boundary and a checkpoint one unit lower (with speculative de
 next turn resumes there, at for example 2 blocks and 31 units (10,176 tokens), not at the last
 full block. The mirror matches these events. It takes the unit from `prefix_match_unit` in
 `vllm:cache_config_info`, else from the size of the unit events, and follows the engine's rule:
-the prompt's full blocks must be cached up to the block holding the hit, the engine probes that
-block's unit boundaries from the top, and speculative decoding drops one unit rather than a
-block. The events carry only the last unit of tokens of each entry, which repeats elsewhere in
-agent conversations, so the mirror places them through the prompts it has keyed: it remembers
-where each prompt ends, under a key chained over all of its tokens, and counts a unit hit only
-at a remembered end whose entries the engine holds. A conversation whose last turn did not go
+the attention layers reach through the contiguous cached full blocks and then the next block's
+unit boundaries, probed from the top; speculative decoding drops one unit rather than a block;
+the hit is the newest boundary at or below that with a recurrent checkpoint, which may lie a
+block or more lower (a turn whose decode filled the block its prompt ended in leaves its
+checkpoint below a block the next turn matches whole). Unit matching only adds boundaries to
+the block-level rule, so it never predicts less. The events carry only the last unit of tokens
+of each entry, which repeats elsewhere in agent conversations, so the mirror places them through
+the prompts it has keyed: it remembers where each prompt ends, under a key chained over all of
+its tokens, and counts a unit boundary only at a remembered end whose entry the engine holds. A conversation whose last turn did not go
 through the proxy gets no unit hit until its next turn has. On that engine, a mirror without
 unit matching under-predicted cached tokens by a median of 21,824 per request (p90 61,248);
 an earlier version of the matching had a median and p90 error of 0 under the same load.

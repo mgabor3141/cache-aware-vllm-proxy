@@ -262,7 +262,7 @@ func TestKVMirrorUnitHitWithoutDrop(t *testing.T) {
 
 // Many unit entries sharing the probed tokens (a low-entropy span cached under many
 // prefixes) cost one lookup each at a remembered end, never one per pair (review cv-52
-// #12), and the one whose parent matches still hits.
+// #12), and an entry held in every group still hits.
 func TestKVMirrorUnitHitAmongDuplicates(t *testing.T) {
 	toks := append([]int64(nil), fixtureTokens(t)[:10800]...)
 	for i := 10112; i < 10240; i++ {
@@ -283,10 +283,13 @@ func TestKVMirrorUnitHitAmongDuplicates(t *testing.T) {
 	}
 }
 
-// duplicates are n checkpoints and n attention entries holding the tokens of a 10,260-token
-// prompt's end, none of them parent of another.
+// duplicates are n attention entries holding the tokens of a 10,260-token prompt's end and
+// n entries holding its checkpoint's tokens in only one of the four recurrent groups.
 func duplicates(toks []int64, n uint64) []Event {
 	var evs []Event
+	for _, g := range mambaGroups[1:] {
+		evs = append(evs, stored(g, "mamba", unit, 9000, nil, toks[:unit]))
+	}
 	for i := uint64(0); i < n; i++ {
 		evs = append(evs, stored(0, "mamba", unit, 10000+i, uint64(5000), toks[10112:10176]))
 		evs = append(evs, stored(5, "mla_attention", unit, 20000+i, uint64(7000), toks[10176:10240]))
@@ -305,7 +308,7 @@ func TestPromptKeysTail(t *testing.T) {
 	if len(k.Units) != 200000/unit {
 		t.Fatalf("waiting keys hold %d unit keys", len(k.Units))
 	}
-	if tail := k.Tail(); len(tail.Units) > ubs/unit+1 || len(tail.Blocks) != len(k.Blocks) {
+	if tail := k.Tail(); len(tail.Units) > ubs/unit+2 || len(tail.Blocks) != len(k.Blocks) {
 		t.Fatalf("tail keeps %d unit keys, %d blocks", len(tail.Units), len(tail.Blocks))
 	}
 
@@ -318,7 +321,7 @@ func TestPromptKeysTail(t *testing.T) {
 	}
 
 	for i := uint64(0); i < maxTails+10; i++ {
-		m.rememberTail(i, tail{})
+		m.rememberLocked(i, 0, true, false)
 	}
 	if _, oldest := m.tails[0]; len(m.tails) != maxTails || oldest {
 		t.Fatalf("%d ends remembered", len(m.tails))
@@ -358,5 +361,65 @@ func BenchmarkCachedUnitDuplicates(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m.Cached(keys)
+	}
+}
+
+// decodeAcross is what the engine publishes when a request's decode fills the block its
+// prompt ended in: the block becomes a full block hashed over prompt and output (hash
+// next, parent the previous block's), and with promote the unit entry it held is removed
+// (vLLM block_pool cache_full_blocks: partial-to-full promotion).
+func decodeAcross(all []int64, block int, next uint64, promote bool, at uint64) []Event {
+	var evs []Event
+	if promote {
+		evs = append(evs, removed(5, at))
+	}
+	return append(evs, stored(5, "mla_attention", ubs, next, uint64(block), all[block*ubs:(block+1)*ubs]))
+}
+
+// Production, block 4096, unit 64: a 64,725-token prompt ends with its checkpoint at
+// 64,640 (attention entry at 64,704), its 2,309-token decode crosses 65,536 and fills
+// block 15, and the next turn (67,710 tokens, the previous prompt and output verbatim)
+// is cached by the engine to 64,640: its attention reaches through block 15, and the
+// recurrent groups resume at the checkpoint, a block below the probed one. The mirror
+// predicted 0. Whether or not the engine drops the unit entry when the block fills, and
+// whether or not the next turn's block 15 matches the decoded one, the prediction is the
+// checkpoint, and never below the block-level rule.
+func TestKVMirrorUnitHitAfterDecodeFillsTheBlock(t *testing.T) {
+	all := seqPrompt(67710)
+	prev, next := all[:64725], all
+	for _, c := range []struct {
+		name             string
+		promote, rewrite bool
+		want             int
+	}{
+		{"block filled, entry kept", false, false, 64640},
+		{"block filled, entry removed", true, false, 64640},
+		{"output re-rendered, entry kept", false, true, 64640},
+		{"output re-rendered, entry removed", true, true, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			m.SetGeometry(ubs, unit)
+			m.NewPromptKeys(prev)
+			m.Apply(0, fullBlocks(all, 15))
+			m.Apply(1, tailEntries(prev, len(prev), 900, 901, uint64(899)))
+			m.Apply(2, decodeAcross(all, 15, 16, c.promote, 901))
+			p := append([]int64(nil), next...)
+			if c.rewrite {
+				p[64800]++ // the next turn renders the previous output differently
+			}
+			keys := m.NewPromptKeys(p)
+			if got := m.Cached(keys); got != c.want {
+				t.Fatalf("cached %d, want %d", got, c.want)
+			}
+			blocks := keys
+			blocks.Unit, blocks.Units = 0, nil
+			for _, g := range mambaGroups { // a checkpoint at block 15's start
+				m.Apply(int64(3+g), []Event{stored(g, "mamba", ubs, 15, uint64(14), all[14*ubs:15*ubs])})
+			}
+			if got, floor := m.Cached(keys), m.Cached(blocks); got < floor || !c.rewrite && floor != 15*ubs {
+				t.Fatalf("cached %d, below the block-level %d", got, floor)
+			}
+		})
 	}
 }
