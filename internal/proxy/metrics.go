@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
 // requestMetrics counts finished API requests.
@@ -98,6 +100,7 @@ type admissionMetrics struct {
 	marginBlocks, marginRaises     int
 	displaced, evictedHolds        int
 	mirrorConnected                bool
+	mirror                         kvmirror.Status
 	oldestWait                     time.Duration
 	engineMetricsErrors            uint64
 }
@@ -118,6 +121,7 @@ func (q *AdmissionQueue) metrics() admissionMetrics {
 	mirror := q.mirror
 	q.mu.Unlock()
 	m.mirrorConnected = mirror.Healthy()
+	m.mirror = mirror.Status()
 	return m
 }
 
@@ -143,6 +147,18 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	counter("cavp_cache_displaced_tokens_total", "Held tokens released to make room for other work (or forgotten with a full session table).", uint64(a.displaced))
 	counter("cavp_cache_holds_evicted_total", "Holds released because the KV mirror no longer saw them cached.", uint64(a.evictedHolds))
 	gauge("cavp_kv_mirror_connected", "1 while the KV event mirror is subscribed and caught up.", b2i(a.mirrorConnected))
+	gauge("cavp_kv_mirror_blocks", "Full blocks the KV event mirror holds.", a.mirror.Blocks)
+	gauge("cavp_kv_mirror_unsupported", "1 while the engine has a KV cache group kind the mirror cannot model (nothing is predicted cached).", b2i(a.mirror.Unsupported != ""))
+	io.WriteString(w, "# HELP cavp_kv_mirror_events_total KV event mirror counters by kind (skipped_*: events it could not use).\n# TYPE cavp_kv_mirror_events_total counter\n")
+	counts := a.mirror.Stats.Counts()
+	kinds := make([]string, 0, len(counts))
+	for k := range counts {
+		kinds = append(kinds, k)
+	}
+	sort.Strings(kinds)
+	for _, k := range kinds {
+		fmt.Fprintf(w, "cavp_kv_mirror_events_total{kind=%q} %d\n", k, counts[k])
+	}
 	counter("cavp_engine_metrics_errors_total", "Failed reads of the engine's /metrics (KV pool and preemptions); the guard is blind while they fail.", a.engineMetricsErrors)
 
 	p.metrics.mu.Lock()

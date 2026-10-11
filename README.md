@@ -89,7 +89,9 @@ Each request logs one JSON line on stdout; `curl localhost:4001/metrics` shows t
 the cache: requests waiting for the engine (`cavp_ready_wait_requests`) and for admission
 (`cavp_queue_length`, `cavp_queue_oldest_wait_seconds`, the `cavp_queue_wait_seconds` histogram),
 and failures to size prompts or read the engine's metrics (`cavp_tokenize_errors_total`,
-`cavp_engine_metrics_errors_total`). Clients need no changes: a conversation is identified by
+`cavp_engine_metrics_errors_total`), and the KV event mirror (`cavp_kv_mirror_connected`,
+`cavp_kv_mirror_blocks`, `cavp_kv_mirror_unsupported`, and `cavp_kv_mirror_events_total` by kind,
+whose `skipped_*` kinds count events it could not use). Clients need no changes: a conversation is identified by
 its first two messages.
 
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the

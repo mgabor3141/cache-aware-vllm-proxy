@@ -344,6 +344,16 @@ type Stats struct {
 	SkippedMedium uint64
 }
 
+// Counts are the counters by name (snake case), for metrics.
+func (s Stats) Counts() map[string]uint64 {
+	return map[string]uint64{
+		"stored": s.Stored, "removed": s.Removed, "cleared": s.Cleared, "restarts": s.Restarts,
+		"skipped_orphan": s.SkippedOrphan, "skipped_empty": s.SkippedEmpty, "batches": s.Batches,
+		"duplicates": s.Duplicates, "seq_gaps": s.SeqGaps, "reports": s.Reports,
+		"skipped_no_group": s.SkippedNoGroup, "skipped_hash": s.SkippedHash, "skipped_medium": s.SkippedMedium,
+	}
+}
+
 func New() *Mirror {
 	m := &Mirror{tails: map[uint64]*list.Element{}, tailOrder: list.New()}
 	m.resetLocked()
