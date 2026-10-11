@@ -397,11 +397,15 @@ func TestKVMirrorRestartInsideReplayedRange(t *testing.T) {
 
 	m := replay(0)
 	m.replayedAt = time.Now().Add(-overlapWindow) // the engine sat idle, then restarted
-	m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
+	if m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])}) {
+		t.Fatal("a restart did not ask for a resync")
+	}
+	m.Apply(0, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])}) // the resync replays it
 	check(m)
 
 	m = replay(5)
 	m.Apply(2, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])})
+	m.Apply(2, []Event{attnStore(7, nil, fresh[:4]), attnStore(8, uint64(7), fresh[4:8])}) // the resync replays it
 	check(m)
 }
 

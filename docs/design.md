@@ -76,7 +76,8 @@ from the publisher's replay buffer; until that replay completes it reports nothi
 replay that fails ends the subscription so it is retried. Batches missing from the replay
 buffer, or that cannot be decoded, are skipped (the mirror under-reports what they stored)
 rather than failing every retry. A sequence number that goes backwards
-outside the replay overlap means the engine restarted, and the mirror starts over. Holds are
+outside the replay overlap means the engine restarted: the mirror starts over, resyncs from the
+replay, and its generation moves so admission sees its holds may be gone. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
 a restart, or older than the replay buffer reaches) is released.
 

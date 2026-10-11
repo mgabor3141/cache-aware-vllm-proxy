@@ -661,7 +661,8 @@ func TestCacheAdmissionHoldsRevalidatedAfterMirrorReset(t *testing.T) {
 		t.Fatal("no hold after the turn")
 	}
 	m.Apply(2, nil)
-	m.Apply(0, nil) // the engine restarted: the mirror starts over
+	m.Apply(0, nil)      // the engine restarted: the mirror starts over
+	m.SetConnected(true) // resubscribed, the replay empty
 	q.tick()
 	if m := q.metrics(); m.held != 0 || m.evictedHolds != 1 {
 		t.Fatalf("hold survived an engine restart: %+v", m)
@@ -861,7 +862,8 @@ func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
 	tr := q.startReq("a", 0, len(prompt), prompt)
 	rel := mustAdmit(t, tr, "a")
 	m.Apply(2, nil)
-	m.Apply(0, nil) // the engine restarted while the turn ran
+	m.Apply(0, nil)      // the engine restarted while the turn ran
+	m.SetConnected(true) // resubscribed, the replay empty
 	tr.finish(rel, len(prompt), 100)
 	for i := 0; i < 5; i++ {
 		clk.add(time.Minute)

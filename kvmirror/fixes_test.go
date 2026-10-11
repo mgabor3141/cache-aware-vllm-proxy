@@ -88,3 +88,20 @@ func TestFixTailsAreLRU(t *testing.T) {
 		t.Fatalf("after %d other ends: cached %d, want 10176", 2*maxTails, got)
 	}
 }
+
+// A sequence going back (an engine or publisher restart) ends the subscription so it
+// resyncs from a replay, marks the mirror unhealthy until then, and moves the generation
+// so admission re-judges its holds (review cv-72 #7).
+func TestFixRestartResyncs(t *testing.T) {
+	m := New()
+	m.SetConnected(true)
+	toks := seqPrompt(9)
+	m.Apply(5, []Event{attnStore(1, nil, toks[:4]), attnStore(2, uint64(1), toks[4:8])})
+	gen := m.Generation()
+	if ok := m.Apply(0, nil); ok {
+		t.Fatal("a restart did not end the subscription")
+	}
+	if m.Healthy() || m.Generation() == gen || m.CachedTokens(toks) != 0 {
+		t.Fatalf("after a restart: healthy %v, generation %d (was %d), cached %d", m.Healthy(), m.Generation(), gen, m.CachedTokens(toks))
+	}
+}

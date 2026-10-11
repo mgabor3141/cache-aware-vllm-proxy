@@ -319,8 +319,8 @@ func (m *Mirror) isUnitLocked(size int) bool {
 }
 
 type Stats struct {
-	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps uint64
-	Reports uint64 // reuse reports (kv_cache_report_mode "full") not counted as copies
+	// Reports are reuse reports (kv_cache_report_mode "full"), not counted as copies.
+	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps, Reports uint64
 }
 
 func New() *Mirror {
@@ -329,8 +329,8 @@ func New() *Mirror {
 	return m
 }
 
-// errSeqGap ends a subscription so it restarts with a replay.
-var errSeqGap = fmt.Errorf("kv events sequence gap")
+// errResync ends a subscription so it restarts with a replay (a gap or an engine restart).
+var errResync = fmt.Errorf("kv events sequence gap or restart: resyncing")
 
 var rootKey BlockKey
 
@@ -411,8 +411,10 @@ func decodeBatch(payload []byte) ([]Event, error) {
 
 // Apply ingests one batch. seq is the publisher's sequence number (-1: unknown). Live
 // delivery repeating what a replay applied is skipped; any other sequence that goes
-// backwards means the engine restarted, so the mirror starts over. It returns false on a
-// gap: batches were lost and the mirror can no longer be trusted until it resyncs.
+// backwards means the engine restarted, so the mirror starts over. It returns false, and
+// the mirror is unhealthy, on a gap (batches were lost) or a restart: either way the
+// mirror can no longer be trusted until it resyncs from a replay. A restart's batch is
+// not applied; the replay brings it.
 func (m *Mirror) Apply(seq int64, events []Event) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -425,12 +427,15 @@ func (m *Mirror) Apply(seq int64, events []Event) bool {
 		m.replayedTo = -1
 		switch {
 		case seq <= m.lastSeq:
-			log.Printf("level=warn msg=\"kv events sequence went back: engine restarted, mirror cleared\" seq=%d last=%d", seq, m.lastSeq)
+			log.Printf("level=warn msg=\"kv events sequence went back: engine restarted, mirror cleared, resyncing\" seq=%d last=%d", seq, m.lastSeq)
 			m.resetLocked()
 			m.stats.Restarts++
+			m.connected = false
+			return false
 		case seq > m.lastSeq+1:
 			m.stats.SeqGaps++
 			m.lastSeq = seq
+			m.connected = false
 			return false
 		}
 	}
@@ -852,7 +857,7 @@ func (m *Mirror) subscribe(ctx context.Context, endpoint, replay string) error {
 			continue
 		}
 		if !m.Apply(seq, events) {
-			return errSeqGap
+			return errResync
 		}
 	}
 }
