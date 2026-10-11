@@ -485,26 +485,26 @@ func (q *AdmissionQueue) grantStateLocked(now time.Time) *grantState {
 // under-used. With nothing running, the head waiter may take any equal-priority hold:
 // nothing else will free room, so this guarantees progress.
 func (q *AdmissionQueue) displaceable(p int, s *cacheSession, now time.Time) bool {
-	if s.held > 0 && p < s.priority {
+	if p < s.priority && q.freesLocked(s) > 0 {
 		return true
 	}
 	return s.holding(now) && ((q.active == 0 && p == s.priority) ||
 		(!q.firm(s, now) && q.active < evictBelowRunning))
 }
 
-// reachLocked is how many held tokens w may displace.
+// reachLocked is how much room w may free by displacing holds.
 func (q *AdmissionQueue) reachLocked(g *grantState, w *admissionWaiter, now time.Time) int {
 	r, ok := g.reach[w.priority]
 	if !ok {
 		for _, s := range q.sessions {
 			if q.displaceable(w.priority, s, now) {
-				r += s.held
+				r += q.freesLocked(s)
 			}
 		}
 		g.reach[w.priority] = r
 	}
 	if own := q.sessions[w.session]; own != nil && q.displaceable(w.priority, own, now) {
-		r -= own.held
+		r -= q.freesLocked(own)
 	}
 	return r
 }
@@ -527,7 +527,7 @@ func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved i
 	}
 	var cands []*cacheSession
 	for k, s := range q.sessions {
-		if k != w.session && q.displaceable(w.priority, s, now) {
+		if k != w.session && q.displaceable(w.priority, s, now) && q.freesLocked(s) > 0 {
 			cands = append(cands, s)
 		}
 	}
@@ -543,19 +543,19 @@ func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved i
 	})
 	var single *cacheSession
 	for _, s := range cands {
-		if s.held >= need && (single == nil || s.held < single.held) {
+		if f := q.freesLocked(s); f >= need && (single == nil || f < q.freesLocked(single)) {
 			single = s
 		}
 	}
 	if single != nil {
-		return []displacement{{single, single.held}}, true
+		return []displacement{{single, q.freesLocked(single)}}, true
 	}
 	for _, s := range cands {
 		if need <= 0 {
 			break
 		}
-		plan = append(plan, displacement{s, s.held})
-		need -= s.held
+		plan = append(plan, displacement{s, q.freesLocked(s)})
+		need -= q.freesLocked(s)
 	}
 	if need > 0 {
 		return nil, false
@@ -784,4 +784,14 @@ func (q *AdmissionQueue) sharesHold(w *admissionWaiter) bool {
 		}
 	}
 	return true
+}
+
+// freesLocked is the room displacing s's hold frees: the whole hold while the session is
+// idle, else only what its running requests do not already cover (it is charged the
+// larger of the two).
+func (q *AdmissionQueue) freesLocked(s *cacheSession) int {
+	if s.running == 0 {
+		return s.held
+	}
+	return max(0, s.held-q.sessionRunningLocked(s))
 }

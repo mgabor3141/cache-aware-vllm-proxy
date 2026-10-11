@@ -273,3 +273,36 @@ func TestRunningSessionHoldYieldsToHigherPriority(t *testing.T) {
 	}
 	t.Errorf("x starved behind a's pinned hold")
 }
+
+// Displacing the hold of a running session frees only what its running requests do not
+// cover (rev-1 N1).
+func TestDisplacingRunningHoldFreesOnlyExcess(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		run   int
+		admit bool
+	}{
+		{"next turn resends the hold", 303000, false},
+		{"small side call", 2000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, clk := newCacheQueue(t, nil)
+			ta := q.start("a", 5, 300000)
+			ta.finish(mustAdmit(t, ta, "a"), 300000, 0)
+			clk.add(time.Hour)
+			run := mustAdmit(t, q.start("a", 5, tc.run), "a's request")
+			x := q.start("x", 0, 500000)
+			rel := x.waitAdmitted(200 * time.Millisecond)
+			if m := q.metrics(); m.usedTokens > m.budgetTokens {
+				t.Errorf("modelled use %d over the budget %d", m.usedTokens, m.budgetTokens)
+			}
+			if (rel != nil) != tc.admit {
+				t.Errorf("x admitted %v, want %v", rel != nil, tc.admit)
+			}
+			if rel != nil {
+				rel()
+			}
+			run()
+		})
+	}
+}
