@@ -195,6 +195,7 @@ const (
 )
 
 type cacheSession struct {
+	key        string
 	priority   int // of its hold: the request that left it
 	footprint  int // prompt + completion of the last completed turn
 	lastPrompt int // prompt tokens of the last completed turn
@@ -262,7 +263,7 @@ func (q *AdmissionQueue) session(key string, now time.Time) *cacheSession {
 		if len(q.sessions) >= sessionCap {
 			q.pruneSessionsLocked(now, true)
 		}
-		s = &cacheSession{}
+		s = &cacheSession{key: key}
 		q.sessions[key] = s
 	}
 	s.lastSeen = now
@@ -295,7 +296,10 @@ func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 		if (a.held > 0) != (b.held > 0) {
 			return a.held == 0
 		}
-		return a.lastSeen.Before(b.lastSeen)
+		if !a.lastSeen.Equal(b.lastSeen) {
+			return a.lastSeen.Before(b.lastSeen)
+		}
+		return idle[i] < idle[j]
 	})
 	forgotten, held := 0, 0
 	for _, k := range idle[:min(excess, len(idle))] {
@@ -471,7 +475,15 @@ func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved i
 		}
 	}
 	// Best fit: the smallest single hold that covers the need; otherwise the holds idle
-	// longest (least likely back) until it is covered.
+	// longest (least likely back) until it is covered. Ties go to the longest idle, then
+	// to the session key, so the same state always displaces the same holds.
+	sort.Slice(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if !a.lastDone.Equal(b.lastDone) {
+			return a.lastDone.Before(b.lastDone)
+		}
+		return a.key < b.key
+	})
 	var single *cacheSession
 	for _, s := range cands {
 		if s.held >= need && (single == nil || s.held < single.held) {
@@ -481,7 +493,6 @@ func (q *AdmissionQueue) fitLocked(w *admissionWaiter, now time.Time, reserved i
 	if single != nil {
 		return []displacement{{single, single.held}}, true
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i].lastDone.Before(cands[j].lastDone) })
 	for _, s := range cands {
 		if need <= 0 {
 			break

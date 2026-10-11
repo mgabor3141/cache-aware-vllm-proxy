@@ -124,3 +124,25 @@ func TestRetryMemoryDoesNotCompound(t *testing.T) {
 		t.Errorf("pinger credited %v of waiting after six 10 s attempts", w)
 	}
 }
+
+// Equal holds idle since the same instant are displaced in a fixed order, not in map
+// order (fairness #7).
+func TestDisplacementVictimsDeterministic(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, k := range []string{"c", "a", "b"} {
+		q.sessions[k] = &cacheSession{key: k, held: 230400, lastDone: clk.now(), heldSeen: -1}
+	}
+	w := &admissionWaiter{session: "w", prompt: 300000, maxOut: 4000}
+	for i := 0; i < 60; i++ {
+		plan, ok := q.fitLocked(w, clk.now().Add(time.Hour), 0)
+		if !ok || len(plan) != 2 || plan[0].s != q.sessions["a"] || plan[1].s != q.sessions["b"] {
+			var got []string
+			for _, d := range plan {
+				got = append(got, d.s.key)
+			}
+			t.Fatalf("run %d: displaced %v (ok %v), want [a b]", i, got, ok)
+		}
+	}
+}
