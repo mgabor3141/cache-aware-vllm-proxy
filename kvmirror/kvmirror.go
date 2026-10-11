@@ -336,6 +336,9 @@ type Stats struct {
 	// SkippedNoGroup are BlockStored events without a usable group_idx (missing, or 64 and
 	// up): not stored.
 	SkippedNoGroup uint64
+	// SkippedHash are block hashes of a type the mirror cannot read: those blocks are not
+	// stored or removed.
+	SkippedHash uint64
 }
 
 func New() *Mirror {
@@ -406,6 +409,16 @@ func hashToUint(v any) (uint64, bool) {
 		return u, true
 	}
 	return 0, false
+}
+
+// hashLocked reads an engine block hash, counting and logging one it cannot read.
+func (m *Mirror) hashLocked(v any) (uint64, bool) {
+	u, ok := hashToUint(v)
+	if !ok {
+		m.stats.SkippedHash++
+		m.warnSkipLocked("hash", fmt.Sprintf("kv events block hash of type %T cannot be read: its block is skipped", v))
+	}
+	return u, ok
 }
 
 // decodeBatch parses one payload into events.
@@ -503,14 +516,14 @@ func (m *Mirror) applyLocked(e *Event) {
 			// forgetting under-reports.
 			m.warnSkipLocked("no_group", "kv events BlockRemoved without a usable group_idx: the hash is forgotten in every group")
 			for _, h := range e.BlockHashes {
-				if u, ok := hashToUint(h); ok {
+				if u, ok := m.hashLocked(h); ok {
 					m.forgetLocked(u)
 				}
 			}
 			return
 		}
 		for _, h := range e.BlockHashes {
-			u, ok := hashToUint(h)
+			u, ok := m.hashLocked(h)
 			if !ok {
 				continue
 			}
@@ -582,7 +595,7 @@ func (m *Mirror) applyLocked(e *Event) {
 		}
 		parent := rootKey
 		if e.ParentBlockHash != nil {
-			pu, ok := hashToUint(e.ParentBlockHash)
+			pu, ok := m.hashLocked(e.ParentBlockHash)
 			pb := m.byEngine[pu]
 			if !ok || pb == nil {
 				// The rest of this event chains from the unknown parent; the batch's other
@@ -603,7 +616,7 @@ func (m *Mirror) applyLocked(e *Event) {
 			}
 			key := chainKey(parent, e.TokenIDs[i*bs:(i+1)*bs], extra)
 			parent = key
-			u, ok := hashToUint(h)
+			u, ok := m.hashLocked(h)
 			if !ok {
 				continue // its key still chains the blocks after it
 			}
@@ -670,7 +683,7 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 		if (i+1)*size > len(e.TokenIDs) {
 			return
 		}
-		u, ok := hashToUint(h)
+		u, ok := m.hashLocked(h)
 		switch {
 		case !ok || i < len(e.ExtraKeys) && e.ExtraKeys[i] != nil:
 		case m.byEngine[u] != nil:
