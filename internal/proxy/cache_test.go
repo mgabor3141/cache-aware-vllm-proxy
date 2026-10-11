@@ -288,8 +288,8 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 	rs := mustAdmit(t, side, "side")
 	main.finish(rm, 242000, 4000)
 	side.finish(rs, 3000, 50)
-	if fp := q.sessions["s"].footprint; fp != 246000 {
-		t.Fatalf("footprint %d, want 246000", fp)
+	if h := q.sessionHeld("s"); h != 243200 {
+		t.Fatalf("hold %d, want the main turn's 243200", h)
 	}
 }
 

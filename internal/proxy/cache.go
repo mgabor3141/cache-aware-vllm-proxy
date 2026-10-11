@@ -195,11 +195,9 @@ const (
 )
 
 type cacheSession struct {
-	key        string
-	priority   int // of its hold: the request that left it
-	footprint  int // prompt + completion of the last completed turn
-	lastPrompt int // prompt tokens of the last completed turn
-	outputs    []int
+	key      string
+	priority int // of its hold: the request that left it
+	outputs  []int
 
 	running int
 	// Largest observation of the current busy period (overlapping requests).
@@ -727,10 +725,9 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 	}
 	s.lastDone = now
 	if s.busyFootprint > 0 {
-		s.footprint, s.lastPrompt = s.busyFootprint, s.busyPrompt
 		// The next turn resends the prompt, not the completion (thinking is dropped), so
 		// the prompt is what stays useful in the cache.
-		s.held = q.roundUp(s.lastPrompt)
+		s.held = q.roundUp(s.busyPrompt)
 		s.heldBlocks = s.busyBlocks
 		s.heldSeen, s.heldGen = -1, s.busyGen
 		s.priority = s.busyPriority
