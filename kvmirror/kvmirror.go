@@ -324,7 +324,7 @@ func (m *Mirror) isUnitLocked(size int) bool {
 }
 
 type Stats struct {
-	// Reports are reuse reports (kv_cache_report_mode "full"), not counted as copies.
+	// Reports are reuse reports of a recurrent group (parent-less, several blocks): not stored.
 	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps, Reports uint64
 }
 
@@ -584,14 +584,6 @@ func (m *Mirror) applyLocked(e *Event) {
 			if !ok {
 				continue // its key still chains the blocks after it
 			}
-			if e.ParentBlockHash == nil && m.hashHeldLocked(u, g) {
-				// A reuse report (kv_cache_report_mode "full", block_pool.py
-				// emit_cached_block_events) lists the blocks a request hit, from block 0,
-				// with no BlockRemoved ever to match: not new copies. A real second copy
-				// of a block stored from 0 is missed too, which only under-reports.
-				m.stats.Reports++
-				continue
-			}
 			b := m.byKey[key]
 			if b == nil {
 				b = &mirrorBlock{key: key}
@@ -624,8 +616,6 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 		u, ok := hashToUint(h)
 		switch {
 		case !ok || i < len(e.ExtraKeys) && e.ExtraKeys[i] != nil:
-		case e.ParentBlockHash == nil && m.hashHeldLocked(u, g):
-			m.stats.Reports++ // a reuse report, as in applyLocked
 		case m.byEngine[u] != nil:
 			m.byEngine[u].add(g, 1)
 			m.stats.Stored++
@@ -643,15 +633,6 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 			m.stats.Stored++
 		}
 	}
-}
-
-// hashHeldLocked reports whether the engine hash is a block or unit entry held in group g.
-func (m *Mirror) hashHeldLocked(u uint64, g uint) bool {
-	if b := m.byEngine[u]; b != nil {
-		return b.groups&(1<<g) != 0
-	}
-	f := m.units[u]
-	return f != nil && f.groups&(1<<g) != 0
 }
 
 func (m *Mirror) dropUnitLocked(f *unitEntry) {
