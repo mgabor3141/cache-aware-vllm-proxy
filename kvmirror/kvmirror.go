@@ -539,6 +539,13 @@ func (m *Mirror) applyLocked(e *Event) {
 			m.stats.SkippedEmpty++
 			return
 		}
+		if e.ParentBlockHash == nil && e.Kind == "mamba" && len(e.BlockHashes) > 1 {
+			// A reuse report for a recurrent group lists every block from 0 (null
+			// placeholders included) though state is held only at the checkpoint; a real
+			// recurrent store is one block with its parent.
+			m.stats.Reports++
+			return
+		}
 		if e.BlockSize != m.blockSize {
 			if m.isUnitLocked(e.BlockSize) {
 				m.storeUnitsLocked(e, g)
