@@ -475,14 +475,13 @@ func (q *AdmissionQueue) grantStateLocked(now time.Time) *grantState {
 // lower-priority hold, even while its session runs a request (the running request stays
 // charged; only the hold goes), so an agent that overlaps calls cannot pin its hold.
 // Otherwise only idle, expendable holds (past holdFor) go, and only while the engine is
-// under-used. With nothing running, the head waiter may take any equal-priority hold:
-// nothing else will free room, so this guarantees progress.
+// under-used. A firm hold waits out its window even with nothing running: a tick re-runs
+// the grant pass, so the head waiter gets in once it is expendable.
 func (q *AdmissionQueue) displaceable(p int, s *cacheSession, now time.Time) bool {
 	if p < s.priority && q.freesLocked(s) > 0 {
 		return true
 	}
-	return s.holding(now) && ((q.active == 0 && p == s.priority) ||
-		(!q.firm(s, now) && q.active < evictBelowRunning))
+	return s.holding(now) && !q.firm(s, now) && q.active < evictBelowRunning
 }
 
 // reachLocked is how much room w may free by displacing holds.

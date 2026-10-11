@@ -141,20 +141,26 @@ func holdModelRun(t *testing.T, seed int64) {
 		}
 		return p
 	}
-	for step := 0; step < 300; step++ {
+	type pre struct {
+		held, prio int
+		firm       bool
+	}
+	var before map[string]pre
+	// snap records each hold before a step, firm as the grant pass will see it: after the
+	// clock moved, and with a finishing request's slot already returned (fewer running
+	// requests shorten the firm window).
+	snap := func(released int) {
 		q.mu.Lock()
-		now := q.now()
-		before := map[string]struct {
-			held, prio int
-			firm       bool
-		}{}
+		defer q.mu.Unlock()
+		q.active -= released
+		before = map[string]pre{}
 		for k, s := range q.sessions {
-			before[k] = struct {
-				held, prio int
-				firm       bool
-			}{s.held, s.priority, q.firm(s, now)}
+			before[k] = pre{s.held, s.priority, q.firm(s, q.now())}
 		}
-		q.mu.Unlock()
+		q.active += released
+	}
+	for step := 0; step < 300; step++ {
+		snap(0)
 		finished := ""
 		switch op := rng.Intn(10); {
 		case op < 4: // arrival: the next turn, a divergent prompt, or a side call
@@ -191,6 +197,7 @@ func holdModelRun(t *testing.T, seed int64) {
 			s := q.sessions[finished]
 			h0, b0 := s.held, s.heldBlocks.Blocks
 			q.mu.Unlock()
+			snap(1)
 			q.release(pr.w, func() (CacheObservation, bool) { return pr.obs, pr.ok })
 			q.mu.Lock()
 			if s.held != h0 || len(s.heldBlocks.Blocks) != len(b0) || (len(b0) > 0 && &s.heldBlocks.Blocks[0] != &b0[0]) {
@@ -208,6 +215,7 @@ func holdModelRun(t *testing.T, seed int64) {
 			q.mu.Unlock()
 		default:
 			clk.add(time.Duration(rng.Intn(30)) * time.Second)
+			snap(0)
 			q.tick()
 		}
 		q.mu.Lock()
@@ -252,6 +260,13 @@ func holdModelRun(t *testing.T, seed int64) {
 				continue
 			}
 			displaced[k] = true
+			ok := false
+			for _, w := range granted {
+				ok = ok || w.session == k || w.priority < b.prio || !b.firm
+			}
+			if !ok {
+				t.Fatalf("%s: %s firm hold (priority %d) displaced", trace, k, b.prio)
+			}
 		}
 		for k, d := range displaced {
 			if s := q.sessions[k]; d && s != nil && s.held > 0 && k != finished {
@@ -263,4 +278,19 @@ func holdModelRun(t *testing.T, seed int64) {
 	for _, pr := range running {
 		q.release(pr.w, func() (CacheObservation, bool) { return CacheObservation{}, false })
 	}
+}
+
+// A firm hold is not displaced by equal-priority work even with nothing running; once its
+// window passes, the waiter gets in (l3-92 F1).
+func TestFirmHoldKeptWithEngineIdle(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	ta, tb := q.start("a", 0, 245000), q.start("b", 0, 245000)
+	ra, rb := mustAdmit(t, ta, "a"), mustAdmit(t, tb, "b")
+	ta.finish(ra, 245000, 0)
+	tb.finish(rb, 245000, 0)
+	c := q.start("c", 0, 200000)
+	mustWait(t, c, "c while a's and b's holds are firm")
+	clk.add(2 * time.Minute)
+	q.tick()
+	mustAdmit(t, c, "c once the holds are expendable")()
 }

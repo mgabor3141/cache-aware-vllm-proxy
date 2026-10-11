@@ -135,8 +135,8 @@ the prompt behind it, a priority and the time its last turn finished.
 - Displacing a hold removes it for good; nothing recreates it except a later finish of its own
   session, sized by that request's own charge. A waiter may always displace its own session's
   hold (it is that conversation's next turn). Other holds are displaced by higher-priority work,
-  or, when idle, by equal-priority work while nothing runs or, once no longer firm, while fewer
-  than 4 requests run.
+  or, when idle and no longer firm, by equal-priority work while fewer than 4 requests run.
+  A firm hold is never displaced by work of the same or lower priority.
 
 These are checked over random sequences of arrivals, finishes, streamed output and time
 (`TestHoldModelProperties`).
