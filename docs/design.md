@@ -45,8 +45,24 @@ In live runs the prediction matched the engine's reported `cached_tokens` on ove
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
 attention blocks: a hit at position p also needs a saved recurrent state at exactly p. The mirror
-tracks each KV group separately and only counts a hit where every group has it. It tracks full
-blocks only.
+tracks each KV group separately and only counts a hit where every group has it.
+
+Engines that cache hybrid-model prefixes at a finer unit than the block, such as halt95's vLLM
+fork (`--block-size 4096 --prefix-match-unit 64`), save a recurrent state where each prompt ends,
+rounded down to the unit, and publish unit-sized block events for it: an attention entry at the
+prompt's last unit boundary and a checkpoint one unit lower (with speculative decoding). The
+next turn resumes there, at for example 2 blocks and 31 units (10,176 tokens), not at the last
+full block. The mirror matches these events. It takes the unit from `prefix_match_unit` in
+`vllm:cache_config_info`, else from the size of the unit events, and follows the engine's rule:
+the prompt's full blocks must be cached up to the block holding the hit, the engine probes that
+block's unit boundaries from the top, and speculative decoding drops one unit rather than a
+block. The events carry only the last unit of tokens of each entry, which repeats elsewhere in
+agent conversations, so the mirror places them through the prompts it has keyed: it remembers
+where each prompt ends, under a key chained over all of its tokens, and counts a unit hit only
+at a remembered end whose entries the engine holds. A conversation whose last turn did not go
+through the proxy gets no unit hit until its next turn has. On that engine, a mirror without
+unit matching under-predicted cached tokens by a median of 21,824 per request (p90 61,248);
+an earlier version of the matching had a median and p90 error of 0 under the same load.
 
 The mirror is only as good as the stream. On every (re)subscription it starts empty and rebuilds
 from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
@@ -118,8 +134,8 @@ normal operation. Using it raised the margin by 8 blocks in five minutes of norm
 
 - With `mamba_cache_mode=align`, recurrent checkpoints were written only where a prefill step
   ended on a block boundary (3,200-4,096 tokens), so a turn adding less than a block missed
-  entirely. A finer checkpoint unit in halt95's fork fixed it at the time; the proxy no
-  longer models it.
+  entirely. A finer checkpoint unit fixed it (`--prefix-match-unit`, in halt95's fork); the
+  mirror matches its unit-sized entries (above).
 - On one engine version a prompt's tail checkpoint was released early and aged out of the cache
   before the agent returned (fixed in halt95's vLLM fork, v2.5.1).
 - Each was found by tracing KV events against real misses, not by aggregate hit rates.

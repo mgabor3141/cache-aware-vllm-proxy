@@ -41,7 +41,9 @@ admission:
 
     # vLLM's KV cache event stream (--kv-events-config, ZMQ publisher). Required. The
     # replay socket (replay_endpoint) is expected on the next port: the mirror of the
-    # engine's cache is rebuilt from it on every (re)subscribe.
+    # engine's cache is rebuilt from it on every (re)subscribe. The block size and, on
+    # engines that cache at a finer unit (--prefix-match-unit), the unit are read from the
+    # engine's /metrics; nothing to set here.
     kv_events_endpoint: "tcp://vllm:5557"
 
     # Prefill speed of your engine in tokens per second. With decode_interference (how

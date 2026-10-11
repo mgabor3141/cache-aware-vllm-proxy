@@ -87,7 +87,11 @@ the cache. Clients need no changes: a conversation is identified by its first tw
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
 engine's cache from the replay whenever it (re)subscribes, and treats every prompt as uncached
 until that replay completes. Requests wait until the engine's metrics have been read once (that
-is where the KV pool size comes from). One engine means one engine: a data-parallel vLLM has a
+is where the KV pool size comes from). Engines that cache hybrid-model prefixes at a finer unit
+than the block (`--prefix-match-unit`, as halt95's vLLM fork does) publish unit-sized block
+events for where each prompt ends; the mirror matches them, taking the unit from the engine's
+metrics (`prefix_match_unit`) or else from those events, so a returning turn is predicted
+cached to the unit, not to the last full block. One engine means one engine: a data-parallel vLLM has a
 KV pool and an event publisher per rank, and the proxy follows only one, so it is not
 supported (`cavp -calibrate` refuses one).
 
