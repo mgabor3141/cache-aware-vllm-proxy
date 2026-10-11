@@ -42,3 +42,19 @@ func TestDoneEndsStreamWithEngineResponseOpen(t *testing.T) {
 	}
 	waitFor(t, "the permit back", func() bool { return h.p.admission.Snapshot().Active == 0 })
 }
+
+// A [DONE] whose blank line arrives in a later read still reaches the client as a complete
+// event (rev-3 2).
+func TestDoneSplitAcrossReadsEndsWithBlankLine(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sseUsage+"data: [DONE]\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		io.WriteString(w, "\n")
+	}, nil)
+	_, b := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if !strings.HasSuffix(b, "data: [DONE]\n\n") {
+		t.Fatalf("body ends %q", b[max(0, len(b)-30):])
+	}
+}

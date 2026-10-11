@@ -149,7 +149,7 @@ from admission, since their output is not seen until they finish. A client that 
 `max_tokens` (often the context length) is charged up to the whole pool: it still runs, but
 nothing runs beside it. Prefer streaming, whose output is charged as it arrives, or a realistic
 `max_tokens`. The cap is read as the engine reads it: `60000`, `60000.0`, `6e4` and `"60000"` are
-the same cap. Several choices (`n`) or a batched `/v1/completions` prompt are several
+the same cap, and `n` is read the same way. Several choices (`n`) or a batched `/v1/completions` prompt are several
 sequences, each charged its own expected output.
 
 **Engine restarts.** A readiness probe asks the engine's `/v1/models` every
