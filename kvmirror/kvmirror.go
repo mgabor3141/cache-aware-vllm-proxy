@@ -905,12 +905,14 @@ func parseFrames(frames [][]byte) (int64, []Event, bool) {
 	return seq, events, true
 }
 
-// skipHole accepts that the batches from up to (not including) to are lost for good.
+// skipHole accepts that the batches from up to (not including) to are lost for good and
+// forgets every block: what they removed is unknown, and only forgetting under-reports.
 func (m *Mirror) skipHole(from, to int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	log.Printf("level=warn msg=\"kv events replay buffer has a hole, skipped\" from=%d to=%d", from, to)
+	log.Printf("level=warn msg=\"kv events replay buffer has a hole, mirror cleared\" from=%d to=%d", from, to)
 	m.stats.SeqGaps++
+	m.clearLocked()
 	if m.lastSeq >= 0 {
 		m.lastSeq = to - 1
 	}
@@ -921,7 +923,8 @@ func (m *Mirror) skipHole(from, to int64) {
 // reader and drops the rest silently, so a replay is read in rounds: each takes the
 // batches that arrive in sequence, stops at the first gap or a quiet second, and asks
 // again from the next missing sequence, until the end-of-sequence marker (seq -1). A round
-// whose first batch is past the sequence asked for skips the hole: those batches are gone.
+// whose first batch is past the sequence asked for skips the hole and clears the mirror:
+// those batches are gone, and may have removed blocks.
 // Undecodable batches are skipped too. A replay that does not reach the marker is an error.
 func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 	total := 0
@@ -1002,8 +1005,8 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 			}
 			if seq > next && next != 0 {
 				// Asked from next, the buffer's first batch is later: those batches are
-				// gone for good (dropped at the publisher's high-water mark). Skip them;
-				// the mirror under-reports what they stored.
+				// gone for good (dropped at the publisher's high-water mark). They may have
+				// removed blocks, so the mirror starts over from the batch after them.
 				m.skipHole(next, seq)
 			}
 			m.Apply(seq, events)
