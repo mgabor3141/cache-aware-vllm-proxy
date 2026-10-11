@@ -86,7 +86,9 @@ replay that fails ends the subscription so it is retried. Batches missing from t
 buffer are skipped and the mirror starts over from the batch after them (they may have removed
 blocks); undecodable batches are skipped. Neither fails every retry. A sequence number that goes backwards
 outside the replay overlap means the engine restarted: the mirror starts over, resyncs from the
-replay, and its generation moves so admission sees its holds may be gone. Holds are
+replay, and its generation moves so admission sees its holds may be gone. The same goes for a
+restart seen inside the replay: each later round asks from the last batch already applied, and a
+publisher that does not send it back unchanged fails the replay, which resyncs. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
 a restart, or older than the replay buffer reaches) is released. A hold the mirror never saw
 (the prompt could not be tokenized, or its blocks carry extra hash keys) cannot be verified: it

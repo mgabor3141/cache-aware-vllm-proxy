@@ -61,6 +61,7 @@
 package kvmirror
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/sha256"
@@ -906,12 +907,15 @@ func (m *Mirror) skipHole(from, to int64) {
 // again from the next missing sequence, until the end-of-sequence marker (seq -1). A round
 // whose first batch is past the sequence asked for skips the hole and clears the mirror:
 // those batches are gone, and may have removed blocks.
+// A later round asks from one batch earlier, the last one already applied: a publisher that
+// does not send that batch back unchanged is a restarted engine, and the replay fails.
 // Undecodable batches are skipped too. A replay that does not reach the marker is an error.
 func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 	total := 0
 	from := int64(0)
+	var last []byte // the payload of batch from-1
 	for round := 0; round < 64; round++ {
-		n, next, done, err := m.replayRound(ctx, endpoint, from)
+		n, next, l, done, err := m.replayRound(ctx, endpoint, from, last)
 		total += n
 		if err != nil || done {
 			return total, err
@@ -919,25 +923,29 @@ func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 		if n == 0 {
 			return total, fmt.Errorf("replay round from %d returned nothing", from)
 		}
-		from = next
+		from, last = next, l
 	}
 	return total, fmt.Errorf("replay did not finish in 64 rounds")
 }
 
-func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (n int, next int64, done bool, err error) {
+func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64, prev []byte) (n int, next int64, last []byte, done bool, err error) {
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	d := zmq4.NewDealer(rctx)
 	defer d.Close()
 	if err := d.Dial(endpoint); err != nil {
-		return 0, from, false, err
+		return 0, from, prev, false, err
 	}
 	// The connection handshake completes asynchronously; a request sent before it is lost.
 	time.Sleep(300 * time.Millisecond)
 	start := make([]byte, 8)
-	binary.BigEndian.PutUint64(start, uint64(from))
+	ask := from
+	if prev != nil {
+		ask-- // the last batch applied, to check the publisher is the same engine
+	}
+	binary.BigEndian.PutUint64(start, uint64(ask))
 	if err := d.Send(zmq4.NewMsgFrom([]byte{}, start)); err != nil {
-		return 0, from, false, err
+		return 0, from, prev, false, err
 	}
 	msgs := make(chan zmq4.Msg, 64)
 	go func() {
@@ -954,35 +962,54 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 			}
 		}
 	}()
-	next = from
+	next, last = from, prev
+	checked := prev == nil
+	restarted := func(why string) (int, int64, []byte, bool, error) {
+		log.Printf("level=warn msg=\"kv events replay does not continue the batches applied: engine restarted, resyncing\" from=%d why=%q", from, why)
+		return n, next, last, false, errResync
+	}
 	idle := time.NewTimer(replayFirstWait)
 	defer idle.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return n, next, false, ctx.Err()
+			return n, next, last, false, ctx.Err()
 		case <-idle.C:
-			return n, next, false, nil
+			return n, next, last, false, nil
 		case msg, ok := <-msgs:
 			if !ok {
-				return n, next, false, nil
+				return n, next, last, false, nil
 			}
 			f := msg.Frames
 			if len(f) > 0 && len(f[0]) == 0 {
 				f = f[1:] // delimiter
 			}
 			if len(f) >= 2 && len(f[len(f)-2]) == 8 && int64(binary.BigEndian.Uint64(f[len(f)-2])) == -1 {
-				return n, next, true, nil
+				if !checked {
+					// The buffer would still hold the newest batch applied.
+					return restarted("the last batch applied is gone")
+				}
+				return n, next, last, true, nil
 			}
 			seq, events, ok := parseFrames(f)
 			if !ok {
 				continue
 			}
+			if !checked {
+				checked = true
+				if seq == ask {
+					if !bytes.Equal(f[len(f)-1], prev) {
+						return restarted("the last batch applied changed")
+					}
+					continue
+				}
+			}
 			if seq < next {
-				continue
+				// The publisher answers from the start asked for.
+				return restarted("a batch below the start asked for")
 			}
 			if seq > next && n > 0 {
-				return n, next, false, nil // the publisher dropped batches: ask again from here
+				return n, next, last, false, nil // the publisher dropped batches: ask again from here
 			}
 			if seq > next && next != 0 {
 				// Asked from next, the buffer's first batch is later: those batches are
@@ -992,7 +1019,7 @@ func (m *Mirror) replayRound(ctx context.Context, endpoint string, from int64) (
 			}
 			m.Apply(seq, events)
 			n++
-			next = seq + 1
+			next, last = seq+1, f[len(f)-1]
 			idle.Reset(time.Second)
 		}
 	}
