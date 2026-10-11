@@ -294,6 +294,7 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 		ensureStreamUsage(body)
 	}
 	ev.maxTokens = maxTokensOf(body)
+	ev.sequences = sequencesOf(body)
 	ev.textBytes = textBytesOf(body)
 	ev.body = body
 
@@ -549,7 +550,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event) AdmissionRequest {
 	ev.report = &AdmissionReport{}
 	ar := AdmissionRequest{
-		Priority: ev.Priority, Session: ev.Session, MaxTokens: ev.maxTokens,
+		Priority: ev.Priority, Session: ev.Session, MaxTokens: ev.maxTokens, Sequences: ev.sequences,
 		Buffered: !ev.Stream, Report: ev.report,
 		Observe: func() (CacheObservation, bool) {
 			if ev.PromptTokens <= 0 || ev.Status != http.StatusOK {
@@ -610,6 +611,22 @@ func intField(body map[string]any, key string) (int, bool) {
 		return 0, false
 	}
 	return int(v), true
+}
+
+// sequencesOf is how many sequences the engine runs for the request: OpenAI "n"
+// (choices) times the prompts of a batched /v1/completions prompt, at least 1.
+func sequencesOf(body map[string]any) int {
+	n := 1
+	if v, ok := intField(body, "n"); ok && v > 1 {
+		n = v
+	}
+	if list, ok := body["prompt"].([]any); ok && len(list) > 1 {
+		switch list[0].(type) {
+		case string, []any:
+			n *= len(list) // a list of prompts, not one prompt as token IDs
+		}
+	}
+	return n
 }
 
 // maxTokensOf returns the request's output cap, or 0 when it has none.

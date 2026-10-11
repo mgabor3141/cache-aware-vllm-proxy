@@ -74,6 +74,7 @@ type Event struct {
 
 	// Inputs carried from body parsing to admission; not logged.
 	maxTokens int
+	sequences int
 	textBytes int64
 	body      map[string]any
 	generated *OutputCounter // output tokens streamed so far

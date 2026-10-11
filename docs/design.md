@@ -105,7 +105,8 @@ updates as output streams: from the stream's own token counts when it reports us
 else a configured number of tokens per chunk (1 plus the draft length under speculative
 decoding). A non-streaming request is charged its whole output cap from admission until it
 finishes: its `max_tokens`, else `default_output_tokens`, since nothing raises its charge while
-it runs.
+it runs. The expected output is per sequence: a request with `n` choices or a batched
+prompt is charged it once per sequence.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
 admitted on top of it. It stays counted while the conversation's next request runs (the session is

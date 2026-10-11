@@ -45,6 +45,7 @@ type admissionWaiter struct {
 	tokens  []int64             // the prompt, kept only until its keys match the block size
 	mirGen  uint64              // the mirror's generation when admitted
 	maxOut  int                 // the request's output cap (0: none)
+	seqs    int                 // sequences the engine runs for it (choices x prompts), at least 1
 	expOut  int                 // expected output tokens, fixed at admission
 	buffer  bool                // output unseen until the end: charged the cap
 	gen     *OutputCounter
@@ -127,6 +128,9 @@ type AdmissionRequest struct {
 	// prompt could not be tokenized.
 	Tokens    []int64
 	MaxTokens int
+	// Sequences is how many sequences the engine runs for the request: OpenAI "n" times
+	// the prompts in a batched /v1/completions prompt. Each has its own output.
+	Sequences int
 	// Generated, when set, counts output tokens so far; the request's charge grows with
 	// it once it passes the expected output.
 	Generated *OutputCounter
@@ -202,7 +206,7 @@ func (q *AdmissionQueue) enqueue(ar AdmissionRequest) (*admissionWaiter, bool, A
 	w := &admissionWaiter{
 		priority: ar.Priority, enqueued: now, arrived: now,
 		sequence: q.sequence, ready: make(chan struct{}), session: ar.Session,
-		prompt: max(ar.PromptTokens, 0), blocks: keys, tokens: tokens, maxOut: ar.MaxTokens,
+		prompt: max(ar.PromptTokens, 0), blocks: keys, tokens: tokens, maxOut: ar.MaxTokens, seqs: max(ar.Sequences, 1),
 		report: ar.Report, gen: ar.Generated, buffer: ar.Buffered,
 	}
 	q.sequence++

@@ -132,7 +132,7 @@ func (s *usageScanner) scanLine(line []byte) {
 		}
 	}
 	if s.chunks != nil && len(chunk.Choices) > 0 {
-		s.chunks.Chunk()
+		s.chunks.Chunks(len(chunk.Choices)) // a chunk may carry several choices
 	}
 }
 

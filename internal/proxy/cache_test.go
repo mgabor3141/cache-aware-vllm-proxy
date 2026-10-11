@@ -740,7 +740,7 @@ func TestCacheAdmissionAbortedTurnKeepsHold(t *testing.T) {
 		done <- rel
 	}()
 	rel := <-done
-	gen.Chunk()
+	gen.Chunks(1)
 	rel() // the client left mid-stream: no usage, but output streamed
 	if h := q.sessions["t"].held; h != 32*3200 {
 		t.Fatalf("held %d, want the measured prompt in whole blocks", h)

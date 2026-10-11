@@ -102,8 +102,8 @@ func (q *AdmissionQueue) NewOutputCounter() *OutputCounter {
 	return &OutputCounter{perChunk: int64(q.cfg.Cache.TokensPerChunk)}
 }
 
-// Chunk counts one streamed choice chunk that carried no usage.
-func (c *OutputCounter) Chunk() { c.n.Add(c.perChunk) }
+// Chunks counts a streamed chunk that carried no usage: one token per choice in it.
+func (c *OutputCounter) Chunks(n int) { c.n.Add(int64(n) * c.perChunk) }
 
 // Usage records the completion tokens a chunk's usage reports (a running total).
 func (c *OutputCounter) Usage(completionTokens int64) { c.n.Store(completionTokens) }
@@ -354,6 +354,9 @@ func (q *AdmissionQueue) chargeLocked(w *admissionWaiter) int {
 	} else {
 		w.expOut = q.expectedOutput(q.sessions[w.session], w.maxOut)
 	}
+	// Each sequence (choice, batched prompt) has its own output; the prompt is shared or
+	// already sized as the sum of the prompts.
+	w.expOut *= max(w.seqs, 1)
 	return q.liveCharge(w)
 }
 
@@ -724,7 +727,7 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 	}
 	o, ok := obs()
 	if ok && o.PromptTokens > 0 {
-		s.outputs = pushInt(s.outputs, o.CompletionTokens)
+		s.outputs = pushInt(s.outputs, o.CompletionTokens/max(w.seqs, 1)) // per sequence
 	} else if g := w.generated(); g > 0 && w.prompt > 0 {
 		o, ok = CacheObservation{PromptTokens: w.prompt, CompletionTokens: g}, true
 	} else {

@@ -145,7 +145,8 @@ hold its place on the engine.
 from admission, since their output is not seen until they finish. A client that sends a large
 `max_tokens` (often the context length) is charged up to the whole pool: it still runs, but
 nothing runs beside it. Prefer streaming, whose output is charged as it arrives, or a realistic
-`max_tokens`.
+`max_tokens`. Several choices (`n`) or a batched `/v1/completions` prompt are several
+sequences, each charged its own expected output.
 
 **Engine restarts.** A readiness probe asks the engine's `/v1/models` every
 `readiness.interval` (5 s); the engine is ready while it lists a model. While it is not,
@@ -187,7 +188,7 @@ Left unset, both are 28, the largest figure measured so far: safe on the engines
 wasteful on a plain transformer, which needs close to none.
 
 Output is charged as it streams: from the stream's own token counts when it reports usage on
-every chunk, else as `tokens_per_chunk` tokens per chunk (default 1; with speculative decoding
+every chunk, else as `tokens_per_chunk` tokens per choice in each chunk (default 1; with speculative decoding
 set 1 plus the draft length, e.g. 4 for MTP with 3 draft tokens).
 
 ### Measuring it
