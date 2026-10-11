@@ -16,6 +16,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,7 +136,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	route := apiRoute(r)
-	ev := &Event{TS: start.UTC().Format(time.RFC3339Nano), Method: r.Method, Path: r.URL.Path}
+	ev := &Event{TS: start.UTC().Format(time.RFC3339Nano), Method: r.Method, Path: r.URL.Path,
+		RequestID: requestID(r)}
+	w.Header().Set("X-Request-Id", ev.RequestID)
 	defer func() {
 		ev.LatencyMS = time.Since(start).Milliseconds()
 		p.logger.Log(ev)
@@ -185,6 +189,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		p.serveInference(w, r, ev, who, body)
 	}
+}
+
+// requestID returns the request's X-Request-Id, making one up when it has none (or one
+// too long to log), and sets it on r so the engine gets it too.
+func requestID(r *http.Request) string {
+	id := r.Header.Get("X-Request-Id")
+	if id == "" || len(id) > 128 {
+		var b [12]byte
+		_, _ = rand.Read(b[:])
+		id = hex.EncodeToString(b[:])
+	}
+	r.Header.Set("X-Request-Id", id)
+	return id
 }
 
 // readBody reads the request body, at most max_body_bytes of it. On failure it has

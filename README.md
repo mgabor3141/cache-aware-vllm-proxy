@@ -111,7 +111,9 @@ cavp serves a small, fixed set of routes; everything else is 404:
 `/healthz`, `/readyz` and `/metrics` need no credentials and expose only totals. Every other
 route requires a caller (`auth` in the config: `static` bearer keys, `trusted_header` behind a
 gateway, or `none`). Only `Content-Type`, `Accept`, `User-Agent` and `X-Request-Id` are passed
-to the engine; the engine must not require an API key.
+to the engine; the engine must not require an API key. Every request has an `X-Request-Id`: the
+caller's, else one the proxy makes up. It is sent to the engine, echoed in the response and
+logged as `request_id`.
 
 **Bodies** are forwarded as sent, with two changes. `priority` is set by the proxy: the
 caller's identity is the most urgent it may run, and a numeric `priority` field in the body
