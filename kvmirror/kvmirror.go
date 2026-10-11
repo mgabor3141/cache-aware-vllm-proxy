@@ -339,6 +339,9 @@ type Stats struct {
 	// SkippedHash are block hashes of a type the mirror cannot read: those blocks are not
 	// stored or removed.
 	SkippedHash uint64
+	// SkippedMedium are events about another medium than the GPU (CPU or disk offload):
+	// the engine serves no prefix hit from them directly, so they are not applied.
+	SkippedMedium uint64
 }
 
 func New() *Mirror {
@@ -503,6 +506,8 @@ func (m *Mirror) clearLocked() {
 
 func (m *Mirror) applyLocked(e *Event) {
 	if e.Medium != nil && *e.Medium != "" && *e.Medium != "GPU" {
+		m.stats.SkippedMedium++
+		m.warnSkipLocked("medium", fmt.Sprintf("kv events for medium %q (KV offload) are not mirrored: only GPU blocks are", *e.Medium))
 		return
 	}
 	switch e.Type {

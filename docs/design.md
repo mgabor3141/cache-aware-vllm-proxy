@@ -85,7 +85,9 @@ The mirror is only as good as the stream. On every (re)subscription it starts em
 from the publisher's replay buffer; until that replay completes it reports nothing cached, and a
 replay that fails ends the subscription so it is retried. Batches missing from the replay
 buffer are skipped and the mirror starts over from the batch after them (they may have removed
-blocks); undecodable batches are skipped. Neither fails every retry. A sequence number that goes backwards
+blocks); undecodable batches are skipped. Neither fails every retry. Events the mirror cannot
+use are counted and logged once, never applied: blocks on another medium than the GPU (CPU or
+disk KV offload), events without a usable `group_idx`, and block hashes of an unknown type. A sequence number that goes backwards
 outside the replay overlap means the engine restarted: the mirror starts over, resyncs from the
 replay, and its generation moves so admission sees its holds may be gone. The same goes for a
 restart seen inside the replay: each later round asks from the last batch already applied, and a
