@@ -80,7 +80,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	gauge("cavp_active_requests", "Admitted requests running on the engine.", a.active)
 	gauge("cavp_cache_used_tokens", "Modelled KV cache use: running requests and held contexts.", a.usedTokens)
 	gauge("cavp_cache_budget_tokens", "KV cache budget (the engine's pool; 0 until known).", a.budgetTokens)
-	gauge("cavp_cache_held_tokens", "Tokens held for idle conversations.", a.held)
+	gauge("cavp_cache_held_tokens", "Tokens held for conversations, idle or with a request running.", a.held)
 	gauge("cavp_guard_margin_blocks", "Overcommit guard margin added to each running request.", a.marginBlocks)
 	counter("cavp_guard_raises_total", "Times the overcommit guard raised its margin.", uint64(a.marginRaises))
 	counter("cavp_cache_displaced_tokens_total", "Held tokens released to make room for other work (or forgotten with a full session table).", uint64(a.displaced))

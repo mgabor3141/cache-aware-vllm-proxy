@@ -88,7 +88,8 @@ else a configured number of tokens per chunk (1 plus the draft length under spec
 decoding). A non-streaming request is charged its expected output until it finishes.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
-admitted on top of it. A hold is firm (cannot be displaced by work of the same or lower
+admitted on top of it. It stays counted while the conversation's next request runs (the session is
+charged the larger of the two, which share the prefix). A hold is firm (cannot be displaced by work of the same or lower
 priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
 that prefill would slow, and at least 5 s so a quick tool call always comes back warm. After that
 it is expendable: it stays while nothing needs the room. A hold has the priority of the turn that

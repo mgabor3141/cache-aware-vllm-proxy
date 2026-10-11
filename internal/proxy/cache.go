@@ -13,7 +13,8 @@ package proxy
 // Space, in tokens against the engine's pool:
 //   running request  its prompt plus the larger of its output so far and its expected
 //                    output, in whole blocks, plus a per-request overhead (guard.go).
-//   idle session     its last prompt, held until displaced. Displacing it is all
+//   session hold     its last prompt, held until displaced, and still counted while
+//                    its own next request runs (the larger of the two). Displacing it is all
 //                    or nothing: with speculative decoding the engine drops a prompt's last
 //                    cached block before matching, so losing the tail loses the whole hit.
 //
@@ -309,12 +310,12 @@ func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 	}
 }
 
+// heldLocked is every session's held prompt, idle or not: a session's own running request
+// does not release the prefix the engine still has cached.
 func (q *AdmissionQueue) heldLocked(now time.Time) int {
 	held := 0
 	for _, s := range q.sessions {
-		if s.holding(now) {
-			held += s.held
-		}
+		held += s.held
 	}
 	return held
 }
@@ -353,8 +354,33 @@ func (q *AdmissionQueue) runningLocked() int {
 	return model
 }
 
+// cacheUsedLocked is the modelled occupancy: running requests and holds, a session with
+// both charged the larger of its hold and its running requests (they share its prefix).
 func (q *AdmissionQueue) cacheUsedLocked(now time.Time) int {
-	return q.runningLocked() + q.heldLocked(now)
+	used := q.heldLocked(now)
+	own := map[*cacheSession]int{}
+	for w := range q.running {
+		if s := q.sessions[w.session]; s != nil && s.held > 0 {
+			own[s] += q.liveCharge(w)
+		} else {
+			used += q.liveCharge(w)
+		}
+	}
+	for s, run := range own {
+		used += max(run, s.held) - s.held
+	}
+	return used
+}
+
+// sessionRunningLocked is the live charge of a session's running requests.
+func (q *AdmissionQueue) sessionRunningLocked(s *cacheSession) int {
+	run := 0
+	for w := range q.running {
+		if q.sessions[w.session] == s {
+			run += q.liveCharge(w)
+		}
+	}
+	return run
 }
 
 // cachedLocked is the waiter's prefix the engine holds now, per the mirror.
@@ -381,10 +407,11 @@ type displacement struct {
 func (q *AdmissionQueue) needLocked(w *admissionWaiter, now time.Time) int {
 	budget := q.budget()
 	charge := min(q.chargeLocked(w), budget)
-	own := q.sessions[w.session]
 	free := budget - q.cacheUsedLocked(now)
-	if own != nil && own.holding(now) {
-		free += own.held
+	if own := q.sessions[w.session]; own != nil && own.held > 0 {
+		// The session is charged the larger of its hold and its running requests.
+		run := q.sessionRunningLocked(own)
+		charge = max(own.held, run+charge) - max(own.held, run)
 	}
 	return charge - free
 }
@@ -541,7 +568,7 @@ func (q *AdmissionQueue) syncHoldsLocked(now time.Time) {
 		return
 	}
 	for _, s := range q.sessions {
-		if s.holding(now) {
+		if s.held > 0 {
 			q.judgeHoldLocked(s)
 		}
 	}
