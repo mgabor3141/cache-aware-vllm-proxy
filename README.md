@@ -138,8 +138,8 @@ reached the engine returns its error (for a stream, as an SSE error event after 
 complete event: an event the engine left half written is dropped, never relayed).
 
 **Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
-status and an `error` when it failed or ended without `[DONE]`; `status` 499 for a client that
-left while waiting; token usage including `cached_prompt_tokens` (with
+status, or 502 with an `error` when it failed or ended without `[DONE]`; `status` 499 for a
+client that left before the end; token usage including `cached_prompt_tokens` (with
 `--enable-prompt-tokens-details`; without it `usage_details` is absent and the hit-ratio
 counters in `/metrics` stay at zero rather than report misses).
 

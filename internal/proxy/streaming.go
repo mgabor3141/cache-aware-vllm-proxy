@@ -4,8 +4,8 @@
 // silent, e.g. while a long prompt prefills.
 //
 // Once the 200 is out, failures reach the client as one SSE error event followed by
-// "data: [DONE]"; the log line carries the real outcome (the engine's status, and an
-// error when the stream failed or ended without [DONE]).
+// "data: [DONE]"; the log line and metrics carry the real outcome (the engine's status,
+// 502 when the stream failed or ended without [DONE], 499 when the client left).
 package proxy
 
 import (
@@ -92,13 +92,13 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 		if n > 0 {
 			scan.Write(buf[:n])
 			if werr := sw.relay(buf[:n]); werr != nil {
-				ev.Error = "client went away mid-stream: " + werr.Error()
+				ev.Status, ev.Error = statusClientGone, "client went away mid-stream: "+werr.Error()
 				return
 			}
 		}
 		if rerr == io.EOF {
 			if !scan.done {
-				ev.Error = "stream ended without [DONE]"
+				ev.Status, ev.Error = http.StatusBadGateway, "stream ended without [DONE]"
 				sw.errorEvent("the engine ended the stream early", http.StatusBadGateway)
 				return
 			}
@@ -107,10 +107,10 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 		}
 		if rerr != nil {
 			if r.Context().Err() != nil {
-				ev.Error = "client went away mid-stream"
+				ev.Status, ev.Error = statusClientGone, "client went away mid-stream"
 				return
 			}
-			ev.Error = "engine stream cut: " + rerr.Error()
+			ev.Status, ev.Error = http.StatusBadGateway, "engine stream cut: "+rerr.Error()
 			sw.errorEvent("the engine stream failed", http.StatusBadGateway)
 			return
 		}

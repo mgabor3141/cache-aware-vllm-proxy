@@ -449,7 +449,7 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 		if n > 0 {
 			keep.Write(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				ev.Error = "client went away: " + werr.Error()
+				ev.Status, ev.Error = statusClientGone, "client went away: "+werr.Error()
 				return
 			}
 		}
@@ -457,9 +457,9 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 			return
 		}
 		if rerr != nil {
-			ev.Error = "engine response cut: " + rerr.Error()
+			ev.Status, ev.Error = http.StatusBadGateway, "engine response cut: "+rerr.Error()
 			if r.Context().Err() != nil {
-				ev.Error = "client went away"
+				ev.Status, ev.Error = statusClientGone, "client went away"
 				return
 			}
 			panic(http.ErrAbortHandler)
