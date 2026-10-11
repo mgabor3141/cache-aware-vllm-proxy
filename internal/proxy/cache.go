@@ -25,7 +25,7 @@ package proxy
 // (with the decoding that prefill stalls), at least minHold, and as long again once its own thread
 // starts waiting (holdFor, firm). After that it is expendable: an equal-priority waiter may
 // displace it while fewer than evictBelowRunning requests run. A higher-priority waiter
-// may displace any lower-priority hold (fitLocked). Waiting long forces nothing, so many
+// may displace any lower-priority hold, idle or not (displaceable). Waiting long forces nothing, so many
 // waiters cannot start thrashing together.
 //
 // Holds steer admission only. The engine evicts free blocks least recently used first,
@@ -467,11 +467,16 @@ func (q *AdmissionQueue) grantStateLocked(now time.Time) *grantState {
 }
 
 // displaceable: a waiter at priority p may displace s. A higher priority may displace any
-// lower-priority idle hold. Otherwise only expendable holds (past holdFor) go, and only
-// while the engine is under-used. With nothing running, the head waiter may take any
-// equal-priority hold: nothing else will free room, so this guarantees progress.
+// lower-priority hold, even while its session runs a request (the running request stays
+// charged; only the hold goes), so an agent that overlaps calls cannot pin its hold.
+// Otherwise only idle, expendable holds (past holdFor) go, and only while the engine is
+// under-used. With nothing running, the head waiter may take any equal-priority hold:
+// nothing else will free room, so this guarantees progress.
 func (q *AdmissionQueue) displaceable(p int, s *cacheSession, now time.Time) bool {
-	return s.holding(now) && (p < s.priority || (q.active == 0 && p == s.priority) ||
+	if s.held > 0 && p < s.priority {
+		return true
+	}
+	return s.holding(now) && ((q.active == 0 && p == s.priority) ||
 		(!q.firm(s, now) && q.active < evictBelowRunning))
 }
 

@@ -92,7 +92,8 @@ decoding). A non-streaming request is charged its expected output until it finis
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
 admitted on top of it. It stays counted while the conversation's next request runs (the session is
-charged the larger of the two, which share the prefix). A hold is firm (cannot be displaced by work of the same or lower
+charged the larger of the two, which share the prefix); a higher-priority waiter may still
+displace it then. A hold is firm (cannot be displaced by work of the same or lower
 priority) for as long as re-prefilling the context would take, scaled up by the decoding streams
 that prefill would slow, and at least 5 s so a quick tool call always comes back warm, and as
 long again from when its conversation's next request starts waiting. After that

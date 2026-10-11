@@ -232,3 +232,27 @@ func TestGrantPassBlockedWaitersCheap(t *testing.T) {
 		t.Errorf("a pass over 100 blocked waiters made %.0f allocations: it builds displacement candidates per waiter", allocs)
 	}
 }
+
+// A lower-priority session that keeps an overlapping side call running cannot pin its
+// hold against a higher-priority waiter (rev-1 F1).
+func TestRunningSessionHoldYieldsToHigherPriority(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	ta := q.start("a", 5, 300000)
+	ta.finish(mustAdmit(t, ta, "a"), 300000, 0)
+	clk.add(time.Hour)
+	cur := mustAdmit(t, q.start("a", 5, 2000), "side0")
+	x := q.start("x", 0, 500000)
+	for i := 0; i < 20; i++ {
+		if rel := x.waitAdmitted(20 * time.Millisecond); rel != nil {
+			rel()
+			cur()
+			return
+		}
+		clk.add(time.Minute)
+		next := mustAdmit(t, q.start("a", 5, 2000), "side")
+		cur()
+		cur = next
+		q.tick()
+	}
+	t.Errorf("x starved behind a's pinned hold")
+}
