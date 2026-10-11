@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"testing"
+	"time"
+
+	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
 )
 
 // A session's held prefix stays in the budget while one of its own requests runs: the
@@ -23,4 +26,52 @@ func TestHoldChargedWhileOwnRequestRuns(t *testing.T) {
 	mustWait(t, x, "x beside a's running side call and its hold")
 	rs()
 	q.tick()
+}
+
+// A hold the mirror cannot verify (no token IDs: /tokenize failed) has a bounded life: it
+// is released once it is no longer firm, even with the engine busy (invariants #2).
+func TestUnverifiedHoldReleasedAfterHoldWindow(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	q.mirror.SetConnected(true)
+	ta := q.start("a", 0, 200000)
+	ta.finish(mustAdmit(t, ta, "a"), 200000, 0)
+	q.tick()
+	if q.sessionHeld("a") == 0 {
+		t.Fatal("setup: a holds nothing")
+	}
+	var rels []func()
+	for _, k := range []string{"r1", "r2", "r3", "r4"} {
+		rels = append(rels, mustAdmit(t, q.start(k, 0, 1000), k))
+	}
+	big := q.start("big", 0, 200000)
+	q.tick()
+	mustWait(t, big, "big while a's unverified hold is firm")
+	clk.add(10 * time.Minute)
+	q.tick()
+	rel := big.waitAdmitted(time.Second)
+	if rel == nil {
+		t.Fatalf("big starved: a's unverifiable hold (%d) outlived its hold window", q.sessionHeld("a"))
+	}
+	rel()
+	for _, r := range rels {
+		r()
+	}
+}
+
+// A mirror reset releases a hold whose first look saw nothing, even while it is firm
+// (vLLM #9).
+func TestUnverifiedHoldReleasedOnMirrorReset(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	q.mirror.SetConnected(true)
+	ta := q.start("a", 0, 200000)
+	ta.finish(mustAdmit(t, ta, "a"), 200000, 0)
+	q.tick()
+	if q.sessionHeld("a") == 0 {
+		t.Fatal("setup: a holds nothing")
+	}
+	q.mirror.Apply(-1, []kvmirror.Event{{Type: "AllBlocksCleared"}})
+	q.tick()
+	if h := q.sessionHeld("a"); h != 0 {
+		t.Errorf("a still holds %d after a mirror reset it was never seen through", h)
+	}
 }

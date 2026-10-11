@@ -569,29 +569,30 @@ func (q *AdmissionQueue) syncHoldsLocked(now time.Time) {
 	}
 	for _, s := range q.sessions {
 		if s.held > 0 {
-			q.judgeHoldLocked(s)
+			q.judgeHoldLocked(s, now)
 		}
 	}
 }
 
 // judgeHoldLocked checks one hold against a healthy mirror. The first look records how
 // much of it is cached, and a hold that later falls below half of that is gone (evicted,
-// or lost to an engine restart or a resync whose replay did not reach it). A first look
-// that sees nothing is evidence too when the mirror was reset since the turn was admitted:
-// the engine's cache, or the mirror's view of it, started over, so the hold is gone. With
-// no reset in between, a hold the mirror sees nothing of cannot be matched (its blocks
-// carry extra hash keys, or it is a block or two, which the engine never serves whole)
-// and stays unjudged until displaced.
-func (q *AdmissionQueue) judgeHoldLocked(s *cacheSession) {
-	if s.heldSeen == 0 {
-		return
-	}
+// or lost to an engine restart or a resync whose replay did not reach it). Seeing nothing
+// is evidence too when the mirror was reset since the turn was admitted: the engine's
+// cache, or the mirror's view of it, started over, so the hold is gone. With no reset in
+// between, a hold the mirror sees nothing of cannot be verified (no token IDs, blocks with
+// extra hash keys, or a block or two, which the engine never serves whole). It is kept
+// while firm and released after, and it is judged again on every pass, so a later reset
+// releases it and blocks that show up later make it verified.
+func (q *AdmissionQueue) judgeHoldLocked(s *cacheSession, now time.Time) {
 	cached := q.mirror.Cached(s.heldBlocks)
 	switch {
 	case s.heldSeen > 0 && cached >= s.heldSeen/2:
 		return
-	case s.heldSeen < 0 && (cached > 0 || q.mirror.Generation() == s.heldGen):
+	case s.heldSeen <= 0 && cached > 0:
 		s.heldSeen = cached
+		return
+	case s.heldSeen <= 0 && q.mirror.Generation() == s.heldGen && (s.heldSeen < 0 || q.firm(s, now)):
+		s.heldSeen = 0
 		return
 	}
 	q.dropHoldLocked(s)
@@ -660,7 +661,7 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 		s.heldSeen, s.heldGen = -1, s.busyGen
 		s.priority = s.busyPriority
 		if q.mirror.Healthy() {
-			q.judgeHoldLocked(s) // the first look, while the blocks are fresh
+			q.judgeHoldLocked(s, now) // the first look, while the blocks are fresh
 		}
 	}
 	s.busyFootprint, s.busyPrompt, s.busyBlocks = 0, 0, kvmirror.PromptKeys{}

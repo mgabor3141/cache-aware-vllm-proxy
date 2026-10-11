@@ -72,7 +72,9 @@ from the publisher's replay buffer; until that replay completes it reports nothi
 replay that fails ends the subscription so it is retried. A sequence number that goes backwards
 outside the replay overlap means the engine restarted, and the mirror starts over. Holds are
 judged against whatever the mirror holds now: a hold the mirror no longer sees (evicted, lost to
-a restart, or older than the replay buffer reaches) is released.
+a restart, or older than the replay buffer reaches) is released. A hold the mirror never saw
+(the prompt could not be tokenized, or its blocks carry extra hash keys) cannot be verified: it
+is released once it is no longer firm, or at once when the mirror starts over.
 
 ## Admission
 
