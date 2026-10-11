@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -136,7 +137,7 @@ func TestDisplacementVictimsDeterministic(t *testing.T) {
 	}
 	w := &admissionWaiter{session: "w", prompt: 300000, maxOut: 4000}
 	for i := 0; i < 60; i++ {
-		plan, ok := q.fitLocked(w, clk.now().Add(time.Hour), 0)
+		plan, ok := q.fitLocked(w, clk.now().Add(time.Hour), 0, q.grantStateLocked(clk.now().Add(time.Hour)))
 		if !ok || len(plan) != 2 || plan[0].s != q.sessions["a"] || plan[1].s != q.sessions["b"] {
 			var got []string
 			for _, d := range plan {
@@ -191,4 +192,43 @@ func TestCoveredRequestIgnoresReservations(t *testing.T) {
 	}
 	rel()
 	r1()
+}
+
+// With every slot taken, a grant pass returns before it scores waiters against the
+// mirror (scale #2).
+func TestGrantPassWithSlotsFullDoesNotScore(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	w := &admissionWaiter{session: "w", prompt: 3200, tokens: testPrompt(1, 1), ready: make(chan struct{})}
+	q.waiters = append(q.waiters, w)
+	q.active = q.cfg.MaxActive
+	q.grantLocked()
+	if w.blocks.BlockSize != 0 {
+		t.Error("a pass with no free slot built the waiter's mirror keys")
+	}
+}
+
+// A grant pass does not scan every hold for every blocked waiter: its work per waiter
+// does not grow with the session table (scale #1).
+func TestGrantPassBlockedWaitersCheap(t *testing.T) {
+	q, clk := newCacheQueue(t, nil)
+	mustAdmit(t, q.start("r1", 0, 300000), "r1")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := 0; i < 10; i++ {
+		k := fmt.Sprintf("h%d", i)
+		q.sessions[k] = &cacheSession{key: k, held: 3200, heldSeen: -1, lastDone: clk.now().Add(-time.Hour)}
+	}
+	for i := 0; i < 100; i++ {
+		q.waiters = append(q.waiters, &admissionWaiter{session: fmt.Sprintf("w%d", i), prompt: 400000,
+			maxOut: 4000, enqueued: clk.now(), ready: make(chan struct{})})
+	}
+	allocs := testing.AllocsPerRun(5, q.grantLocked)
+	if len(q.waiters) != 100 {
+		t.Fatalf("setup: %d waiters left, want all 100 blocked", len(q.waiters))
+	}
+	if allocs >= 100 {
+		t.Errorf("a pass over 100 blocked waiters made %.0f allocations: it builds displacement candidates per waiter", allocs)
+	}
 }
