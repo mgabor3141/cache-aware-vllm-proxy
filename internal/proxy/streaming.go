@@ -105,7 +105,7 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 			if scan.done {
 				// [DONE] ends the turn. An engine (or something in front of it) may keep
 				// the response open after it; the permit must not wait for that.
-				sw.finish()
+				sw.finishAtDone()
 				return
 			}
 		}
@@ -239,6 +239,22 @@ func (s *sseWriter) finish() {
 		_ = s.writeLocked(s.pending)
 		s.pending = nil
 	}
+}
+
+// finishAtDone is finish for a stream that ended at its [DONE] line: the engine may not
+// have sent the blank line that ends the event yet (a split read), and a strict SSE
+// client only dispatches the event on it, so it is completed here.
+func (s *sseWriter) finishAtDone() {
+	s.mu.Lock()
+	if len(s.pending) > 0 && !endsEvent(s.pending) {
+		if bytes.HasSuffix(s.pending, []byte("\r\n")) {
+			s.pending = append(s.pending, "\r\n"...)
+		} else {
+			s.pending = append(s.pending, '\n')
+		}
+	}
+	s.mu.Unlock()
+	s.finish()
 }
 
 // eventBoundary is the length of b's complete events: up to and including its last
