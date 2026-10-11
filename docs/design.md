@@ -68,7 +68,8 @@ next turn resumes there, at for example 2 blocks and 31 units (10,176 tokens), n
 full block. The mirror matches these events. It takes the unit from `prefix_match_unit` in
 `vllm:cache_config_info`, else from the size of the unit events, and follows the engine's rule:
 the attention layers reach through the contiguous cached full blocks and then the next block's
-unit boundaries, probed from the top; speculative decoding drops one unit rather than a block;
+unit boundaries, probed from the top but never past the prompt's last token (the engine recomputes it, so
+a prompt that ends on a unit boundary cannot read the entry it registers there; a longer one can); speculative decoding drops one unit rather than a block;
 the hit is the newest boundary at or below that with a recurrent checkpoint, which may lie a
 block or more lower (a turn whose decode filled the block its prompt ended in leaves its
 checkpoint below a block the next turn matches whole). Unit matching only adds boundaries to

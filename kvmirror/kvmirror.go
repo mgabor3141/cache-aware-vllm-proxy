@@ -163,6 +163,9 @@ type Mirror struct {
 // size than the mirror's match nothing, at another unit no unit hit.
 type PromptKeys struct {
 	BlockSize int
+	// Limit is the prompt's token count: the engine bounds its lookup at Limit-1, as it
+	// recomputes the last token. 0 leaves the unit probe unbounded.
+	Limit     int
 	Blocks    []BlockKey
 	Unit      int
 	UnitsFrom int
@@ -184,7 +187,9 @@ func (k PromptKeys) unitKey(x int) (uint64, bool) {
 // on: where the engine registers this prompt's own end, the one unit hit it can have once
 // it has run. Call it when the prompt is admitted, so a running request or an idle session
 // keeps at most a block's worth of unit keys (66 at 4096/64) whatever the prompt's length.
+// The keys then stand for the session's next turn, which extends the prompt, so Limit is cleared.
 func (k PromptKeys) Tail() PromptKeys {
+	k.Limit = 0
 	if k.Unit <= 0 {
 		return k
 	}
@@ -233,7 +238,7 @@ func (m *Mirror) NewPromptKeys(prompt []int64) PromptKeys {
 	m.mu.Lock()
 	bs, unit, drop := m.blockSize, m.unitLocked(), m.dropLast
 	m.mu.Unlock()
-	k := PromptKeys{BlockSize: bs, Blocks: PromptBlockKeys(prompt, bs)}
+	k := PromptKeys{BlockSize: bs, Limit: len(prompt), Blocks: PromptBlockKeys(prompt, bs)}
 	if unit <= 0 || bs <= 0 {
 		return k
 	}
@@ -709,7 +714,13 @@ func (m *Mirror) Cached(k PromptKeys) int {
 // cached full blocks) whose attention entry the engine holds, or 0.
 func (m *Mirror) attentionReachLocked(k PromptKeys, c int) int {
 	u, bs := k.Unit, k.BlockSize
-	for q := (c+1)*bs - u; q > c*bs; q -= u {
+	top := (c+1)*bs - u
+	if k.Limit > 0 {
+		// The engine reads no boundary past Limit-1: the entry an aligned prompt
+		// registers at its own end serves only longer prompts, not a resend of it.
+		top = min(top, (k.Limit-1)/u*u)
+	}
+	for q := top; q > c*bs; q -= u {
 		if e, ok := m.endLocked(k, q); ok && e.attn && m.heldLocked(e.content, m.attnMask) {
 			return q
 		}
