@@ -105,7 +105,7 @@ cavp serves a small, fixed set of routes; everything else is 404:
 | `POST /v1/tokenize`, `POST /tokenize` | forwarded to the engine's `/tokenize`, not admitted; shares the proxy's 4 tokenize slots (it waits for one) |
 | `GET /v1/models` | the engine's model list, unchanged |
 | `GET /healthz` | the process is up |
-| `GET /readyz` | the engine is ready (see below) |
+| `GET /readyz` | the engine is ready (see below) and its KV pool is known |
 | `GET /metrics` | aggregate state, Prometheus text format |
 
 `/healthz`, `/readyz` and `/metrics` need no credentials and expose only totals. Every other

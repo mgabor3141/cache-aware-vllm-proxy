@@ -651,3 +651,10 @@ type CacheObservation struct {
 	PromptTokens     int
 	CompletionTokens int
 }
+
+// PoolKnown reports whether the engine's KV pool is known; nothing is admitted until it is.
+func (q *AdmissionQueue) PoolKnown() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.budget() > 0
+}

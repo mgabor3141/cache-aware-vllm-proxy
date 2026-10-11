@@ -122,8 +122,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, "ok\n")
 			return
 		case "/readyz":
+			// Ready means requests can be served: the engine answers and its KV pool is
+			// known (until then admission admits nothing).
 			if !p.ready.Ready() {
 				http.Error(w, "engine not ready", http.StatusServiceUnavailable)
+				return
+			}
+			if !p.admission.PoolKnown() {
+				http.Error(w, "engine KV pool unknown", http.StatusServiceUnavailable)
 				return
 			}
 			io.WriteString(w, "ok\n")
