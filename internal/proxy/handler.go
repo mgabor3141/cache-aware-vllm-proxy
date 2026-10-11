@@ -362,6 +362,7 @@ func (p *Proxy) admit(ctx context.Context, r *http.Request, ev *Event) (func(), 
 	if !ok {
 		return nil, gone()
 	}
+	p.metrics.admitted(adm.Wait)
 	// The engine may have gone away while this request queued. Wait for it again,
 	// holding the permit: nothing runs meanwhile, and the request keeps its turn.
 	if !p.ready.Ready() {
@@ -554,6 +555,9 @@ func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event
 		// real request repeats, or a changed route that it does not.
 		ar.PromptTokens = int(ev.textBytes / fallbackBytesPerToken)
 		ev.TokenizeError = err.Error()
+		if ctx.Err() == nil {
+			p.metrics.tokenizeFailed()
+		}
 	}
 	ev.EstPromptTokens = ar.PromptTokens
 	return ar

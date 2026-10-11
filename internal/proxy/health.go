@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,8 @@ type readiness struct {
 	mu      sync.Mutex
 	ready   bool
 	changed chan struct{} // closed and replaced on every change of ready
+
+	waiting atomic.Int64 // requests in Wait while the engine is not ready
 }
 
 func newReadiness(upstream string, interval time.Duration) *readiness {
@@ -44,12 +47,18 @@ func (h *readiness) Ready() bool {
 
 // Wait returns nil once the engine is ready, or ctx's error if it is cancelled first.
 func (h *readiness) Wait(ctx context.Context) error {
+	counted := false
 	for {
 		h.mu.Lock()
 		ready, changed := h.ready, h.changed
 		h.mu.Unlock()
 		if ready {
 			return nil
+		}
+		if !counted {
+			counted = true
+			h.waiting.Add(1)
+			defer h.waiting.Add(-1)
 		}
 		select {
 		case <-ctx.Done():

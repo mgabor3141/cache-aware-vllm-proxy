@@ -82,7 +82,11 @@ curl -N localhost:4001/v1/chat/completions \
 ```
 
 Each request logs one JSON line on stdout; `curl localhost:4001/metrics` shows the queue and
-the cache. Clients need no changes: a conversation is identified by its first two messages.
+the cache: requests waiting for the engine (`cavp_ready_wait_requests`) and for admission
+(`cavp_queue_length`, `cavp_queue_oldest_wait_seconds`, the `cavp_queue_wait_seconds` histogram),
+and failures to size prompts or read the engine's metrics (`cavp_tokenize_errors_total`,
+`cavp_engine_metrics_errors_total`). Clients need no changes: a conversation is identified by
+its first two messages.
 
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
 engine's cache from the replay whenever it (re)subscribes, and treats every prompt as uncached

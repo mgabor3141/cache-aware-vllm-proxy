@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/kvmirror"
@@ -64,7 +65,9 @@ type AdmissionQueue struct {
 	active    int
 	sequence  uint64
 	waiters   []*admissionWaiter
-	now       func() time.Time
+	// engineMetricsErrors counts failed reads of the engine's /metrics.
+	engineMetricsErrors atomic.Uint64
+	now                 func() time.Time
 
 	sessions     map[string]*cacheSession
 	running      map[*admissionWaiter]struct{}
