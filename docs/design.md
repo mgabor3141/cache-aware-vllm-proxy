@@ -85,7 +85,9 @@ and a fixed per-request overhead in blocks for state the engine keeps beyond the
 waiter is priced when it is granted, so a raised overhead reaches the queue too. The charge
 updates as output streams: from the stream's own token counts when it reports usage per chunk,
 else a configured number of tokens per chunk (1 plus the draft length under speculative
-decoding). A non-streaming request is charged its expected output until it finishes.
+decoding). A non-streaming request is charged its whole output cap from admission until it
+finishes: its `max_tokens`, else `default_output_tokens`, since nothing raises its charge while
+it runs.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
 admitted on top of it. A hold is firm (cannot be displaced by work of the same or lower

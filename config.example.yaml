@@ -53,7 +53,8 @@ admission:
     decode_interference: 0.9
 
     # Output tokens reserved for a request until its conversation has history (then
-    # its 75th percentile); output beyond the reserve is charged as it streams.
+    # its 75th percentile); output beyond the reserve is charged as it streams. A
+    # non-streaming request without max_tokens is charged this much until it finishes.
     default_output_tokens: 2048
 
     # Output tokens a streamed chunk counts as, when the stream does not report usage per

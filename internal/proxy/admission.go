@@ -44,6 +44,7 @@ type admissionWaiter struct {
 	mirGen  uint64              // the mirror's generation when admitted
 	maxOut  int                 // the request's output cap (0: none)
 	expOut  int                 // expected output tokens, fixed at admission
+	buffer  bool                // output unseen until the end: charged the cap
 	gen     *OutputCounter
 	report  *AdmissionReport
 }
@@ -123,6 +124,10 @@ type AdmissionRequest struct {
 	// Generated, when set, counts output tokens so far; the request's charge grows with
 	// it once it passes the expected output.
 	Generated *OutputCounter
+	// Buffered marks a request whose output is not seen until it finishes (not
+	// streaming): it is charged its whole output cap from admission (MaxTokens, else
+	// default_output_tokens), since nothing raises its charge while it runs.
+	Buffered bool
 	// Observe is called at release and reports the engine's usage for the request.
 	Observe func() (CacheObservation, bool)
 	// Report, when set, is filled at admission time for the request log.
@@ -192,7 +197,7 @@ func (q *AdmissionQueue) enqueue(ar AdmissionRequest) (*admissionWaiter, bool, A
 		priority: ar.Priority, enqueued: now,
 		sequence: q.sequence, ready: make(chan struct{}), session: ar.Session,
 		prompt: max(ar.PromptTokens, 0), blocks: keys, tokens: tokens, maxOut: ar.MaxTokens,
-		report: ar.Report, gen: ar.Generated,
+		report: ar.Report, gen: ar.Generated, buffer: ar.Buffered,
 	}
 	q.sequence++
 	// A client that timed out and retried keeps its place: its wait counts from the

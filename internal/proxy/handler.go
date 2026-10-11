@@ -486,16 +486,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // path recorded the status and usage.
 func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event) AdmissionRequest {
 	ev.report = &AdmissionReport{}
-	ev.generated = p.admission.NewOutputCounter()
 	ar := AdmissionRequest{
 		Priority: ev.Priority, Session: ev.Session, MaxTokens: ev.maxTokens,
-		Generated: ev.generated, Report: ev.report,
+		Buffered: !ev.Stream, Report: ev.report,
 		Observe: func() (CacheObservation, bool) {
 			if ev.PromptTokens <= 0 || ev.Status != http.StatusOK {
 				return CacheObservation{}, false
 			}
 			return CacheObservation{PromptTokens: ev.PromptTokens, CompletionTokens: ev.CompletionTokens}, true
 		},
+	}
+	if ev.Stream {
+		ev.generated = p.admission.NewOutputCounter()
+		ar.Generated = ev.generated
 	}
 	body := ev.body
 	ev.body = nil

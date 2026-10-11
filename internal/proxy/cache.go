@@ -337,7 +337,14 @@ func (q *AdmissionQueue) liveCharge(w *admissionWaiter) int {
 // chargeLocked is what a waiter would occupy if admitted now: priced at the current block
 // size, guard margin and session history, not frozen at arrival.
 func (q *AdmissionQueue) chargeLocked(w *admissionWaiter) int {
-	w.expOut = q.expectedOutput(q.sessions[w.session], w.maxOut)
+	if w.buffer {
+		w.expOut = w.maxOut
+		if w.expOut <= 0 {
+			w.expOut = q.cfg.Cache.DefaultOutputTokens
+		}
+	} else {
+		w.expOut = q.expectedOutput(q.sessions[w.session], w.maxOut)
+	}
 	return q.liveCharge(w)
 }
 
