@@ -146,7 +146,7 @@ func fetchPreemptions(ctx context.Context, upstream string) (preemptions map[str
 func runEnginePool(ctx context.Context, upstream string, q *AdmissionQueue) {
 	var last [3]int
 	for {
-		wait := time.Minute
+		wait := q.poolEvery
 		blocks, size, unit, err := fetchEnginePool(ctx, upstream)
 		switch {
 		case err != nil:
@@ -154,7 +154,7 @@ func runEnginePool(ctx context.Context, upstream string, q *AdmissionQueue) {
 				q.engineMetricsErrors.Add(1)
 			}
 			if last[0] == 0 {
-				wait = 10 * time.Second
+				wait = q.poolRetryEvery
 				log.Printf("level=warn msg=\"engine KV pool unknown, requests wait\" err=%q", err.Error())
 			}
 		case [3]int{blocks, size, unit} != last:

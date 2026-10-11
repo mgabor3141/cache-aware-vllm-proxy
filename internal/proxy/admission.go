@@ -86,12 +86,16 @@ type AdmissionQueue struct {
 
 	// mirror says what the engine has cached (fed by its KV events, run.go).
 	mirror *kvmirror.Mirror
+
+	// Background cadences (Run, runEnginePool); fields so tests can shorten them.
+	tickEvery, pruneEvery, poolEvery, poolRetryEvery time.Duration
 }
 
 func NewAdmissionQueue(cfg AdmissionConfig) *AdmissionQueue {
 	cfg.applyDefaults()
 	q := &AdmissionQueue{cfg: cfg, now: time.Now, sessions: map[string]*cacheSession{},
-		running: map[*admissionWaiter]struct{}{}, mirror: kvmirror.New()}
+		running: map[*admissionWaiter]struct{}{}, mirror: kvmirror.New(),
+		tickEvery: time.Second, pruneEvery: 10 * time.Minute, poolEvery: time.Minute, poolRetryEvery: 10 * time.Second}
 	q.mirror.SetSpeculative(cfg.Cache.SpeculativeDecoding)
 	return q
 }
@@ -99,9 +103,9 @@ func NewAdmissionQueue(cfg AdmissionConfig) *AdmissionQueue {
 // Run re-evaluates the queue once a second: holds the engine dropped are released and
 // expendable holds become displaceable without a request finishing first.
 func (q *AdmissionQueue) Run(ctx context.Context) {
-	t := time.NewTicker(time.Second)
+	t := time.NewTicker(q.tickEvery)
 	defer t.Stop()
-	prune := time.NewTicker(10 * time.Minute)
+	prune := time.NewTicker(q.pruneEvery)
 	defer prune.Stop()
 	for {
 		select {

@@ -49,12 +49,7 @@ func Main() {
 	if err != nil {
 		fatal("proxy init: %v", err)
 	}
-	go prx.admission.Run(rootCtx)
-	ep := cfg.Admission.Cache.KVEventsEndpoint
-	go prx.admission.mirror.Run(rootCtx, ep, kvmirror.ReplayEndpoint(ep))
-	go runEnginePool(rootCtx, cfg.Upstream, prx.admission)
-	go runEnginePreemptions(rootCtx, cfg.Upstream, prx.admission)
-	go prx.ready.Run(rootCtx)
+	startBackground(rootCtx, prx, cfg)
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
@@ -95,4 +90,16 @@ func Main() {
 func fatal(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "level=fatal msg=%q\n", fmt.Sprintf(format, a...))
 	os.Exit(1)
+}
+
+// startBackground starts the loops the proxy needs besides serving requests: the
+// admission pass, the KV event mirror, the engine pool and preemption readers and the
+// readiness probe. They stop with ctx.
+func startBackground(ctx context.Context, prx *Proxy, cfg *Config) {
+	go prx.admission.Run(ctx)
+	ep := cfg.Admission.Cache.KVEventsEndpoint
+	go prx.admission.mirror.Run(ctx, ep, kvmirror.ReplayEndpoint(ep))
+	go runEnginePool(ctx, cfg.Upstream, prx.admission)
+	go runEnginePreemptions(ctx, cfg.Upstream, prx.admission)
+	go prx.ready.Run(ctx)
 }
