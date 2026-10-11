@@ -41,6 +41,8 @@ The engine publishes every prefix-cache block it stores or evicts (`--kv-events-
 The `kvmirror` package replays that stream into a copy of the cache, keyed by token content, so
 for any prompt the proxy can say how many leading tokens the engine would serve from cache.
 Every request is tokenized on arrival (`/tokenize`, with the chat template) to get those tokens.
+When that fails, the prompt is priced from the body: 4 bytes per token for every string, and 4096
+tokens per image, audio or video item (recognised by its place in the schema, not its content).
 In live runs the prediction matched the engine's reported `cached_tokens` on over 99% of requests.
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the

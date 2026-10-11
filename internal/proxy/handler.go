@@ -44,6 +44,9 @@ const (
 	minCallerPriority, maxCallerPriority = -10, 100
 	// fallbackBytesPerToken prices a prompt /tokenize could not measure.
 	fallbackBytesPerToken = 4
+	// fallbackMediaTokens prices one image, audio or video item /tokenize could not
+	// measure: a large image on current vision models.
+	fallbackMediaTokens = 4096
 )
 
 // Proxy is the HTTP handler. Built once at startup; safe for concurrent use.
@@ -557,18 +560,25 @@ func maxTokensOf(body map[string]any) int {
 	return 0
 }
 
-// textBytesOf is the size of a request body's text: inline media (data: URLs) is left
-// out because its bytes say nothing about its token count.
+// mediaKeys name the content parts that carry media (OpenAI and vLLM chat schemas). A
+// media item's bytes say nothing about its token count, so each one is priced at
+// fallbackMediaTokens instead.
+var mediaKeys = map[string]bool{"image_url": true, "input_audio": true, "audio_url": true, "video_url": true}
+
+// textBytesOf is the size of a request body for the fallback estimate: every string's
+// bytes, except media items (by their place in the schema, never by their content),
+// which count as fallbackMediaTokens each.
 func textBytesOf(v any) int64 {
 	switch x := v.(type) {
 	case string:
-		if strings.HasPrefix(x, "data:") {
-			return 0
-		}
 		return int64(len(x))
 	case map[string]any:
 		var n int64
 		for k, e := range x {
+			if mediaKeys[k] {
+				n += int64(len(k)) + fallbackMediaTokens*fallbackBytesPerToken
+				continue
+			}
 			n += int64(len(k)) + textBytesOf(e)
 		}
 		return n

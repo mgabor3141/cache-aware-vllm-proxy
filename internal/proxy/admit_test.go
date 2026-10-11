@@ -83,7 +83,8 @@ func TestAdmissionRequestTokenizeRejected(t *testing.T) {
 	}
 }
 
-// Engine failing: fall back to text bytes, ignoring inline media.
+// Engine failing: fall back to the body's bytes; an inline image counts as
+// fallbackMediaTokens, not its base64 size and not nothing (chaos #5).
 func TestAdmissionRequestTokenizeFailsFallsBackToTextBytes(t *testing.T) {
 	p, _ := tokenizeProxy(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
@@ -91,8 +92,21 @@ func TestAdmissionRequestTokenizeFailsFallsBackToTextBytes(t *testing.T) {
 	img := "data:image/png;base64," + strings.Repeat("A", 1000000)
 	ev := parsedEvent(t, `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"`+strings.Repeat("y", 40000)+`"},{"type":"image_url","image_url":{"url":"`+img+`"}}]}]}`)
 	ar := p.admissionRequest(context.Background(), chatRequest(), ev)
-	if ar.PromptTokens < 9000 || ar.PromptTokens > 12000 {
-		t.Fatalf("fallback prompt %d, want about 10K (40 KB of text, image ignored)", ar.PromptTokens)
+	if want := 10000 + fallbackMediaTokens; ar.PromptTokens < want-500 || ar.PromptTokens > want+2000 {
+		t.Fatalf("fallback prompt %d, want about %d (40 KB of text and one image)", ar.PromptTokens, want)
+	}
+}
+
+// A string that merely starts with "data:" is text: it prices at its bytes, so a caller
+// cannot make a large prompt free by prefixing it (attacker #3).
+func TestFallbackPricesDataPrefixedTextAsText(t *testing.T) {
+	p, _ := tokenizeProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	ev := parsedEvent(t, `{"model":"m","messages":[{"role":"user","content":"data:`+strings.Repeat("z", 400000)+`"}]}`)
+	ar := p.admissionRequest(context.Background(), chatRequest(), ev)
+	if ar.PromptTokens < 100000 {
+		t.Fatalf("a 400 KB prompt starting with data: priced at %d tokens", ar.PromptTokens)
 	}
 }
 
