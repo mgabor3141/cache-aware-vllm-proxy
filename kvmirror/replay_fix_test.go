@@ -53,8 +53,8 @@ func serveReplay(ctx context.Context, t *testing.T, buf []rawBatch) string {
 }
 
 // A batch lost for good inside the publisher's replay buffer, or one that cannot be
-// decoded, is skipped: the replay completes with what is there instead of failing every
-// resubscribe (review r4-85 #1).
+// decoded, is skipped: the replay completes (after a hole, from the batch after it)
+// instead of failing every resubscribe (review r4-85 #1).
 func TestFixReplaySkipsHoleAndUndecodable(t *testing.T) {
 	old := replayFirstWait
 	replayFirstWait = 300 * time.Millisecond
@@ -79,8 +79,12 @@ func TestFixReplaySkipsHoleAndUndecodable(t *testing.T) {
 		if _, err := m.replay(ctx, serveReplay(ctx, t, buf)); err != nil {
 			t.Fatalf("%s: replay failed: %v", name, err)
 		}
-		if got := m.CachedTokens(toks); got != 12 {
-			t.Fatalf("%s: cached %d after replay, want 12", name, got)
+		want := 12
+		if name == "hole" {
+			want = 0 // the hole may have removed blocks: the mirror starts over after it
+		}
+		if got := m.CachedTokens(toks); got != want {
+			t.Fatalf("%s: cached %d after replay, want %d", name, got, want)
 		}
 	}
 }
