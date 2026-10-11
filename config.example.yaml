@@ -80,7 +80,8 @@ admission:
 # it is not (starting, restarting), requests wait in the queue instead of failing;
 # streaming clients get SSE keepalives meanwhile. /readyz reports the probe (and the
 # engine's KV pool being known). A running request is given up (502) once the probe has
-# failed for 3 intervals and the engine sent nothing for the request in that time.
+# found the engine gone (connection refused, reset, no route; a timeout never counts) for 3
+# intervals and the engine sent nothing for the request in that time.
 readiness:
   interval: "5s"
 

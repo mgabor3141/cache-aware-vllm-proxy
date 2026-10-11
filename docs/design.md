@@ -28,7 +28,8 @@ of its time recomputing.
   only add load. A retry from the same conversation (within 5 min) keeps the place
   its previous attempt had on arrival; giving up and returning again does not add up.
   The one bound is on a dead engine, not on a request: a running request is given up once
-  the engine has failed its readiness probe for three intervals and sent it nothing meanwhile.
+  the readiness probe has found the engine gone (refused, reset, no route; never a mere timeout)
+  for three intervals and the engine sent it nothing meanwhile.
 - **One job.** The proxy decides when a chat request reaches the engine, and nothing else: no
   model aliases, no request rewriting beyond priority and usage reporting, no replays. Deployment
   concerns (external identity, rate limits, CORS) belong to a gateway in front, which names the

@@ -144,10 +144,12 @@ hold its place on the engine.
 requests wait in the queue rather than fail. Nothing is retried: a request that fails once it
 reached the engine returns its error (for a stream, as an SSE error event after the last
 complete event: an event the engine left half written is dropped, never relayed). A running
-request whose engine has failed the probe for three intervals in a row, and which received
-nothing from the engine in that time, is given up with a 502 (an error event on a stream), so a
-dead or hung engine cannot hold permits forever. This is not a request timeout: on a live
-engine, or while the engine keeps sending, a request runs as long as it takes.
+request is given up with a 502 (an error event on a stream) when the probe has found the engine
+gone (connection refused, reset or no route) for three intervals in a row and nothing came from
+the engine for the request in that time, so a vanished engine cannot hold permits forever. A probe
+that times out or gets an error answer never counts: a busy engine is alive, and a request on a
+live engine runs as long as it takes. An engine wedged while still accepting connections is not
+detected.
 
 **Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
 status, or 502 with an `error` when it failed or ended without `[DONE]`; `status` 499 for a

@@ -732,18 +732,20 @@ func (p *Proxy) tokenizeSlot(ctx context.Context) (release func(), err error) {
 }
 
 // errEngineDown cancels a running request whose engine went down (watchEngine).
-var errEngineDown = errors.New("the engine stopped answering its readiness probe while the request ran")
+var errEngineDown = errors.New("the engine went away while the request ran (its readiness probe found nothing listening)")
 
-// engineDownProbes: a running request is given up once the engine has failed its
-// readiness probe for this many probe intervals, and nothing came from the engine for
-// the request in that time.
+// engineDownProbes: a running request is given up once the readiness probe has found the
+// engine gone (nothing listening) for this many probe intervals, and nothing came from
+// the engine for the request in that time.
 const engineDownProbes = 3
 
-// watchEngine cancels a running request (with errEngineDown) when the engine has been
-// down for engineDownAfter and the request heard nothing from it (heard, unix nanos of
-// the last bytes) for as long. This is not a request timeout: a request on a live engine
-// runs as long as it takes. It frees the permit of a request stuck on a dead or hung
-// engine, whose connection may never fail on its own.
+// watchEngine cancels a running request (with errEngineDown) when the probe has found the
+// engine gone (engineGone: refused, reset, no route) for engineDownAfter and the request
+// heard nothing from it (heard, unix nanos of the last bytes) for as long. This is not a request timeout: a request on a live engine
+// runs as long as it takes, and a probe that times out (a busy engine) never counts. It
+// frees the permit of a request stuck on an engine that is gone, whose connection may
+// never fail on its own (a vanished host, a half-open connection). A wedged engine that
+// still accepts connections is not detected.
 func (p *Proxy) watchEngine(ctx context.Context, cancel context.CancelCauseFunc, heard *atomic.Int64) (stop func()) {
 	quit := make(chan struct{})
 	go func() {
@@ -758,7 +760,7 @@ func (p *Proxy) watchEngine(ctx context.Context, cancel context.CancelCauseFunc,
 			case <-t.C:
 			}
 			silent := time.Since(time.Unix(0, heard.Load()))
-			if d := p.ready.downFor(); d >= p.engineDownAfter && silent >= p.engineDownAfter {
+			if d := p.ready.goneFor(); d >= p.engineDownAfter && silent >= p.engineDownAfter {
 				log.Printf("level=warn msg=\"gave up a running request: the engine is down and sent nothing for it\" down_s=%.0f silent_s=%.0f", d.Seconds(), silent.Seconds())
 				cancel(errEngineDown)
 				return

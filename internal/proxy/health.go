@@ -3,12 +3,14 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -22,10 +24,13 @@ type readiness struct {
 	client   *http.Client
 	interval time.Duration
 
-	mu      sync.Mutex
-	ready   bool
-	since   time.Time     // when ready last changed
-	changed chan struct{} // closed and replaced on every change of ready
+	mu    sync.Mutex
+	ready bool
+	// goneSince: since when every probe found nothing listening (connection refused,
+	// reset or no route); zero otherwise. A probe that times out or gets an error answer
+	// does not count: the engine may be alive and busy.
+	goneSince time.Time
+	changed   chan struct{} // closed and replaced on every change of ready
 
 	waiting atomic.Int64 // requests in Wait while the engine is not ready
 }
@@ -75,7 +80,7 @@ func (h *readiness) set(ready bool, why string) {
 		h.mu.Unlock()
 		return
 	}
-	h.ready, h.since = ready, time.Now()
+	h.ready = ready
 	close(h.changed)
 	h.changed = make(chan struct{})
 	h.mu.Unlock()
@@ -95,6 +100,7 @@ func (h *readiness) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		h.noteGone(err != nil && engineGone(err))
 		if err != nil {
 			h.set(false, err.Error())
 		} else {
@@ -133,15 +139,35 @@ func (h *readiness) probe(ctx context.Context) error {
 	return nil
 }
 
-// downFor is how long the engine has been not ready; 0 while it is ready.
-func (h *readiness) downFor() time.Duration {
+// engineGone reports whether a probe error shows nothing listening at the engine: the
+// connection was refused or reset, or there is no route to it.
+func engineGone(err error) bool {
+	for _, e := range []error{syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *readiness) noteGone(gone bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.ready {
+	switch {
+	case !gone:
+		h.goneSince = time.Time{}
+	case h.goneSince.IsZero():
+		h.goneSince = time.Now()
+	}
+}
+
+// goneFor is how long the probes have found the engine gone (engineGone); 0 when the
+// last probe did not.
+func (h *readiness) goneFor() time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.goneSince.IsZero() {
 		return 0
 	}
-	if h.since.IsZero() {
-		return 0 // never probed yet
-	}
-	return time.Since(h.since)
+	return time.Since(h.goneSince)
 }

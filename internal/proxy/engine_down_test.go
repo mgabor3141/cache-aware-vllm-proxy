@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -26,6 +28,7 @@ func TestEngineDownReleasesSilentRequest(t *testing.T) {
 		}()
 		<-in
 		h.p.ready.set(false, "test")
+		h.p.ready.noteGone(true)
 		waitFor(t, "permit released", func() bool { return h.p.admission.Snapshot().Active == 0 })
 		b := <-done
 		ev := h.event(1)
@@ -57,11 +60,59 @@ func TestEngineDownKeepsStreamThatIsHeard(t *testing.T) {
 	waitFor(t, "streaming", func() bool { return h.p.admission.Snapshot().Active == 1 })
 	time.Sleep(50 * time.Millisecond) // past the admission check, chunks flowing
 	h.p.ready.set(false, "test")
+	h.p.ready.noteGone(true)
 	b := <-done
 	if !strings.HasSuffix(b, sseDone) || strings.Contains(b, `"error"`) {
 		t.Fatalf("%q", b)
 	}
 	if ev := h.event(1); num(ev["status"]) != 200 {
 		t.Fatalf("log %v", ev)
+	}
+}
+
+// A probe that fails without showing the engine gone (a timeout: the engine is busy)
+// never gives up a running request, even one the engine is silent on (rev-3 #1).
+func TestEngineBusyProbeFailureKeepsRequest(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		w.Write([]byte(realVLLMChatResponse))
+	}, nil)
+	h.p.engineDownAfter = 100 * time.Millisecond
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		h.p.ready.set(false, "probe timed out")
+		h.p.ready.noteGone(false)
+	}()
+	if code, b := h.do("POST", "/v1/chat/completions", chatBody, nil); code != 200 {
+		t.Fatalf("%d %s", code, b)
+	}
+}
+
+// Only errors that show nothing listening count as the engine gone.
+func TestEngineGoneClassification(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	h := newReadiness("http://"+addr, time.Second)
+	if err := h.probe(context.Background()); err == nil || !engineGone(err) {
+		t.Fatalf("refused: %v gone=%v", err, err != nil && engineGone(err))
+	}
+	hang := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	h = newReadiness(hang.URL, time.Second)
+	h.client.Timeout = 100 * time.Millisecond
+	if err := h.probe(context.Background()); err == nil || engineGone(err) {
+		t.Fatalf("timeout: %v counted as gone", err)
+	}
+	busy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "loading", http.StatusServiceUnavailable)
+	}))
+	h = newReadiness(busy.URL, time.Second)
+	if err := h.probe(context.Background()); err == nil || engineGone(err) {
+		t.Fatalf("503: %v counted as gone", err)
 	}
 }
