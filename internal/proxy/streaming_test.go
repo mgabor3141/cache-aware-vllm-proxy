@@ -214,22 +214,40 @@ func TestStreamFeedsOutputCounter(t *testing.T) {
 	}
 }
 
-// When the engine dies inside an event, the error event still starts on a line of its
-// own, so the client can parse it (rev-1 #1).
+// When the engine dies inside an event, the client gets every complete event, then the
+// error event; never the cut event's truncated JSON (client #2). Both a reset and a
+// clean EOF.
 func TestStreamErrorAfterPartialEvent(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		sseEngine(sseChunk, `data: {"choices":[{"del`)(w, r)
-		conn, _, _ := w.(http.Hijacker).Hijack()
-		conn.Close()
-	}, nil)
-	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
-	if !strings.Contains(body, "\n\ndata: {\"error\"") || !strings.HasSuffix(body, sseDone) {
-		t.Fatalf("%q", body)
+	for _, reset := range []bool{true, false} {
+		h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+			sseEngine(sseChunk, `data: {"choices":[{"del`)(w, r)
+			if reset {
+				conn, _, _ := w.(http.Hijacker).Hijack()
+				conn.Close()
+			}
+		}, nil)
+		_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+		if !strings.HasPrefix(body, sseChunk) || !strings.HasSuffix(body, sseDone) {
+			t.Fatalf("reset=%v: %q", reset, body)
+		}
+		for _, e := range strings.Split(strings.TrimSpace(body), "\n\n") {
+			if p := strings.TrimPrefix(e, "data: "); p != e && p != "[DONE]" && !json.Valid([]byte(p)) {
+				t.Fatalf("reset=%v: event %q is not JSON; body %q", reset, e, body)
+			}
+		}
+		if !strings.Contains(body, `data: {"error"`) {
+			t.Fatalf("reset=%v: no error event: %q", reset, body)
+		}
 	}
-	// Each event parses: the cut one is skipped by a client, the error is not lost.
-	events := strings.Split(strings.TrimSpace(body), "\n\n")
-	if last := events[len(events)-2]; !strings.HasPrefix(last, `data: {"error"`) {
-		t.Fatalf("error event %q", last)
+}
+
+// Events split across reads are relayed whole, and a complete stream whose last bytes
+// follow its last blank line is relayed as sent.
+func TestStreamRelaysSplitEvents(t *testing.T) {
+	h := newHarness(t, sseEngine(`data: {"id":"c","choi`, `ces":[]}`+"\n\n"+`data: [DO`, "NE]\n\n"), nil)
+	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)
+	if want := `data: {"id":"c","choices":[]}` + "\n\n" + sseDone; body != want {
+		t.Fatalf("%q", body)
 	}
 }
 

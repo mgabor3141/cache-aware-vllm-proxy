@@ -1,6 +1,6 @@
 // Streaming requests (stream: true). The response is committed at once: SSE headers,
 // then keepalive comments while the request waits for the engine and for admission,
-// then the engine's stream as it arrives. Keepalives continue whenever the stream is
+// then the engine's stream as it arrives, whole events at a time. Keepalives continue whenever the stream is
 // silent, e.g. while a long prompt prefills.
 //
 // Once the 200 is out, failures reach the client as one SSE error event followed by
@@ -9,12 +9,12 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -98,7 +98,9 @@ func (p *Proxy) serveStream(w http.ResponseWriter, r *http.Request, ev *Event, b
 			if !scan.done {
 				ev.Error = "stream ended without [DONE]"
 				sw.errorEvent("the engine ended the stream early", http.StatusBadGateway)
+				return
 			}
+			sw.finish()
 			return
 		}
 		if rerr != nil {
@@ -138,16 +140,17 @@ func engineErrorMessage(r io.Reader) string {
 }
 
 // sseWriter serialises writes from the stream copier and the keepalive goroutine, and
-// flushes each one. It tracks whether the relayed engine stream stopped inside an event,
-// so nothing of the proxy's own (a keepalive, an error event) lands in the middle of one.
+// flushes each one. Engine bytes are relayed whole events at a time: the tail of an
+// event still being written is held back until its blank line arrives, so the client
+// never sees a partial event, and a keepalive or an error event of the proxy's own
+// always lands between events.
 type sseWriter struct {
-	mu     sync.Mutex
-	w      http.ResponseWriter
-	cancel context.CancelFunc
-	wrote  bool    // since the last keepalive check
-	tail   [4]byte // last bytes relayed from the engine
-	open   bool    // the relayed stream ends inside an event
-	failed bool
+	mu      sync.Mutex
+	w       http.ResponseWriter
+	cancel  context.CancelFunc
+	wrote   bool   // since the last keepalive check
+	pending []byte // engine bytes after the last complete event
+	failed  bool
 }
 
 func (s *sseWriter) writeLocked(b []byte) error {
@@ -173,51 +176,69 @@ func (s *sseWriter) write(b []byte) error {
 	return s.writeLocked(b)
 }
 
-// relay writes engine bytes and notes whether they end at an event boundary (a blank
-// line).
+// relay writes the engine bytes up to the last event boundary (a blank line) and holds
+// the rest.
 func (s *sseWriter) relay(b []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(b) >= len(s.tail) {
-		copy(s.tail[:], b[len(b)-len(s.tail):])
-	} else {
-		n := copy(s.tail[:], s.tail[len(b):])
-		copy(s.tail[n:], b)
+	s.pending = append(s.pending, b...)
+	cut := eventBoundary(s.pending)
+	if cut == 0 {
+		return nil
 	}
-	t := string(s.tail[:])
-	s.open = !strings.HasSuffix(t, "\n\n") && t != "\r\n\r\n"
-	return s.writeLocked(b)
+	err := s.writeLocked(s.pending[:cut])
+	s.pending = append(s.pending[:0], s.pending[cut:]...)
+	return err
+}
+
+// finish writes what the engine sent after its last blank line, for a stream that
+// ended complete.
+func (s *sseWriter) finish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) > 0 {
+		_ = s.writeLocked(s.pending)
+		s.pending = nil
+	}
+}
+
+// eventBoundary is the length of b's complete events: up to and including its last
+// blank line ("\n\n" or "\r\n\r\n"), 0 when it has none.
+func eventBoundary(b []byte) int {
+	cut := 0
+	if i := bytes.LastIndex(b, []byte("\n\n")); i >= 0 {
+		cut = i + 2
+	}
+	if i := bytes.LastIndex(b, []byte("\r\n\r\n")); i >= 0 && i+4 > cut {
+		cut = i + 4
+	}
+	return cut
 }
 
 func (s *sseWriter) flush() { _ = s.write(nil) }
 
-// keepaliveTick sends a keepalive comment if nothing was written since the last tick
-// and the stream is between events.
+// keepaliveTick sends a keepalive comment if nothing was written since the last tick.
 func (s *sseWriter) keepaliveTick() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idle := !s.wrote
 	s.wrote = false
-	if !idle || s.open {
+	if !idle {
 		return nil
 	}
 	return s.writeLocked([]byte(keepaliveLine))
 }
 
-// errorEvent sends an OpenAI-style error event and ends the stream. If the engine's
-// stream stopped inside an event, that event is terminated first, so the error is a
-// line of its own.
+// errorEvent sends an OpenAI-style error event and ends the stream. An event the engine
+// left unfinished is dropped: the client sees only complete events, then the error.
 func (s *sseWriter) errorEvent(msg string, code int) {
 	payload, _ := json.Marshal(map[string]any{
 		"error": map[string]any{"message": msg, "type": "proxy_error", "code": code},
 	})
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ev := "data: " + string(payload) + "\n\ndata: [DONE]\n\n"
-	if s.open {
-		ev = "\n\n" + ev
-	}
-	_ = s.writeLocked([]byte(ev))
+	s.pending = nil
+	_ = s.writeLocked([]byte("data: " + string(payload) + "\n\ndata: [DONE]\n\n"))
 }
 
 // keepalive sends a comment whenever nothing was written for about an interval, until

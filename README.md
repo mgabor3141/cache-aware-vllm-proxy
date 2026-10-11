@@ -132,7 +132,8 @@ hold its place on the engine.
 **Engine restarts.** A readiness probe asks the engine's `/v1/models` every
 `readiness.interval` (5 s); the engine is ready while it lists a model. While it is not,
 requests wait in the queue rather than fail. Nothing is retried: a request that fails once it
-reached the engine returns its error (for a stream, as an SSE error event).
+reached the engine returns its error (for a stream, as an SSE error event after the last
+complete event: an event the engine left half written is dropped, never relayed).
 
 **Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
 status and an `error` when it failed or ended without `[DONE]`; `status` 499 for a client that
