@@ -902,3 +902,36 @@ func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 	}
 }
 
+// With a prefix-match unit the engine keeps a prompt to its last unit (with speculative
+// decoding, one unit lower), which only the mirror's unit hits show: a two-block hold is
+// seen on its first look and dropped when the engine evicts its checkpoint. The session
+// keeps a block's worth of unit keys, not one per unit of the prompt.
+func TestCacheAdmissionHoldJudgedByUnitHit(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	m := q.mirror
+	m.SetConnected(true)
+	m.SetGeometry(3200, 64)
+	prompt := testPrompt(3, 0)[:6900]
+	storePrompt(m, 1, prompt, 1)
+	tr := q.startReq("a", 0, len(prompt), prompt)
+	rel := mustAdmit(t, tr, "a")
+	// The engine registers the prompt's end: attention at 6,848, a checkpoint at 6,784.
+	g0, g5 := 0, 5
+	m.Apply(2, []kvmirror.Event{
+		{Type: "BlockStored", BlockHashes: []any{uint64(41)}, ParentBlockHash: uint64(40), TokenIDs: prompt[6720:6784], BlockSize: 64, GroupIdx: &g0, Kind: "mamba"},
+		{Type: "BlockStored", BlockHashes: []any{uint64(42)}, ParentBlockHash: uint64(41), TokenIDs: prompt[6784:6848], BlockSize: 64, GroupIdx: &g5, Kind: "full_attention"},
+	})
+	tr.finish(rel, len(prompt), 100)
+	q.mu.Lock()
+	s := q.sessions["a"]
+	seen, units := s.heldSeen, len(s.heldBlocks.Units)
+	q.mu.Unlock()
+	if seen != 6784 || units > 3200/64+1 {
+		t.Fatalf("hold seen %d with %d unit keys, want 6784 and at most a block's", seen, units)
+	}
+	m.Apply(3, []kvmirror.Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(41)}, GroupIdx: &g0}})
+	q.tick()
+	if m := q.metrics(); m.held != 0 || m.evictedHolds != 1 {
+		t.Fatalf("evicted hold kept: %+v", m)
+	}
+}

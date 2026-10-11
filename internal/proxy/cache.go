@@ -576,6 +576,7 @@ func (q *AdmissionQueue) admitLocked(w *admissionWaiter, now time.Time) {
 	w.granted = true
 	q.running[w] = struct{}{}
 	w.tokens = nil
+	w.blocks = w.blocks.Tail() // from now on only the prompt's own end can be a unit hit
 	w.mirGen = q.mirror.Generation()
 	if s := q.sessions[w.session]; s != nil {
 		s.running++ // a session with a running request holds nothing (holding)
