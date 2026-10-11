@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -140,8 +141,13 @@ func (h *readiness) probe(ctx context.Context) error {
 }
 
 // engineGone reports whether a probe error shows nothing listening at the engine: the
-// connection was refused or reset, or there is no route to it.
+// connection was refused or reset, there is no route to it, or its name no longer resolves
+// (a removed or renamed container). A timeout is never "gone": a busy engine is alive.
 func engineGone(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return true
+	}
 	for _, e := range []error{syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH} {
 		if errors.Is(err, e) {
 			return true

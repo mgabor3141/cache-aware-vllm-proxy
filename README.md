@@ -154,7 +154,7 @@ requests wait in the queue rather than fail. Nothing is retried: a request that 
 reached the engine returns its error (for a stream, as an SSE error event after the last
 complete event: an event the engine left half written is dropped, never relayed). A running
 request is given up with a 502 (an error event on a stream) when the probe has found the engine
-gone (connection refused, reset or no route) for three intervals in a row and nothing came from
+gone (connection refused, reset, no route, or its name no longer resolves) for three intervals in a row and nothing came from
 the engine for the request in that time, so a vanished engine cannot hold permits forever. A probe
 that times out or gets an error answer never counts: a busy engine is alive, and a request on a
 live engine runs as long as it takes. An engine wedged while still accepting connections is not
