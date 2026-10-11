@@ -48,6 +48,8 @@ attention blocks: a hit at position p also needs a saved recurrent state at exac
 tracks each KV group separately and only counts a hit where every group has it. With
 speculative decoding (EAGLE, MTP) vLLM drops the last block of a hit; the mirror does the same
 only when `speculative_decoding` is set, as nothing in the event stream says so.
+A store that only repeats blocks the mirror holds, from the first block (vLLM's reuse report
+under `kv_cache_report_mode: "full"`), is not counted as a new copy.
 
 Engines that cache hybrid-model prefixes at a finer unit than the block, such as halt95's vLLM
 fork (`--block-size 4096 --prefix-match-unit 64`), save a recurrent state where each prompt ends,

@@ -137,21 +137,24 @@ func TestKVMirrorHybridRule(t *testing.T) {
 	}
 }
 
-// vLLM can cache two physical copies of one hash; evicting one publishes BlockRemoved
-// while the other stays. The mirror must keep the block until every copy is gone.
+// vLLM can cache two physical copies of one hash (a hybrid model recomputes the attention
+// blocks past its last recurrent checkpoint); evicting one publishes BlockRemoved while the
+// other stays. The mirror must keep the block until every copy is gone.
 func TestKVMirrorDuplicateCopies(t *testing.T) {
 	m := New()
 	g := 5
-	toks := make([]int64, 5)
-	st := Event{Type: "BlockStored", BlockHashes: []any{uint64(7)}, TokenIDs: toks[:4], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
-	m.Apply(-1, []Event{st, st})
+	toks := make([]int64, 9)
+	toks[0] = 1
+	first := Event{Type: "BlockStored", BlockHashes: []any{uint64(6)}, TokenIDs: toks[:4], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
+	st := Event{Type: "BlockStored", BlockHashes: []any{uint64(7)}, ParentBlockHash: uint64(6), TokenIDs: toks[4:8], BlockSize: 4, GroupIdx: &g, Kind: "full_attention"}
+	m.Apply(-1, []Event{first, st, st})
 	m.Apply(-1, []Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(7)}, GroupIdx: &g}})
-	if got := m.CachedTokens(toks); got != 4 {
-		t.Fatalf("one of two copies evicted: got %d, want 4", got)
+	if got := m.CachedTokens(toks); got != 8 {
+		t.Fatalf("one of two copies evicted: got %d, want 8", got)
 	}
 	m.Apply(-1, []Event{{Type: "BlockRemoved", BlockHashes: []any{uint64(7)}, GroupIdx: &g}})
-	if got := m.CachedTokens(toks); got != 0 {
-		t.Fatalf("both copies evicted: got %d, want 0", got)
+	if got := m.CachedTokens(toks); got != 4 {
+		t.Fatalf("both copies evicted: got %d, want 4", got)
 	}
 }
 

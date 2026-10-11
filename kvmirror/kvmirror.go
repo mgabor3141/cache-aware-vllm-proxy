@@ -314,6 +314,7 @@ func (m *Mirror) isUnitLocked(size int) bool {
 
 type Stats struct {
 	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps uint64
+	Reports uint64 // reuse reports (kv_cache_report_mode "full") not counted as copies
 }
 
 func New() *Mirror {
@@ -522,6 +523,14 @@ func (m *Mirror) applyLocked(e *Event) {
 				log.Printf("level=warn msg=\"kv events block size differs from the engine's and its unit: those blocks never match\" event_block_size=%d block_size=%d unit=%d group=%d", e.BlockSize, m.blockSize, m.unitLocked(), g)
 			}
 		}
+		if e.ParentBlockHash == nil && m.allHeldLocked(e.BlockHashes, g) {
+			// A reuse report (kv_cache_report_mode "full", block_pool.py
+			// emit_cached_block_events): blocks a request hit, from block 0, with no
+			// BlockRemoved ever to match. Not new copies. A real second copy of block 0
+			// is missed too, which only makes the mirror under-report.
+			m.stats.Reports++
+			return
+		}
 		parent := rootKey
 		if e.ParentBlockHash != nil {
 			pu, ok := hashToUint(e.ParentBlockHash)
@@ -598,6 +607,17 @@ func (m *Mirror) storeUnitsLocked(e *Event, g uint) {
 			m.stats.Stored++
 		}
 	}
+}
+
+// allHeldLocked reports whether every hash is a block the mirror holds in group g.
+func (m *Mirror) allHeldLocked(hashes []any, g uint) bool {
+	for _, h := range hashes {
+		u, ok := hashToUint(h)
+		if !ok || m.byEngine[u] == nil || m.byEngine[u].groups&(1<<g) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Mirror) dropUnitLocked(f *unitEntry) {
