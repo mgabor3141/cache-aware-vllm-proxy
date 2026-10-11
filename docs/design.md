@@ -50,8 +50,9 @@ and MLA attention groups and mamba groups only: a sliding-window, chunked-local 
 is logged as an error and the mirror then predicts nothing cached. With
 speculative decoding (EAGLE, MTP) vLLM drops the last block of a hit; the mirror does the same
 only when `speculative_decoding` is set, as nothing in the event stream says so.
-A store that only repeats blocks the mirror holds, from the first block (vLLM's reuse report
-under `kv_cache_report_mode: "full"`), is not counted as a new copy.
+Every BlockStored of a hash is a physical copy (a hybrid model re-prefilling from block 0 stores
+a second copy of it). vLLM's reuse reports (`kv_cache_report_mode: "full"`) would add copies
+no eviction removes, so the proxy strips that field from requests.
 
 Engines that cache hybrid-model prefixes at a finer unit than the block, such as halt95's vLLM
 fork (`--block-size 4096 --prefix-match-unit 64`), save a recurrent state where each prompt ends,
