@@ -40,7 +40,6 @@ package proxy
 
 import (
 	"fmt"
-	"log"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -273,10 +272,11 @@ func (q *AdmissionQueue) session(key string, now time.Time) *cacheSession {
 }
 
 // pruneSessionsLocked forgets sessions idle past sessionRetention. With force (the table
-// is full), it also forgets the least recently seen idle sessions, those holding nothing
-// first, down to sessionCap less a sixteenth, so a full table is not scanned for every
-// new session. A session with running or queued requests is never forgotten; a hold
-// forgotten that way counts as displaced, and is logged.
+// is full), it also forgets the least recently seen sessions holding nothing, down to
+// sessionCap less a sixteenth, so a full table is not scanned for every new session. A
+// session with running or queued requests, or with a hold, is only forgotten at
+// retention: holds are bounded by the pool, and queued requests by nothing, so neither
+// may turn table pressure into lost holds.
 func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 	var idle []string
 	for k, s := range q.sessions {
@@ -285,7 +285,7 @@ func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 		}
 		if now.Sub(s.lastSeen) > sessionRetention {
 			delete(q.sessions, k)
-		} else if force {
+		} else if force && s.held == 0 {
 			idle = append(idle, k)
 		}
 	}
@@ -295,25 +295,13 @@ func (q *AdmissionQueue) pruneSessionsLocked(now time.Time, force bool) {
 	}
 	sort.Slice(idle, func(i, j int) bool {
 		a, b := q.sessions[idle[i]], q.sessions[idle[j]]
-		if (a.held > 0) != (b.held > 0) {
-			return a.held == 0
-		}
 		if !a.lastSeen.Equal(b.lastSeen) {
 			return a.lastSeen.Before(b.lastSeen)
 		}
 		return idle[i] < idle[j]
 	})
-	forgotten, held := 0, 0
 	for _, k := range idle[:min(excess, len(idle))] {
-		if h := q.sessions[k].held; h > 0 {
-			forgotten++
-			held += h
-		}
 		delete(q.sessions, k)
-	}
-	if forgotten > 0 {
-		q.displaced += held
-		log.Printf("level=warn msg=\"session table full: forgot idle holds\" holds=%d tokens=%d sessions=%d", forgotten, held, len(q.sessions))
 	}
 }
 

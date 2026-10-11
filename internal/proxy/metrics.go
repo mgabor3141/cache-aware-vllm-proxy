@@ -140,7 +140,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	gauge("cavp_cache_held_tokens", "Tokens held for conversations, idle or with a request running.", a.held)
 	gauge("cavp_guard_margin_blocks", "Overcommit guard margin added to each running request.", a.marginBlocks)
 	counter("cavp_guard_raises_total", "Times the overcommit guard raised its margin.", uint64(a.marginRaises))
-	counter("cavp_cache_displaced_tokens_total", "Held tokens released to make room for other work (or forgotten with a full session table).", uint64(a.displaced))
+	counter("cavp_cache_displaced_tokens_total", "Held tokens released to make room for other work.", uint64(a.displaced))
 	counter("cavp_cache_holds_evicted_total", "Holds released because the KV mirror no longer saw them cached.", uint64(a.evictedHolds))
 	gauge("cavp_kv_mirror_connected", "1 while the KV event mirror is subscribed and caught up.", b2i(a.mirrorConnected))
 	counter("cavp_engine_metrics_errors_total", "Failed reads of the engine's /metrics (KV pool and preemptions); the guard is blind while they fail.", a.engineMetricsErrors)
