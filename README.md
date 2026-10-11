@@ -86,7 +86,11 @@ curl -N localhost:4001/v1/chat/completions \
 ```
 
 Each request logs one JSON line on stdout; `curl localhost:4001/metrics` shows the queue and
-the cache. Clients need no changes: a conversation is identified by its first two messages.
+the cache: requests waiting for the engine (`cavp_ready_wait_requests`) and for admission
+(`cavp_queue_length`, `cavp_queue_oldest_wait_seconds`, the `cavp_queue_wait_seconds` histogram),
+and failures to size prompts or read the engine's metrics (`cavp_tokenize_errors_total`,
+`cavp_engine_metrics_errors_total`). Clients need no changes: a conversation is identified by
+its first two messages.
 
 The KV event stream and its replay socket are required: the proxy rebuilds its copy of the
 engine's cache from the replay whenever it (re)subscribes, and treats every prompt as uncached
@@ -106,16 +110,18 @@ cavp serves a small, fixed set of routes; everything else is 404:
 | Route | |
 |---|---|
 | `POST /v1/chat/completions`, `POST /v1/completions` | admitted, then forwarded |
-| `POST /v1/tokenize`, `POST /tokenize` | forwarded to the engine's `/tokenize`, not admitted |
+| `POST /v1/tokenize`, `POST /tokenize` | forwarded to the engine's `/tokenize`, not admitted; shares the proxy's 4 tokenize slots (it waits for one) |
 | `GET /v1/models` | the engine's model list, unchanged |
 | `GET /healthz` | the process is up |
-| `GET /readyz` | the engine is ready (see below) |
+| `GET /readyz` | the engine is ready (see below) and its KV pool is known |
 | `GET /metrics` | aggregate state, Prometheus text format |
 
 `/healthz`, `/readyz` and `/metrics` need no credentials and expose only totals. Every other
 route requires a caller (`auth` in the config: `static` bearer keys, `trusted_header` behind a
 gateway, or `none`). Only `Content-Type`, `Accept`, `User-Agent` and `X-Request-Id` are passed
-to the engine; the engine must not require an API key.
+to the engine; the engine must not require an API key. Every request has an `X-Request-Id`: the
+caller's, else one the proxy makes up. It is sent to the engine, echoed in the response and
+logged as `request_id`.
 
 **Bodies** are forwarded as sent, with two changes. `priority` is set by the proxy: the
 caller's identity is the most urgent it may run, and a numeric `priority` field in the body
@@ -136,11 +142,16 @@ hold its place on the engine.
 **Engine restarts.** A readiness probe asks the engine's `/v1/models` every
 `readiness.interval` (5 s); the engine is ready while it lists a model. While it is not,
 requests wait in the queue rather than fail. Nothing is retried: a request that fails once it
-reached the engine returns its error (for a stream, as an SSE error event).
+reached the engine returns its error (for a stream, as an SSE error event after the last
+complete event: an event the engine left half written is dropped, never relayed). A running
+request whose engine has failed the probe for three intervals in a row, and which received
+nothing from the engine in that time, is given up with a 502 (an error event on a stream), so a
+dead or hung engine cannot hold permits forever. This is not a request timeout: on a live
+engine, or while the engine keeps sending, a request runs as long as it takes.
 
 **Logs.** One JSON line per request on stdout, with the outcome: for a stream the engine's
-status and an `error` when it failed or ended without `[DONE]`; `status` 499 for a client that
-left while waiting; token usage including `cached_prompt_tokens` (with
+status, or 502 with an `error` when it failed or ended without `[DONE]`; `status` 499 for a
+client that left before the end; token usage including `cached_prompt_tokens` (with
 `--enable-prompt-tokens-details`; without it `usage_details` is absent and the hit-ratio
 counters in `/metrics` stay at zero rather than report misses).
 

@@ -11,24 +11,28 @@ import (
 
 // Status codes that exist only in the log: the client got no response, or not this one.
 const (
-	// statusClientGone: the client went away before a response started, while waiting
-	// for the engine or for admission (nginx's convention).
+	// statusClientGone: the client went away before the response ended: while waiting
+	// for the engine or for admission, or mid-response (nginx's convention).
 	statusClientGone = 499
 )
 
 // Event is one log line. Fields appear roughly in the order they become known.
 type Event struct {
-	TS       string `json:"ts"`
-	Method   string `json:"method"`
-	Path     string `json:"path"`
-	User     string `json:"user,omitempty"` // empty when authentication failed
-	Auth     string `json:"auth,omitempty"` // auth mode that accepted the caller
-	Model    string `json:"model,omitempty"`
-	Stream   bool   `json:"stream,omitempty"`
-	Priority int    `json:"priority,omitempty"`
+	TS     string `json:"ts"`
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	// RequestID is the caller's X-Request-Id, or one the proxy made up; it is echoed to the
+	// client and sent to the engine.
+	RequestID string `json:"request_id,omitempty"`
+	User      string `json:"user,omitempty"` // empty when authentication failed
+	Auth      string `json:"auth,omitempty"` // auth mode that accepted the caller
+	Model     string `json:"model,omitempty"`
+	Stream    bool   `json:"stream,omitempty"`
+	Priority  int    `json:"priority,omitempty"`
 	// Status is the outcome: the response status, or for a stream (whose client always
-	// gets 200 once it started) the engine's status; 499 when the client left while
-	// waiting. Error says what went wrong, including a stream cut short.
+	// gets 200 once it started) the engine's status; 502 when the engine's response was
+	// cut or a stream ended without [DONE]; 499 when the client left before the end.
+	// Error says what went wrong.
 	Status       int    `json:"status"`
 	Error        string `json:"error,omitempty"`
 	LatencyMS    int64  `json:"latency_ms"`

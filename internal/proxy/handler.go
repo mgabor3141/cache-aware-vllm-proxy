@@ -16,6 +16,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgabor3141/cache-aware-vllm-proxy/internal/auth"
@@ -38,12 +41,15 @@ const (
 	// writeStallTimeout bounds one write to a client. A client that stops reading
 	// (without disconnecting) would otherwise hold its admission permit forever.
 	writeStallTimeout = 5 * time.Minute
-	// tokenizeTimeout bounds sizing a prompt with /tokenize, including the wait for a slot.
+	// tokenizeTimeout bounds one sizing call to /tokenize, once it has a slot.
 	tokenizeTimeout = 10 * time.Second
 	// A caller-chosen priority is clamped to this range.
 	minCallerPriority, maxCallerPriority = -10, 100
 	// fallbackBytesPerToken prices a prompt /tokenize could not measure.
 	fallbackBytesPerToken = 4
+	// fallbackMediaTokens prices one image, audio or video item /tokenize could not
+	// measure: a large image on current vision models.
+	fallbackMediaTokens = 4096
 )
 
 // Proxy is the HTTP handler. Built once at startup; safe for concurrent use.
@@ -62,6 +68,8 @@ type Proxy struct {
 
 	keepalive  time.Duration
 	writeStall time.Duration
+	// engineDownAfter: see watchEngine.
+	engineDownAfter time.Duration
 
 	closing   chan struct{} // closed when the server shuts down
 	closeOnce sync.Once
@@ -78,14 +86,15 @@ func NewProxy(cfg *Config, logger *EventLogger) (*Proxy, error) {
 	}
 	return &Proxy{
 		cfg: cfg, upstream: u, logger: logger, auth: authn,
-		client:         &http.Client{},
-		admission:      NewAdmissionQueue(cfg.Admission),
-		ready:          newReadiness(cfg.Upstream, cfg.Readiness.Interval),
-		tokenizeClient: &http.Client{},
-		tokenizeSem:    make(chan struct{}, 4),
-		keepalive:      keepaliveInterval,
-		writeStall:     writeStallTimeout,
-		closing:        make(chan struct{}),
+		client:          &http.Client{},
+		admission:       NewAdmissionQueue(cfg.Admission),
+		ready:           newReadiness(cfg.Upstream, cfg.Readiness.Interval),
+		tokenizeClient:  &http.Client{},
+		tokenizeSem:     make(chan struct{}, 4),
+		keepalive:       keepaliveInterval,
+		writeStall:      writeStallTimeout,
+		engineDownAfter: engineDownProbes * cfg.Readiness.Interval,
+		closing:         make(chan struct{}),
 	}, nil
 }
 
@@ -117,8 +126,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, "ok\n")
 			return
 		case "/readyz":
+			// Ready means requests can be served: the engine answers and its KV pool is
+			// known (until then admission admits nothing).
 			if !p.ready.Ready() {
 				http.Error(w, "engine not ready", http.StatusServiceUnavailable)
+				return
+			}
+			if !p.admission.PoolKnown() {
+				http.Error(w, "engine KV pool unknown", http.StatusServiceUnavailable)
 				return
 			}
 			io.WriteString(w, "ok\n")
@@ -131,7 +146,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	route := apiRoute(r)
-	ev := &Event{TS: start.UTC().Format(time.RFC3339Nano), Method: r.Method, Path: r.URL.Path}
+	ev := &Event{TS: start.UTC().Format(time.RFC3339Nano), Method: r.Method, Path: r.URL.Path,
+		RequestID: requestID(r)}
+	w.Header().Set("X-Request-Id", ev.RequestID)
 	defer func() {
 		ev.LatencyMS = time.Since(start).Milliseconds()
 		p.logger.Log(ev)
@@ -170,12 +187,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch route {
 	case "models":
-		p.forwardTo(w, r, ev, "/v1/models", nil, nil)
+		p.forwardTo(r.Context(), w, r, ev, "/v1/models", nil, nil, nil)
 	case "tokenize":
-		p.forwardTo(w, r, ev, "/tokenize", body, nil)
+		release, err := p.tokenizeSlot(r.Context())
+		if err != nil {
+			ev.Status, ev.Error = statusClientGone, errClientGone.Error()
+			return
+		}
+		defer release()
+		p.forwardTo(r.Context(), w, r, ev, "/tokenize", body, nil, nil)
 	default:
 		p.serveInference(w, r, ev, who, body)
 	}
+}
+
+// requestID returns the request's X-Request-Id, making one up when it has none (or one
+// too long to log), and sets it on r so the engine gets it too.
+func requestID(r *http.Request) string {
+	id := r.Header.Get("X-Request-Id")
+	if id == "" || len(id) > 128 {
+		var b [12]byte
+		_, _ = rand.Read(b[:])
+		id = hex.EncodeToString(b[:])
+	}
+	r.Header.Set("X-Request-Id", id)
+	return id
 }
 
 // readBody reads the request body, at most max_body_bytes of it. On failure it has
@@ -274,14 +310,24 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 		}
 		return
 	}
-	defer release() // runs after the usage below is recorded: admission reads it
+	// One deferred step, in this order (it also runs when forwardTo aborts): the
+	// response's usage is recorded on ev, then the permit is released, and admission
+	// reads ev (Observe) as it releases.
 	keep := &bodyKeeper{limit: maxUsageBodyBytes}
-	p.forwardTo(w, r, ev, r.URL.Path, out, keep)
-	if ev.Status == http.StatusOK && !keep.over {
-		if u, ok := parseResponseUsage(keep.buf); ok {
-			ev.setUsage(u)
+	defer func() {
+		if ev.Status == http.StatusOK && !keep.over {
+			if u, ok := parseResponseUsage(keep.buf); ok {
+				ev.setUsage(u)
+			}
 		}
-	}
+		release()
+	}()
+	// A request stuck on a down engine is given up (watchEngine).
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	heard := heardNow()
+	defer p.watchEngine(ctx, cancel, heard)()
+	p.forwardTo(ctx, w, r, ev, r.URL.Path, out, keep, heard)
 }
 
 var (
@@ -325,6 +371,7 @@ func (p *Proxy) admit(ctx context.Context, r *http.Request, ev *Event) (func(), 
 	if !ok {
 		return nil, gone()
 	}
+	p.metrics.admitted(adm.Wait)
 	// The engine may have gone away while this request queued. Wait for it again,
 	// holding the permit: nothing runs meanwhile, and the request keeps its turn.
 	if !p.ready.Ready() {
@@ -376,11 +423,11 @@ func (p *Proxy) upstreamRequest(ctx context.Context, r *http.Request, path strin
 	return req, nil
 }
 
-// forwardTo sends the request to the engine and relays the response. keep, when set,
-// also receives the response body. A response cut short aborts the client's connection,
+// forwardTo sends the request to the engine, under ctx, and relays the response. keep,
+// when set, also receives the response body; heard, when set, the time of its last bytes. A response cut short aborts the client's connection,
 // so the client cannot mistake it for a complete one.
-func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte, keep *bodyKeeper) {
-	req, err := p.upstreamRequest(r.Context(), r, path, body)
+func (p *Proxy) forwardTo(ctx context.Context, w http.ResponseWriter, r *http.Request, ev *Event, path string, body []byte, keep *bodyKeeper, heard *atomic.Int64) {
+	req, err := p.upstreamRequest(ctx, r, path, body)
 	if err != nil {
 		ev.Status, ev.Error = http.StatusInternalServerError, err.Error()
 		writeError(w, ev.Status, "internal error")
@@ -391,6 +438,9 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 		if r.Context().Err() != nil {
 			ev.Status, ev.Error = statusClientGone, "client went away"
 			return
+		}
+		if context.Cause(ctx) == errEngineDown {
+			err = errEngineDown
 		}
 		ev.Status, ev.Error = http.StatusBadGateway, "engine request failed: "+err.Error()
 		writeError(w, ev.Status, "inference upstream request failed")
@@ -410,9 +460,12 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if heard != nil {
+				heard.Store(time.Now().UnixNano())
+			}
 			keep.Write(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				ev.Error = "client went away: " + werr.Error()
+				ev.Status, ev.Error = statusClientGone, "client went away: "+werr.Error()
 				return
 			}
 		}
@@ -420,9 +473,12 @@ func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, ev *Event, pat
 			return
 		}
 		if rerr != nil {
-			ev.Error = "engine response cut: " + rerr.Error()
+			if context.Cause(ctx) == errEngineDown {
+				rerr = errEngineDown
+			}
+			ev.Status, ev.Error = http.StatusBadGateway, "engine response cut: "+rerr.Error()
 			if r.Context().Err() != nil {
-				ev.Error = "client went away"
+				ev.Status, ev.Error = statusClientGone, "client went away"
 				return
 			}
 			panic(http.ErrAbortHandler)
@@ -486,16 +542,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // path recorded the status and usage.
 func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event) AdmissionRequest {
 	ev.report = &AdmissionReport{}
-	ev.generated = p.admission.NewOutputCounter()
 	ar := AdmissionRequest{
 		Priority: ev.Priority, Session: ev.Session, MaxTokens: ev.maxTokens,
-		Generated: ev.generated, Report: ev.report,
+		Buffered: !ev.Stream, Report: ev.report,
 		Observe: func() (CacheObservation, bool) {
 			if ev.PromptTokens <= 0 || ev.Status != http.StatusOK {
 				return CacheObservation{}, false
 			}
 			return CacheObservation{PromptTokens: ev.PromptTokens, CompletionTokens: ev.CompletionTokens}, true
 		},
+	}
+	if ev.Stream {
+		ev.generated = p.admission.NewOutputCounter()
+		ar.Generated = ev.generated
 	}
 	body := ev.body
 	ev.body = nil
@@ -514,6 +573,9 @@ func (p *Proxy) admissionRequest(ctx context.Context, r *http.Request, ev *Event
 		// real request repeats, or a changed route that it does not.
 		ar.PromptTokens = int(ev.textBytes / fallbackBytesPerToken)
 		ev.TokenizeError = err.Error()
+		if ctx.Err() == nil {
+			p.metrics.tokenizeFailed()
+		}
 	}
 	ev.EstPromptTokens = ar.PromptTokens
 	return ar
@@ -554,18 +616,25 @@ func maxTokensOf(body map[string]any) int {
 	return 0
 }
 
-// textBytesOf is the size of a request body's text: inline media (data: URLs) is left
-// out because its bytes say nothing about its token count.
+// mediaKeys name the content parts that carry media (OpenAI and vLLM chat schemas). A
+// media item's bytes say nothing about its token count, so each one is priced at
+// fallbackMediaTokens instead.
+var mediaKeys = map[string]bool{"image_url": true, "input_audio": true, "audio_url": true, "video_url": true}
+
+// textBytesOf is the size of a request body for the fallback estimate: every string's
+// bytes, except media items (by their place in the schema, never by their content),
+// which count as fallbackMediaTokens each.
 func textBytesOf(v any) int64 {
 	switch x := v.(type) {
 	case string:
-		if strings.HasPrefix(x, "data:") {
-			return 0
-		}
 		return int64(len(x))
 	case map[string]any:
 		var n int64
 		for k, e := range x {
+			if mediaKeys[k] {
+				n += int64(len(k)) + fallbackMediaTokens*fallbackBytesPerToken
+				continue
+			}
 			n += int64(len(k)) + textBytesOf(e)
 		}
 		return n
@@ -617,16 +686,15 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any) 
 	if err != nil {
 		return nil, err
 	}
-	// The timeout covers waiting for a slot too.
+	// Wait for a slot as long as it takes (the request has to wait anyway); only the
+	// call itself is bounded, so a busy slot does not push a prompt onto the estimate.
+	releaseSlot, err := p.tokenizeSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 	ctx, cancel := context.WithTimeout(ctx, tokenizeTimeout)
 	defer cancel()
-	// Bounded: tokenizing runs on the engine's API server, next to every stream.
-	select {
-	case p.tokenizeSem <- struct{}{}:
-		defer func() { <-p.tokenizeSem }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	u := *p.upstream
 	u.Path = strings.TrimRight(u.Path, "/") + "/tokenize"
 	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(buf))
@@ -649,4 +717,60 @@ func (p *Proxy) tokenize(ctx context.Context, path string, body map[string]any) 
 		return nil, err
 	}
 	return out.Tokens, nil
+}
+
+// tokenizeSlot waits for one of the tokenize slots, shared by the proxy's own sizing
+// calls and the callers' /tokenize: both are work on the engine's API server, next to
+// every stream. The wait is unbounded; it ends early only if ctx does.
+func (p *Proxy) tokenizeSlot(ctx context.Context) (release func(), err error) {
+	select {
+	case p.tokenizeSem <- struct{}{}:
+		return func() { <-p.tokenizeSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// errEngineDown cancels a running request whose engine went down (watchEngine).
+var errEngineDown = errors.New("the engine stopped answering its readiness probe while the request ran")
+
+// engineDownProbes: a running request is given up once the engine has failed its
+// readiness probe for this many probe intervals, and nothing came from the engine for
+// the request in that time.
+const engineDownProbes = 3
+
+// watchEngine cancels a running request (with errEngineDown) when the engine has been
+// down for engineDownAfter and the request heard nothing from it (heard, unix nanos of
+// the last bytes) for as long. This is not a request timeout: a request on a live engine
+// runs as long as it takes. It frees the permit of a request stuck on a dead or hung
+// engine, whose connection may never fail on its own.
+func (p *Proxy) watchEngine(ctx context.Context, cancel context.CancelCauseFunc, heard *atomic.Int64) (stop func()) {
+	quit := make(chan struct{})
+	go func() {
+		t := time.NewTicker(max(p.engineDownAfter/4, time.Millisecond))
+		defer t.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			silent := time.Since(time.Unix(0, heard.Load()))
+			if d := p.ready.downFor(); d >= p.engineDownAfter && silent >= p.engineDownAfter {
+				log.Printf("level=warn msg=\"gave up a running request: the engine is down and sent nothing for it\" down_s=%.0f silent_s=%.0f", d.Seconds(), silent.Seconds())
+				cancel(errEngineDown)
+				return
+			}
+		}
+	}()
+	return func() { close(quit) }
+}
+
+// heardNow returns a clock of the last bytes from the engine, started now.
+func heardNow() *atomic.Int64 {
+	var h atomic.Int64
+	h.Store(time.Now().UnixNano())
+	return &h
 }

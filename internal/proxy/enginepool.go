@@ -110,6 +110,8 @@ func runEnginePreemptions(ctx context.Context, upstream string, q *AdmissionQueu
 		}
 		if pre, ok := fetchPreemptions(ctx, upstream); ok {
 			q.EngineSignals(pre)
+		} else if ctx.Err() == nil {
+			q.engineMetricsErrors.Add(1)
 		}
 	}
 }
@@ -148,6 +150,9 @@ func runEnginePool(ctx context.Context, upstream string, q *AdmissionQueue) {
 		blocks, size, unit, err := fetchEnginePool(ctx, upstream)
 		switch {
 		case err != nil:
+			if ctx.Err() == nil {
+				q.engineMetricsErrors.Add(1)
+			}
 			if last[0] == 0 {
 				wait = 10 * time.Second
 				log.Printf("level=warn msg=\"engine KV pool unknown, requests wait\" err=%q", err.Error())

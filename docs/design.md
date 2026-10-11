@@ -27,6 +27,8 @@ of its time recomputing.
 - **No timeouts and no queue limit.** Agents retry. Timeouts that fire for many waiters at once
   only add load. A retry from the same conversation (within 5 min) keeps the place
   its previous attempt had on arrival; giving up and returning again does not add up.
+  The one bound is on a dead engine, not on a request: a running request is given up once
+  the engine has failed its readiness probe for three intervals and sent it nothing meanwhile.
 - **One job.** The proxy decides when a chat request reaches the engine, and nothing else: no
   model aliases, no request rewriting beyond priority and usage reporting, no replays. Deployment
   concerns (external identity, rate limits, CORS) belong to a gateway in front, which names the
@@ -42,6 +44,8 @@ The engine publishes every prefix-cache block it stores or evicts (`--kv-events-
 The `kvmirror` package replays that stream into a copy of the cache, keyed by token content, so
 for any prompt the proxy can say how many leading tokens the engine would serve from cache.
 Every request is tokenized on arrival (`/tokenize`, with the chat template) to get those tokens.
+When that fails, the prompt is priced from the body: 4 bytes per token for every string, and 4096
+tokens per image, audio or video item (recognised by its place in the schema, not its content).
 In live runs the prediction matched the engine's reported `cached_tokens` on over 99% of requests.
 
 Hybrid models (attention plus recurrent layers, e.g. Qwen3.8 Flash-Next) need more than the
@@ -97,7 +101,9 @@ and a fixed per-request overhead in blocks for state the engine keeps beyond the
 waiter is priced when it is granted, so a raised overhead reaches the queue too. The charge
 updates as output streams: from the stream's own token counts when it reports usage per chunk,
 else a configured number of tokens per chunk (1 plus the draft length under speculative
-decoding). A non-streaming request is charged its expected output until it finishes.
+decoding). A non-streaming request is charged its whole output cap from admission until it
+finishes: its `max_tokens`, else `default_output_tokens`, since nothing raises its charge while
+it runs.
 
 **Holds.** When a turn ends, its context is held: counted against the budget so nothing new is
 admitted on top of it. It stays counted while the conversation's next request runs (the session is

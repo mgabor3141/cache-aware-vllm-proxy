@@ -58,7 +58,8 @@ admission:
     decode_interference: 0.9
 
     # Output tokens reserved for a request until its conversation has history (then
-    # its 75th percentile); output beyond the reserve is charged as it streams.
+    # its 75th percentile); output beyond the reserve is charged as it streams. A
+    # non-streaming request without max_tokens is charged this much until it finishes.
     default_output_tokens: 2048
 
     # Output tokens a streamed chunk counts as, when the stream does not report usage per
@@ -77,7 +78,9 @@ admission:
 
 # The engine is ready while GET /v1/models lists a model, probed every interval. While
 # it is not (starting, restarting), requests wait in the queue instead of failing;
-# streaming clients get SSE keepalives meanwhile. /readyz reports the probe.
+# streaming clients get SSE keepalives meanwhile. /readyz reports the probe (and the
+# engine's KV pool being known). A running request is given up (502) once the probe has
+# failed for 3 intervals and the engine sent nothing for the request in that time.
 readiness:
   interval: "5s"
 

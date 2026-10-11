@@ -566,3 +566,17 @@ func TestHitRatioCountsOnlyReportedDetails(t *testing.T) {
 		t.Fatalf("prompt tokens without details counted:\n%s", m)
 	}
 }
+
+// /readyz is not ok while the engine's KV pool is unknown, since nothing can be
+// admitted (chaos #4).
+func TestReadyzNotOkWhilePoolUnknown(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	h.p.admission.SetPool(0, 0, 0)
+	if code, body := h.do("GET", "/readyz", "", map[string]string{"Authorization": ""}); code != 503 {
+		t.Fatalf("/readyz %d %q with the pool unknown", code, body)
+	}
+	h.p.admission.SetPool(1000, 16, 0)
+	if code, _ := h.do("GET", "/readyz", "", map[string]string{"Authorization": ""}); code != 200 {
+		t.Fatalf("/readyz %d with the pool known", code)
+	}
+}
