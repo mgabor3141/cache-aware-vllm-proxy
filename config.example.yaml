@@ -3,85 +3,103 @@
 # ${VAR} in a value is replaced from the environment after the file is parsed, so
 # secrets can live outside this file and a value never changes the file's structure.
 # Unknown keys are an error: a misspelt setting fails at startup instead of being
-# ignored. Validate a file with `cavp -check -config config.yaml`.
+# ignored. Validate a file with `cavp -check -config config.yaml`, in the environment the
+# proxy runs in (it substitutes ${VAR} but contacts nothing: a wrong host still passes).
+# The file is read at startup; changes need a restart.
 
 # Address the proxy listens on (plain HTTP; put TLS in front if it is exposed).
 listen: ":4001"
 
 # The vLLM OpenAI-compatible server. It must not require an API key: the proxy sends
-# none (the readiness probe and /v1/models would fail).
+# none, on any route, including the /metrics read that gives the KV pool (without it
+# nothing is admitted).
 upstream: "http://vllm:8000"
 
-# Who may call the proxy (internal/auth). Pick one mode:
+# Who may call the proxy (internal/auth). mode is required; pick one:
 #   static          keys listed here, values from the environment
-#   trusted_header  a gateway in front authenticates callers and sends X-Cavp-User,
-#                   X-Cavp-Priority and X-Cavp-Secret (= secret). Make cavp reachable
-#                   from the gateway alone, or anyone can claim any identity.
+#   trusted_header  a gateway in front authenticates callers and sends X-Cavp-User
+#                   (required), X-Cavp-Priority (an integer, optional) and X-Cavp-Secret
+#                   (= secret, at least 16 characters). Make cavp reachable from the
+#                   gateway alone, or anyone can claim any identity.
 #   none            everyone, as user "anonymous": only for a proxy reachable from
 #                   trusted hosts alone
 # A caller's priority is the most urgent it can be (lower runs first, as in vLLM); a
-# request may ask to run later with a "priority" body field.
+# request may ask to run later with a "priority" body field. A non-zero priority is sent
+# to the engine, which then needs --scheduling-policy priority.
 auth:
   mode: static
   keys:
     - key: ${CAVP_API_KEY}
       user: default
       priority: 0
+  # or, replacing the mode and keys above:
   # mode: trusted_header
   # secret: ${CAVP_GATEWAY_SECRET}
 
 admission:
-  # Most requests the engine runs at once (match vLLM's --max-num-seqs).
+  # The most requests admitted at once (match vLLM's --max-num-seqs). Unset, 1.
   max_active: 8
 
   cache:
     # Admission is cache-aware: it admits only what fits the engine's KV pool (read from
-    # its /metrics; until then requests wait), keeps returning conversations' contexts
-    # resident, and runs mostly-cached work first.
+    # its /metrics; until then requests wait; a request larger than the pool runs alone),
+    # keeps room for returning conversations' contexts so the engine has no reason to
+    # evict them, and, within a priority, runs mostly-cached work first.
 
     # vLLM's KV cache event stream (--kv-events-config, ZMQ publisher). Required. The
     # replay socket (replay_endpoint) is expected on the next port: the mirror of the
-    # engine's cache is rebuilt from it on every (re)subscribe. The block size and, on
-    # engines that cache at a finer unit (--prefix-match-unit), the unit are read from the
-    # engine's /metrics; nothing to set here.
+    # engine's cache is rebuilt from it on every (re)subscribe. If the stream is
+    # unreachable the proxy still serves but predicts nothing cached; watch
+    # cavp_kv_mirror_connected. The block size comes from the engine's /metrics; on
+    # engines that cache at a finer unit (--prefix-match-unit), the unit comes from the
+    # same metrics or, when they do not show it, from the events. Nothing to set here.
     kv_events_endpoint: "tcp://vllm:5557"
 
     # Whether the engine runs speculative decoding (--speculative-config: EAGLE, MTP).
     # vLLM then serves a cached prefix minus its last block (its last unit with
-    # --prefix-match-unit), and the mirror must predict the same. Default false.
+    # --prefix-match-unit), and the mirror must predict the same. Default false. Set
+    # tokens_per_chunk below with it.
     # speculative_decoding: true
 
-    # Prefill speed of your engine in tokens per second. With decode_interference (how
-    # much a running prefill slows decoding, 0-1) it decides how long a finished turn's
-    # context is protected: as long as re-prefilling it would take, at least 5 s.
+    # Prefill speed of your engine in tokens per second (unset, 4200; measure yours).
+    # With decode_interference (how much a running prefill slows decoding, 0-1; unset, 0)
+    # it decides how long a finished turn's context is protected: as long as
+    # re-prefilling it would take, times 1 + decode_interference x the requests running,
+    # and at least 5 s. A long context can so be protected for minutes.
     prefill_tokens_per_s: 4200
     decode_interference: 0.9
 
-    # Output tokens reserved for a request until its conversation has history (then
-    # its 75th percentile); output beyond the reserve is charged as it streams. A
-    # non-streaming request without max_tokens is charged this much until it finishes.
+    # Output tokens reserved for a streaming request before its output is seen: its
+    # conversation's 75th percentile once it has history, else this, never more than the
+    # request's output cap. Output beyond the reserve is charged as it streams. A
+    # non-streaming request is charged its output cap (max_completion_tokens or
+    # max_tokens), else this, until it finishes: a large cap can take the whole pool.
     default_output_tokens: 2048
 
-    # Output tokens a streamed chunk counts as, when the stream does not report usage per
-    # chunk: 1 without speculative decoding, 1 plus the draft length with it (4 for MTP
-    # with 3 draft tokens). Over-counting only wastes room; under-counting overcommits.
+    # Output tokens each choice in a streamed chunk counts as, when the stream does not
+    # report usage per chunk: 1 without speculative decoding, 1 plus the draft length with
+    # it (4 for MTP with 3 draft tokens). Over-counting only wastes room; under-counting
+    # overcommits.
     tokens_per_chunk: 1
 
     # KV blocks each running request holds beyond its prompt and output (recurrent
     # state, speculative and checkpoint blocks), while prefilling and while decoding.
-    # Engine and model specific: measure with `cavp -calibrate` on an idle engine.
-    # See "Per-request overhead" in the README; the overcommit guard covers a low figure.
+    # Engine and model specific: measure with `cavp -calibrate`, with the proxy stopped
+    # and nothing else reaching the engine. See "Per-request overhead" in the README; the
+    # overcommit guard reacts only once the engine preempts, so set a good figure.
     # Unset, both are 28, the largest figure measured (hybrid model with speculative
-    # decoding): safe but wasteful elsewhere. Set the calibrated values, e.g.:
+    # decoding): safe but wasteful elsewhere. An unset decode figure takes the prefill
+    # one; an unset prefill figure stays 28. 0 is valid. Set the calibrated values, e.g.:
     # prefill_overhead_blocks: 12
     # decode_overhead_blocks: 10
 
-# The engine is ready while GET /v1/models lists a model, probed every interval. While
-# it is not (starting, restarting), requests wait in the queue instead of failing;
-# streaming clients get SSE keepalives meanwhile. /readyz reports the probe (and the
-# engine's KV pool being known). A running request is given up (502) once the probe has
-# found the engine gone (connection refused, reset, no route; a timeout never counts) for 3
-# intervals and the engine sent nothing for the request in that time.
+# The engine is ready while GET /v1/models lists a model, probed every interval (a
+# duration with a unit; unset, 5s). While it is not (starting, restarting), requests
+# wait in the queue instead of failing; streaming clients get SSE keepalives meanwhile.
+# /readyz reports the probe (and the engine's KV pool being known). A running request is
+# given up (502, or an SSE error event on a stream) once the probe has found the engine
+# gone (connection refused, reset, no route, or its name no longer resolves; a timeout
+# never counts) for 3 intervals and the engine sent nothing for the request in that time.
 readiness:
   interval: "5s"
 
