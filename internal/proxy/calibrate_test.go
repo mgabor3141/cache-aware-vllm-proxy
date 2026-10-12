@@ -149,3 +149,22 @@ func TestCalibrateRefuses(t *testing.T) {
 		})
 	}
 }
+
+// With VLLM_API_KEY set, every request calibrate sends carries it, the KV pool read of
+// /metrics included, so an engine that requires the key can be calibrated.
+func TestCalibrateSendsKeyEverywhere(t *testing.T) {
+	t.Setenv("VLLM_API_KEY", "engine-key")
+	e := &fakeEngine{bs: 16, blocks: 4000, base: 300, ovh: 5, reqs: map[int]*fakeReq{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer engine-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		e.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	if err := calibrate(&Config{Upstream: srv.URL}, &out); err != nil || !strings.Contains(out.String(), "decode_overhead_blocks: 7") {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+}

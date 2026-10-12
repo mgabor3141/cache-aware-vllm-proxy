@@ -44,7 +44,7 @@ func calibrate(cfg *Config, out io.Writer) error {
 	up := strings.TrimRight(cfg.Upstream, "/")
 	c := &calClient{up: up, http: &http.Client{Timeout: 10 * time.Minute}, key: os.Getenv("VLLM_API_KEY")}
 
-	blocks, blockSize, _, err := fetchEnginePool(ctx, up)
+	blocks, blockSize, err := c.pool(ctx)
 	if err != nil {
 		return fmt.Errorf("engine pool: %w", err)
 	}
@@ -137,6 +137,22 @@ func (c *calClient) model(ctx context.Context) (string, error) {
 func (c *calClient) state(ctx context.Context, usable int) (used float64, busy int, err error) {
 	used, running, waiting, err := c.stateDetail(ctx, usable)
 	return used, running + waiting, err
+}
+
+// pool reads the engine's KV pool from its /metrics, with the key like every other call.
+func (c *calClient) pool(ctx context.Context) (blocks, blockSize int, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := c.do(ctx, http.MethodGet, "/metrics", nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("metrics: %s", resp.Status)
+	}
+	blocks, blockSize, _, err = parseEnginePool(resp.Body)
+	return blocks, blockSize, err
 }
 
 func (c *calClient) stateDetail(ctx context.Context, usable int) (used float64, running, waiting int, err error) {
