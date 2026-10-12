@@ -166,6 +166,10 @@ type Admitted struct {
 
 // Acquire waits for an execution permit until it is granted or ctx ends (ok false).
 // The returned release must be called exactly once.
+// testHookGaveUp runs when a waiter sees its context end, before it takes the lock;
+// tests use it to grant the waiter in between. Nil outside tests.
+var testHookGaveUp func()
+
 func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (release func(), adm Admitted, ok bool) {
 	observe := ar.Observe
 	if observe == nil {
@@ -179,6 +183,9 @@ func (q *AdmissionQueue) Acquire(ctx context.Context, ar AdmissionRequest) (rele
 	case <-w.ready:
 		return q.releaseFunc(w, observe), Admitted{q.now().Sub(w.arrived), snap}, true
 	case <-ctx.Done():
+		if testHookGaveUp != nil {
+			testHookGaveUp()
+		}
 		q.mu.Lock()
 		if w.granted {
 			q.mu.Unlock()

@@ -77,43 +77,33 @@ func TestEngineCutReturnsThePermit(t *testing.T) {
 	waitFor(t, "the permit back", func() bool { return h.p.admission.Snapshot().Active == 0 })
 }
 
-// A waiter granted at the moment its client gives up hands the permit straight back.
+// A waiter granted after its client gave up, before it took the lock, hands the permit
+// straight back.
 func TestReleaseVersusCancelReturnsThePermit(t *testing.T) {
-	branch := 0
-	for i := 0; i < 2000; i++ {
-		q := slotQueue(1)
-		hold, _, ok := q.Acquire(context.Background(), AdmissionRequest{Session: "h"})
-		if !ok {
-			t.Fatal("setup: the first permit")
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		admitted := make(chan func(), 1)
-		go func() {
-			rel, _, ok := q.Acquire(ctx, AdmissionRequest{Session: "s"})
-			if !ok {
-				rel = nil
-			}
-			admitted <- rel
-		}()
-		waitForQueued(t, q, 1)
-		go cancel()
-		hold()
-		rel := <-admitted
-		if rel != nil {
-			rel()
-		}
-		waitFor(t, "the queue empty", func() bool {
-			q.mu.Lock()
-			defer q.mu.Unlock()
-			return q.sessions["s"].waiting == 0 && len(q.running) == 0 && q.active == 0
-		})
-		q.mu.Lock()
-		if rel == nil && q.sessions["s"].gaveUpSince.IsZero() {
-			branch++ // granted, then cancelled
-		}
-		q.mu.Unlock()
+	q := slotQueue(1)
+	hold, _, ok := q.Acquire(context.Background(), AdmissionRequest{Session: "h"})
+	if !ok {
+		t.Fatal("setup: the first permit")
 	}
-	if branch == 0 {
-		t.Fatal("never reached the granted-then-cancelled branch")
+	testHookGaveUp = hold // the grant lands between the cancel and the lock
+	t.Cleanup(func() { testHookGaveUp = nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	admitted := make(chan bool, 1)
+	go func() {
+		_, _, ok := q.Acquire(ctx, AdmissionRequest{Session: "s"})
+		admitted <- ok
+	}()
+	waitForQueued(t, q, 1)
+	cancel()
+	if <-admitted {
+		t.Fatal("a cancelled waiter was admitted")
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if s := q.sessions["s"]; s == nil || !s.gaveUpSince.IsZero() {
+		t.Fatal("the granted-then-cancelled branch was not taken")
+	}
+	if len(q.running) != 0 || q.active != 0 {
+		t.Fatalf("permit not returned: active %d running %d", q.active, len(q.running))
 	}
 }
