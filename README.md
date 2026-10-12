@@ -147,7 +147,8 @@ integer `priority` field in the body may only make a request run later (clamped 
 the field is removed when the result is 0. On a streaming request,
 `stream_options.include_usage` is set to `true` unless the request sets it: the final usage
 chunk is how the proxy learns the size of a turn, which becomes its conversation's hold, so a
-client that sets it `false` gets no hold. A request streams only when `stream` is the JSON value
+client that sets it `false` is held at the prompt size the proxy measured, which can only raise
+its hold. A request streams only when `stream` is the JSON value
 `true`. `vllm_xargs.kv_cache_report_mode` is removed: a full report would corrupt the
 proxy's mirror of the engine's cache. Bodies over `max_body_bytes` (256 MiB) are refused
 with 413.
