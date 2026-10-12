@@ -26,7 +26,7 @@ package proxy
 //
 // Releasing an idle session: its hold is firm for as long as re-prefilling it would take
 // (with the decoding that prefill stalls), at least minHold, and as long again once its own thread
-// starts waiting (holdFor, firm). After that it is expendable: an equal-priority waiter may
+// starts waiting (holdFor, firm). After that it is expendable: a waiter of any priority may
 // displace it while fewer than evictBelowRunning requests run. A higher-priority waiter
 // may displace any lower-priority hold, idle or not (displaceable). Waiting long forces nothing, so many
 // waiters cannot start thrashing together.
@@ -236,8 +236,9 @@ func percentileInt(s []int, p float64) int {
 	return c[int(p*float64(len(c)-1)+0.5)]
 }
 
-// holding: idle with its prompt kept. Holds do not expire; under pressure they are
-// released by the return-rate rule in fitLocked, without pressure they cost nothing.
+// holding: idle with its prompt kept. Holds do not expire on a clock; they end when
+// displaced (fitLocked), when the mirror no longer confirms them (judgeHoldLocked), or with
+// their session (sessionRetention).
 func (s *cacheSession) holding(now time.Time) bool {
 	return s.running == 0 && s.held > 0
 }
@@ -424,7 +425,7 @@ func (q *AdmissionQueue) holdFor(s *cacheSession) time.Duration {
 	return max(minHold, time.Duration(sec*float64(time.Second)))
 }
 
-// firm: an idle hold no equal or lower priority waiter may displace, because its
+// firm: an idle hold no equal or lower priority waiter of another session may displace, because its
 // thread is likely back soon, or is back and waiting. Either lasts holdFor: from the turn
 // that left the hold, or from when the thread started waiting, so a waiter that cannot
 // run does not pin its hold.

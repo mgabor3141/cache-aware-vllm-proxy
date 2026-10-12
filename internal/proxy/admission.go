@@ -77,7 +77,7 @@ type AdmissionQueue struct {
 	evictedHolds int
 
 	// Overcommit guard (guard.go).
-	margin       int // blocks added to every running request's overhead
+	margin       int // blocks added to every running and waiting request's overhead
 	marginRaises int
 	lastRaise    time.Time
 	lastSignal   time.Time

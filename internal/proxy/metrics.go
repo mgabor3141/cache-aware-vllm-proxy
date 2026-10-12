@@ -138,19 +138,19 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	gauge("cavp_ready_wait_requests", "Requests waiting for the engine to become ready (not in cavp_queue_length).", int(p.ready.waiting.Load()))
 	gauge("cavp_tokenize_wait_requests", "Requests and /tokenize calls waiting for a tokenize slot, before admission (not in cavp_queue_length).", int(p.tokenizeWait.Load()))
 	gauge("cavp_queue_length", "Requests waiting for admission.", a.queued)
-	fmt.Fprintf(w, "# HELP cavp_queue_oldest_wait_seconds How long the longest waiting request has waited for admission (0: none waiting).\n# TYPE cavp_queue_oldest_wait_seconds gauge\ncavp_queue_oldest_wait_seconds %g\n", a.oldestWait.Seconds())
-	gauge("cavp_active_requests", "Admitted requests running on the engine.", a.active)
+	fmt.Fprintf(w, "# HELP cavp_queue_oldest_wait_seconds How long the longest waiting request has waited for admission on this attempt (0: none waiting).\n# TYPE cavp_queue_oldest_wait_seconds gauge\ncavp_queue_oldest_wait_seconds %g\n", a.oldestWait.Seconds())
+	gauge("cavp_active_requests", "Admitted requests holding a permit, including any waiting for the engine to be ready again (also in cavp_ready_wait_requests).", a.active)
 	gauge("cavp_cache_used_tokens", "Modelled KV cache use: running requests and held contexts.", a.usedTokens)
-	gauge("cavp_cache_budget_tokens", "KV cache budget (the engine's pool; 0 until known).", a.budgetTokens)
+	gauge("cavp_cache_budget_tokens", "KV cache budget in tokens: the engine's pool less its reserved null block (0 until known).", a.budgetTokens)
 	gauge("cavp_cache_held_tokens", "Tokens held for conversations, idle or with a request running.", a.held)
-	gauge("cavp_guard_margin_blocks", "Overcommit guard margin added to each running request.", a.marginBlocks)
+	gauge("cavp_guard_margin_blocks", "Overcommit guard margin, in blocks, added to the overhead of each running and waiting request.", a.marginBlocks)
 	counter("cavp_guard_raises_total", "Times the overcommit guard raised its margin.", uint64(a.marginRaises))
 	counter("cavp_cache_displaced_tokens_total", "Held tokens released to make room for other work.", uint64(a.displaced))
-	counter("cavp_cache_holds_evicted_total", "Holds released because the KV mirror no longer saw them cached.", uint64(a.evictedHolds))
+	counter("cavp_cache_holds_evicted_total", "Holds released because the KV mirror no longer saw them cached, or never could confirm them.", uint64(a.evictedHolds))
 	gauge("cavp_kv_mirror_connected", "1 while the KV event mirror is subscribed and caught up.", b2i(a.mirrorConnected))
-	gauge("cavp_kv_mirror_blocks", "Full blocks the KV event mirror holds.", a.mirror.Blocks)
-	gauge("cavp_kv_mirror_unsupported", "1 while the engine has a KV cache group kind the mirror cannot model (nothing is predicted cached).", b2i(a.mirror.Unsupported != ""))
-	io.WriteString(w, "# HELP cavp_kv_mirror_events_total KV event mirror counters by kind (skipped_*: events it could not use).\n# TYPE cavp_kv_mirror_events_total counter\n")
+	gauge("cavp_kv_mirror_blocks", "Full blocks the KV event mirror holds (unit entries not counted).", a.mirror.Blocks)
+	gauge("cavp_kv_mirror_unsupported", "1 while the mirror has seen, since it last started over, a KV cache group kind it cannot model (nothing is predicted cached).", b2i(a.mirror.Unsupported != ""))
+	io.WriteString(w, "# HELP cavp_kv_mirror_events_total KV event mirror counters by kind; units differ (stored, removed: blocks; batches, duplicates: batches; skipped_hash: hashes; others: events or occurrences).\n# TYPE cavp_kv_mirror_events_total counter\n")
 	counts := a.mirror.Stats.Counts()
 	kinds := make([]string, 0, len(counts))
 	for k := range counts {
@@ -160,7 +160,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	for _, k := range kinds {
 		fmt.Fprintf(w, "cavp_kv_mirror_events_total{kind=%q} %d\n", k, counts[k])
 	}
-	counter("cavp_engine_metrics_errors_total", "Failed reads of the engine's /metrics (KV pool and preemptions); the guard is blind while they fail.", a.engineMetricsErrors)
+	counter("cavp_engine_metrics_errors_total", "Failed reads of the engine's /metrics (KV pool and preemptions), per poll; the guard is blind while they fail.", a.engineMetricsErrors)
 
 	p.metrics.mu.Lock()
 	keys := make([]routeStatus, 0, len(p.metrics.requests))
@@ -183,7 +183,7 @@ func (p *Proxy) serveMetrics(w http.ResponseWriter) {
 	p.metrics.mu.Unlock()
 	counter("cavp_prompt_tokens_total", "Prompt tokens of finished requests whose engine reported cache details.", prompt)
 	counter("cavp_cached_prompt_tokens_total", "Of those, tokens served from the engine's prefix cache.", cached)
-	counter("cavp_tokenize_errors_total", "Prompts /tokenize could not size, priced from their bytes instead.", tokErr)
+	counter("cavp_tokenize_errors_total", "Prompts /tokenize could not size, priced from their text bytes (each media item 4096 tokens) instead.", tokErr)
 }
 
 func b2i(b bool) int {

@@ -17,7 +17,7 @@ import (
 // Its one signal is the engine preempting a request (vllm:num_preemptions_total rising): the
 // proxy let in more than the engine could hold. Each raises a margin added to every running
 // and waiting request's overhead, by guardStepBlocks, at most once per guardCooldown and up to
-// guardMaxMarginBlocks. After guardDecayAfter without a signal the margin falls by one step,
+// guardMaxMarginBlocks. Each guardDecayAfter without a signal the margin falls by one step,
 // back to zero (the configured figure). Every change is logged.
 //
 // Not signals: the engine evicting a held context (it also drops cached prefixes for its own

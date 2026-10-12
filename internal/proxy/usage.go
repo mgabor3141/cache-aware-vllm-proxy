@@ -9,7 +9,8 @@
 //	  empty choices and a usage object, just before "data: [DONE]". usageScanner reads
 //	  the stream line by line as it passes. The proxy sets include_usage when the
 //	  request does not (ensureStreamUsage); a caller that sets it false gets no usage
-//	  line, and its turn leaves no hold.
+//	  line, and its turn is held at the prompt the proxy measured (finishLocked), which can
+//	  only raise its hold.
 package proxy
 
 import (

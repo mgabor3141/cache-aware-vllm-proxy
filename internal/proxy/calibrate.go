@@ -31,8 +31,8 @@ import (
 // refine the decode figure and are skipped, with the reason, when they cannot be measured.
 //
 // It needs the engine to itself: nothing else running or waiting, before or during a round,
-// and no inference proxy in front of it admitting traffic (stop the proxy: calibration
-// traffic would also trip its overcommit guard). Pinned blocks of finished turns (grace pins in
+// and no inference proxy in front of it admitting traffic (stop the proxy: its traffic would
+// make the rounds abort). Pinned blocks of finished turns (grace pins in
 // halt95's vLLM fork, v2.5) are part of each round's baseline; they must not be released mid-round, so run
 // it with plenty of free KV space, ideally right after the engine starts.
 //
