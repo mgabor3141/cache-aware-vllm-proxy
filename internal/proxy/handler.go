@@ -464,6 +464,7 @@ func (p *Proxy) forwardTo(ctx context.Context, w http.ResponseWriter, r *http.Re
 	for _, k := range hopHeaders {
 		h.Del(k)
 	}
+	h.Set("X-Request-Id", ev.RequestID) // the logged id, not one the engine made up
 	w.WriteHeader(resp.StatusCode)
 	buf := make([]byte, 32<<10)
 	for {

@@ -39,3 +39,22 @@ func TestRequestIDLoggedEchoedForwarded(t *testing.T) {
 		t.Fatalf("401 without a request id: %d %v", resp.StatusCode, resp.Header)
 	}
 }
+
+// The engine's own X-Request-Id does not replace the proxy's echo: the client sees the id
+// that was logged.
+func TestRequestIDEchoNotReplacedByEngine(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "engine-id")
+		w.Write([]byte(realVLLMChatResponse))
+	}, nil)
+	resp, err := h.request(context.Background(), "POST", "/v1/chat/completions", chatBody, map[string]string{"X-Request-Id": "req-abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	logged, _ := h.event(1)["request_id"].(string)
+	if got := resp.Header.Values("X-Request-Id"); len(got) != 1 || got[0] != "req-abc" || logged != "req-abc" {
+		t.Fatalf("echoed %v, logged %q, want req-abc", got, logged)
+	}
+}
