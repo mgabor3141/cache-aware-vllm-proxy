@@ -301,3 +301,28 @@ func TestFirmHoldKeptWithEngineIdle(t *testing.T) {
 	q.tick()
 	mustAdmit(t, c, "c once the holds are expendable")()
 }
+
+// A turn without usage that is priced at exactly the held size does not take over the
+// hold: without usage it may only raise it, so the keys and priority stay the reported
+// turn's.
+func TestTurnWithoutUsageSameSizeKeepsHold(t *testing.T) {
+	q, _ := newCacheQueue(t, nil)
+	t1 := q.start("s", 0, 300000)
+	t1.finish(mustAdmit(t, t1, "turn 1"), 300000, 0)
+	gen := q.NewOutputCounter()
+	done := make(chan func())
+	go func() {
+		rel, _, _ := q.Acquire(context.Background(), AdmissionRequest{Session: "s", Priority: 5, PromptTokens: 300000, Generated: gen})
+		done <- rel
+	}()
+	rel := <-done
+	gen.Chunks(1)
+	rel()
+	q.mu.Lock()
+	s := q.sessions["s"]
+	held, prio := s.held, s.priority
+	q.mu.Unlock()
+	if held != 300800 || prio != 0 {
+		t.Errorf("held %d at priority %d, want the reported turn's 300800 at 0", held, prio)
+	}
+}

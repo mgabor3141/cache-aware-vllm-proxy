@@ -735,7 +735,8 @@ func (q *AdmissionQueue) finishLocked(w *admissionWaiter, obs func() (CacheObser
 	}
 	s.lastDone = now
 	n := commonBlocks(w.blocks, s.heldBlocks)
-	if h < s.held && !(reported && w.arrived.After(s.heldAt) && n < len(w.blocks.Blocks) && n < len(s.heldBlocks.Blocks)) {
+	// Without usage a turn may only raise the hold: an equal one keeps it as it is.
+	if (h < s.held || !reported && h == s.held) && !(reported && w.arrived.After(s.heldAt) && n < len(w.blocks.Blocks) && n < len(s.heldBlocks.Blocks)) {
 		return
 	}
 	s.held, s.heldBlocks, s.priority = h, w.blocks, w.priority
