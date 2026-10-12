@@ -1,16 +1,20 @@
 // Package kvmirror keeps a copy of a vLLM engine's GPU prefix cache from its KV cache events
 // (--kv-events-config, ZMQ PUB). With the token IDs of an incoming prompt it answers
-// "how many of these tokens are cached right now", which is what admission prices.
+// "how many of these tokens are cached right now", the figure the proxy's admission
+// control works from.
 //
 // Wire format (vllm/distributed/kv_events.py): multipart [topic, seq uint64 BE, payload];
 // payload is msgpack [ts, [event...], dp_rank?], each event a map tagged by "type":
 //
 //	BlockStored   block_hashes, parent_block_hash, token_ids, block_size, extra_keys,
-//	              group_idx, kv_cache_spec_kind
-//	BlockRemoved  block_hashes, group_idx
+//	              group_idx, kv_cache_spec_kind, medium
+//	BlockRemoved  block_hashes, group_idx, medium
 //	AllBlocksCleared
 //
 // It reads the event format of vLLM 0.24.0 and later (events as maps tagged by "type").
+// Block hashes must be integers of up to 64 bits or bytes; others are counted
+// (SkippedHash) and not mirrored. Events for another medium than the GPU (CPU or disk KV
+// offload) are counted (SkippedMedium) and not applied.
 //
 // Engine block hashes are opaque (sha256 over pickled keys), so the mirror keys blocks by
 // its own chain hash of token IDs: key(b) = H(key(parent), tokens(b)). An event's parent
@@ -35,19 +39,20 @@
 // boundary q and a recurrent checkpoint one unit lower, at p = q - unit; without it, both
 // at the last unit boundary before the last token. Each is published as a BlockStored of
 // block_size = unit carrying the last unit of tokens before it, its parent being the hash
-// one unit lower. A later prompt that extends the prefix finds them: the engine
+// one unit lower (announced for the attention entry, whose parent is the checkpoint, but
+// not for the checkpoint). A later prompt that extends the prefix finds them: the engine
 // (single_type_kv_cache_manager.py FullAttentionManager.find_longest_cache_hit) matches
 // the contiguous full blocks, probes the unit boundaries inside the next block highest
 // first, drops one unit (not a block) for speculative decoding, and the recurrent groups
 // need a checkpoint there. A turn resuming at a previous turn's tail is so cached to, for
 // example, 2 blocks and 31 units (10,176 tokens) rather than 2 blocks.
 //
-// The parents of unit entries are spans the engine never announces, so the mirror cannot
-// chain them, and their tokens alone do not say where in a prompt they are (agent
+// The checkpoint's parent is a span the engine never announces, so the mirror cannot
+// chain unit entries, and their tokens alone do not say where in a prompt they are (agent
 // conversations repeat themselves). The mirror therefore anchors unit entries on prompts
-// it has keyed: NewPromptKeys chains a key over every unit boundary of a prompt and
-// remembers, under its keys at the two boundaries where it ends, the tokens of the entries
-// the engine will register there. Cached then follows the engine. The attention groups
+// it has keyed: NewPromptKeys chains a key over every unit boundary a hit can use and
+// remembers, under its keys at the boundary or two where it ends, the tokens of the
+// entries the engine will register there. Cached then follows the engine. The attention groups
 // reach through the contiguous cached full blocks, and further to the highest remembered
 // end inside the next block whose attention entry the engine holds; the speculative drop
 // takes one unit off that. The hit is the newest boundary at or below it where every
@@ -55,8 +60,8 @@
 // checkpoint entry the engine holds, in any block. A turn whose predecessor's decode
 // filled the block it ended in reaches past that block (the decoded block matches) and
 // resumes at the checkpoint below it. Unit matching only adds boundaries, so a prediction
-// is never below the block-level rule's. What is not verified is that the engine's entries
-// are that earlier prompt's and not another's with the same unit of tokens; a prompt the
+// is never below the block-level rule's. The mirror cannot tell the engine's entries from
+// another prompt's with the same unit of tokens and takes them for that earlier prompt's; a prompt the
 // mirror never keyed (sent around the proxy, or before it started) gets no unit hit.
 package kvmirror
 
@@ -77,6 +82,8 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+// BlockKey is the mirror's key for a block: the first 16 bytes of its chained SHA-256
+// (chainKey).
 type BlockKey [16]byte
 
 // copies is what the engine holds under one hash: a bit per KV cache group holding at
@@ -119,6 +126,9 @@ type unitEntry struct {
 	copies
 }
 
+// Mirror holds a copy of an engine's prefix cache, built from its KV cache events, and
+// answers how much of a prompt is cached (Cached). It forgets everything on an engine
+// restart, a resubscription or AllBlocksCleared. Safe for concurrent use; build with New.
 type Mirror struct {
 	mu        sync.Mutex
 	blockSize int                     // set by SetGeometry, else learned from the first stored block
@@ -165,7 +175,8 @@ type Mirror struct {
 type PromptKeys struct {
 	BlockSize int
 	// Limit is the prompt's token count: the engine bounds its lookup at Limit-1, as it
-	// recomputes the last token. 0 leaves the unit probe unbounded.
+	// recomputes the last token. 0 (as after Tail) bounds the unit probe only at the
+	// last unit boundary of the block after the cached ones.
 	Limit     int
 	Blocks    []BlockKey
 	Unit      int
@@ -173,6 +184,7 @@ type PromptKeys struct {
 	Units     []uint64
 }
 
+// Empty reports whether the keys hold no block and no unit key.
 func (k PromptKeys) Empty() bool { return len(k.Blocks) == 0 && len(k.Units) == 0 }
 
 // unitKey returns the prompt's key at unit boundary x, if the keys hold it.
@@ -290,9 +302,9 @@ func (m *Mirror) SetSpeculative(on bool) {
 }
 
 // SetGeometry sets the engine's block size and prefix-match unit (from its metrics), so
-// prompt keys are built right before the first event shows them. A unit that is not a
-// proper divisor of the block size is ignored (and logged once); 0 leaves the unit to
-// the events.
+// prompt keys are built correctly even before the first event shows them. A unit at or
+// above the block size, or not dividing it, is ignored and logged once (except a unit
+// equal to the block size, which means none); 0 leaves the unit to the events.
 func (m *Mirror) SetGeometry(blockSize, unit int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -330,6 +342,11 @@ func (m *Mirror) isUnitLocked(size int) bool {
 	return size == m.unitLocked()
 }
 
+// Stats count what the mirror applied and skipped. Stored and Removed count blocks;
+// Batches (applied) and Duplicates (live batches a replay already applied) count batches;
+// Restarts and SeqGaps count sequence numbers that went back or skipped ahead, each
+// forcing a resync; SkippedOrphan counts stores whose parent is unknown and SkippedEmpty
+// stores without hashes, neither stored.
 type Stats struct {
 	// Reports are reuse reports of a recurrent group (parent-less, several blocks): not stored.
 	Stored, Removed, Cleared, Restarts, SkippedOrphan, SkippedEmpty, Batches, Duplicates, SeqGaps, Reports uint64
@@ -354,6 +371,7 @@ func (s Stats) Counts() map[string]uint64 {
 	}
 }
 
+// New returns an empty, unsubscribed mirror.
 func New() *Mirror {
 	m := &Mirror{tails: map[uint64]*list.Element{}, tailOrder: list.New()}
 	m.resetLocked()
@@ -382,6 +400,7 @@ func chainKey(parent BlockKey, tokens []int64, extra []byte) BlockKey {
 	return k
 }
 
+// Event is one KV cache event as decoded from a batch (see the package doc's wire format).
 type Event struct {
 	Type            string  `msgpack:"type"`
 	BlockHashes     []any   `msgpack:"block_hashes"`
@@ -454,8 +473,9 @@ func decodeBatch(payload []byte) ([]Event, error) {
 // delivery repeating what a replay applied is skipped; any other sequence that goes
 // backwards means the engine restarted, so the mirror starts over. It returns false, and
 // the mirror is unhealthy, on a gap (batches were lost) or a restart: either way the
-// mirror can no longer be trusted until it resyncs from a replay. A restart's batch is
-// not applied; the replay brings it.
+// mirror can no longer be trusted until it resyncs from a replay. Neither a restart's nor
+// a gap's batch is applied; Run's resync replay brings them (a program feeding Apply
+// itself must resync).
 func (m *Mirror) Apply(seq int64, events []Event) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -753,7 +773,8 @@ func PromptBlockKeys(prompt []int64, blockSize int) []BlockKey {
 // block, highest first), drops one block (one unit with a unit) for speculative decoding,
 // and returns the newest boundary at or below that where every recurrent group holds a
 // checkpoint: a cached block's end, or with a unit a remembered prompt end whose
-// checkpoint the engine holds, in any block below the reach. Unit matching only adds
+// checkpoint the engine holds, at any boundary at or below the reach (unit hits only on a
+// hybrid model, one with recurrent groups). Unit matching only adds
 // boundaries to the block-level rule, so it never predicts less.
 func (m *Mirror) Cached(k PromptKeys) int {
 	m.mu.Lock()
@@ -860,6 +881,7 @@ func (m *Mirror) CachedTokens(prompt []int64) int {
 	return m.Cached(m.NewPromptKeys(prompt))
 }
 
+// Status is a snapshot of the mirror: whether it is subscribed and what it holds.
 type Status struct {
 	Connected     bool    `json:"connected"`
 	Blocks        int     `json:"blocks"`
@@ -897,9 +919,10 @@ func (m *Mirror) SetConnected(v bool) {
 	m.mu.Unlock()
 }
 
-// Run subscribes to endpoint and applies batches until ctx ends, reconnecting on error.
-// With a replay endpoint, each subscription starts from an empty mirror rebuilt from the
-// publisher's replay buffer, and the mirror is healthy only once that replay completed.
+// Run subscribes to endpoint and applies batches until ctx ends, redialling 2 s after an
+// error. Each subscription starts from an empty mirror. With a replay endpoint it is
+// rebuilt from the publisher's replay buffer, and the mirror is healthy only once that
+// replay completed; without one, what was cached before is unknown.
 func (m *Mirror) Run(ctx context.Context, endpoint, replay string) {
 	for ctx.Err() == nil {
 		err := m.subscribe(ctx, endpoint, replay)
@@ -995,11 +1018,13 @@ func (m *Mirror) skipHole(from, to int64) {
 // reader and drops the rest silently, so a replay is read in rounds: each takes the
 // batches that arrive in sequence, stops at the first gap or a quiet second, and asks
 // again from the next missing sequence, until the end-of-sequence marker (seq -1). A round
-// whose first batch is past the sequence asked for skips the hole and clears the mirror:
-// those batches are gone, and may have removed blocks.
+// whose first batch is past the sequence asked for (other than a first round asking from
+// 0) skips the hole and clears the mirror: those batches are gone, and may have removed
+// blocks.
 // A later round asks from one batch earlier, the last one already applied: a publisher that
 // does not send that batch back unchanged is a restarted engine, and the replay fails.
-// Undecodable batches are skipped too. A replay that does not reach the marker is an error.
+// Undecodable batches are skipped too. A replay that does not reach the marker (an empty
+// round, or 64 rounds) is an error.
 func (m *Mirror) replay(ctx context.Context, endpoint string) (int, error) {
 	total := 0
 	from := int64(0)
