@@ -452,7 +452,7 @@ func (p *Proxy) forwardTo(ctx context.Context, w http.ResponseWriter, r *http.Re
 			err = errEngineDown
 		}
 		ev.Status, ev.Error = http.StatusBadGateway, "engine request failed: "+err.Error()
-		writeError(w, ev.Status, "inference upstream request failed")
+		writeError(w, ev.Status, upstreamFailure(path))
 		return
 	}
 	defer resp.Body.Close()
@@ -810,4 +810,15 @@ func heardNow() *atomic.Int64 {
 	var h atomic.Int64
 	h.Store(time.Now().UnixNano())
 	return &h
+}
+
+// upstreamFailure is the client's message when the engine could not be reached for path.
+func upstreamFailure(path string) string {
+	switch path {
+	case "/v1/models":
+		return "model list upstream request failed"
+	case "/tokenize":
+		return "tokenize upstream request failed"
+	}
+	return "inference upstream request failed"
 }
