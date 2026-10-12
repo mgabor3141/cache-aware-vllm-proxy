@@ -276,7 +276,7 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, ev *Event
 	// the body's priority field may only make it run later, since ordering is strict and
 	// an over-eager caller would starve everyone else.
 	ev.Priority = who.Priority
-	if v, ok := intField(body, "priority"); ok {
+	if v, ok := engineInt(body, "priority"); ok { // read as the engine reads an int
 		ev.Priority = max(min(max(v, minCallerPriority), maxCallerPriority), who.Priority)
 	}
 	if ev.Priority != 0 {
@@ -601,19 +601,6 @@ func (ev *Event) applyAdmissionReport() {
 	ev.PrefillCostS = math.Round(ev.report.PrefillCostS*10) / 10
 	ev.DisplacedTokens = ev.report.DisplacedTokens
 	ev.DisplaceCostS = math.Round(ev.report.DisplaceCostS*10) / 10
-}
-
-// intField reads an integer field of the body.
-func intField(body map[string]any, key string) (int, bool) {
-	n, ok := body[key].(json.Number)
-	if !ok {
-		return 0, false
-	}
-	v, err := n.Int64()
-	if err != nil || v != int64(int(v)) {
-		return 0, false
-	}
-	return int(v), true
 }
 
 // sequencesOf is how many sequences the engine runs for the request: OpenAI "n"

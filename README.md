@@ -142,9 +142,9 @@ Errors the proxy itself returns have an OpenAI-shaped body,
 
 **Bodies** of the two admitted routes must be one JSON object (else 400). They are re-encoded
 (key order and whitespace may change) and otherwise forwarded as sent, with three changes.
-`priority` is set by the proxy: the caller's identity is the most urgent it may run, and an
-integer `priority` field in the body may only make a request run later (clamped to -10..100);
-the field is removed when the result is 0. On a streaming request,
+`priority` is set by the proxy: the caller's identity is the most urgent it may run, and a
+`priority` field in the body (read as the engine reads an integer) may only make a request run
+later (clamped to -10..100); the field is removed when the result is 0. On a streaming request,
 `stream_options.include_usage` is set to `true` unless the request sets it: the final usage
 chunk is how the proxy learns the size of a turn, which becomes its conversation's hold, so a
 client that sets it `false` is held at the prompt size the proxy measured, which can only raise

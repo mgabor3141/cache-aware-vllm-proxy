@@ -240,7 +240,8 @@ func TestBodyPassesThrough(t *testing.T) {
 }
 
 // The caller's identity is the most urgent it may run; the body's priority may only make
-// it run later, clamped. X-Priority is not a control.
+// it run later, clamped. The field is read as the engine reads an integer (9, 9.0, "9").
+// X-Priority is not a control.
 func TestPriorityFromBodyOnlyLater(t *testing.T) {
 	var seen atomic.Value
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +258,8 @@ func TestPriorityFromBodyOnlyLater(t *testing.T) {
 	}{
 		{testKey, "", nil}, {testKey, `,"priority":7`, 7.0}, {testKey, `,"priority":-3`, nil},
 		{"k5", "", 5.0}, {"k5", `,"priority":-3`, 5.0}, {"k5", `,"priority":500`, 100.0},
-		{"k5", `,"priority":7.5`, 5.0}, {"k5", `,"priority":"9"`, 5.0},
+		{"k5", `,"priority":7.5`, 5.0}, {"k5", `,"priority":"9"`, 9.0}, {"k5", `,"priority":9.0`, 9.0},
+		{"k5", `,"priority":8e0`, 8.0}, {testKey, `,"priority":"x"`, nil},
 	} {
 		body := `{"model":"m","messages":[{"role":"user","content":"hi"}]` + c.prio + `}`
 		h.do("POST", "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer " + c.key, "X-Priority": "-10"})
