@@ -88,8 +88,8 @@ func TestGuardPreemptionSeries(t *testing.T) {
 }
 
 // The engine evicting a hold the proxy still protected is not a signal: it drops cached
-// prefixes for its own reasons, and with idle holds filling the pool the old near-budget
-// gate let it raise the margin with nothing running (review cv-60 F1, F5).
+// prefixes for its own reasons. The hold is released and the margin stays at zero (review
+// cv-60 F1, F5).
 func TestGuardIgnoresHoldEviction(t *testing.T) {
 	q, _ := newCacheQueue(t, func(a *AdmissionConfig) {
 		a.Cache.PrefillOverheadBlocks, a.Cache.DecodeOverheadBlocks = intPtr(2), intPtr(2)
@@ -168,7 +168,7 @@ func TestGuardMarginReachesQueuedWaiters(t *testing.T) {
 	if got := q.waiterCharge("early"); got != (40+guardStepBlocks)*bs {
 		t.Fatalf("queued charge %d, want the raised %d", got, (40+guardStepBlocks)*bs)
 	}
-	aRel() // frees exactly the pre-raise charge: early no longer fits beside b
+	aRel() // the margin is on b too: 40 blocks free against early's 42
 	q.tick()
 	mustWait(t, early, "early, short by the margin")
 

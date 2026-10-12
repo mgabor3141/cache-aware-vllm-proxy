@@ -145,7 +145,7 @@ func (h *harness) do(method, path, body string, hdr map[string]string) (int, str
 	return resp.StatusCode, string(b)
 }
 
-// lastEvent waits for the n-th log line and returns it.
+// event waits for the n-th log line and returns it.
 func (h *harness) event(n int) map[string]any {
 	h.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

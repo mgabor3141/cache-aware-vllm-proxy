@@ -241,8 +241,7 @@ func TestStreamErrorAfterPartialEvent(t *testing.T) {
 	}
 }
 
-// Events split across reads are relayed whole, and a complete stream whose last bytes
-// follow its last blank line is relayed as sent.
+// Events split across reads are relayed whole, including a [DONE] split across two writes.
 func TestStreamRelaysSplitEvents(t *testing.T) {
 	h := newHarness(t, sseEngine(`data: {"id":"c","choi`, `ces":[]}`+"\n\n"+`data: [DO`, "NE]\n\n"), nil)
 	_, body := h.do("POST", "/v1/chat/completions", streamBody, nil)

@@ -58,7 +58,7 @@ func TestAPIRoutesNeedCredentials(t *testing.T) {
 	}
 }
 
-// /healthz, /readyz and /metrics need no key and name nothing about callers.
+// /healthz, /readyz and /metrics need no key.
 func TestKeylessEndpoints(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	none := map[string]string{"Authorization": ""}
@@ -128,8 +128,8 @@ func TestTokenizeForwardedUnadmitted(t *testing.T) {
 	}
 }
 
-// Credentials, identity headers and hop-by-hop headers stay at the proxy, on both
-// forwarding paths (cv-56 #11, cv-54 #11).
+// Credentials, identity headers and hop-by-hop headers stay at the proxy, on the buffered
+// and the streaming request path (cv-56 #11, cv-54 #11).
 func TestOnlyAllowlistedHeadersReachEngine(t *testing.T) {
 	var seen atomic.Value
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

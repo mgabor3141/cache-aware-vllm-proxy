@@ -23,8 +23,9 @@ func (c *fakeClock) add(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// newCacheQueue is a queue on a known pool of 3200-token blocks: 222 usable blocks (200 of
-// a hybrid model, plus room for 28-block runners) unless mutate sets another size.
+// newCacheQueue is a queue on a known pool of 3200-token blocks: 222 usable blocks (710,400
+// tokens), room for two 200K threads (64 blocks of context and 28 of overhead each). For
+// another size use newCacheQueuePool; mutate only changes the config.
 func newCacheQueue(t *testing.T, mutate func(*AdmissionConfig)) (*AdmissionQueue, *fakeClock) {
 	return newCacheQueuePool(t, 710400, mutate)
 }
@@ -128,7 +129,8 @@ func mustWait(t *testing.T, tr *turn, what string) {
 	}
 }
 
-// Two 200K threads fit in the 511K cache; a third waits although slots are free.
+// Two 200K threads (294,400 each) fit in the 710,400-token cache; a third waits although
+// slots are free.
 func TestCacheAdmissionBoundsByCacheNotSlots(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	mustAdmit(t, q.start("a", 0, 200000), "a")
@@ -136,7 +138,7 @@ func TestCacheAdmissionBoundsByCacheNotSlots(t *testing.T) {
 	mustWait(t, q.start("c", 0, 200000), "c")
 }
 
-// The returning thread is admitted at once: its own hold covers it.
+// The returning thread is admitted at once: a request may always take its own session's hold.
 func TestCacheAdmissionReturningThreadUsesOwnHold(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	ta := q.start("a", 0, 200000)
@@ -148,8 +150,8 @@ func TestCacheAdmissionReturningThreadUsesOwnHold(t *testing.T) {
 	mustAdmit(t, q.start("a", 0, 206000), "returning a")
 }
 
-// Review finding 2: a tiny request with the GPU idle and the cache full of holds is
-// admitted within seconds, displacing a block or two.
+// Review finding 2: a tiny request with the GPU idle and holds filling most of the cache
+// is admitted at once.
 func TestCacheAdmissionTinyRequestNotStuckBehindHolds(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	ta, tb := q.start("a", 0, 245000), q.start("b", 0, 245000)
@@ -207,9 +209,9 @@ func TestCacheAdmissionPriorityWaitsForRunningAndGoesFirst(t *testing.T) {
 	mustAdmit(t, tclaw, "claw first after a finishes")
 }
 
-// Review finding 1: with the production 30m queue timeout, a large waiter facing an
-// active agent (one-minute turns, 10 s tool gaps) and a rolling stream of small requests
-// gets in by max_agent_wait.
+// Review finding 1: a large waiter facing an active agent (one-minute turns, 10 s tool
+// gaps) and a rolling stream of small requests is not starved by backfill: it gets in
+// within 11 minutes.
 func TestCacheAdmissionLargeWaiterNotStarvedByBackfill(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	agent := q.start("agent", 0, 200000)
@@ -261,7 +263,7 @@ func TestCacheAdmissionLargeWaiterNotStarvedByBackfill(t *testing.T) {
 	t.Fatal("big never admitted")
 }
 
-// A request larger than the whole cache still runs, alone.
+// A request that fills the cache runs, alone.
 func TestCacheAdmissionOversizedRunsAlone(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	mustAdmit(t, q.start("huge", 0, 600000), "oversized")
@@ -293,7 +295,7 @@ func TestCacheAdmissionOverlappingTurnsKeepLargest(t *testing.T) {
 	}
 }
 
-// A request whose prefix the mirror reports cached costs less and goes first.
+// A request whose prefix the mirror reports cached goes first, at its full charge.
 func TestCacheAdmissionCachedRequestJumpsQueue(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	q.mirror.SetSpeculative(true)
@@ -347,9 +349,9 @@ func TestShippedConfigValidates(t *testing.T) {
 }
 
 // Fifteen agent threads of 200K+ with tool gaps all finish and nothing exceeds the
-// budget. Two such threads fit at once and each keeps its cache for its entry quantum
-// (about 5 minutes), so a rotation through 15 takes most of an hour: the bound below is
-// that rotation, not a target. Clients that time out meanwhile retry in place.
+// budget. Two such threads fit at once and each keeps its cache for its hold window (48 s
+// of re-prefill, scaled by the requests running: 2-3 minutes here), so a rotation through
+// 15 takes over an hour: the bound below is that rotation, not a target.
 func TestCacheAdmissionFifteenThreadsAllProgress(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	const threads, turns = 15, 4
@@ -421,13 +423,14 @@ func TestCacheAdmissionFifteenThreadsAllProgress(t *testing.T) {
 	t.Fatal("threads did not all finish")
 }
 
-// Review 3 finding 1: two protected 250K holds fill the cache and nothing runs; a 2K
-// chat request with no max_tokens (charged 2K + 8,192 output) gets in at once.
+// Review 3 finding 1: two protected 240K holds leave 230,400 free and nothing runs; a 2K
+// chat request with no max_tokens (charged 2K + 8,192 output and the overhead) gets in at
+// once, displacing nothing.
 func TestCacheAdmissionTinyRequestBesideProtectedHolds(t *testing.T) {
 	q, _ := newCacheQueue(t, func(c *AdmissionConfig) { c.Cache.DefaultOutputTokens = 8192 })
 	ta, tb := q.start("a", 0, 240000), q.start("b", 0, 240000)
 	ra, rb := mustAdmit(t, ta, "a"), mustAdmit(t, tb, "b")
-	ta.finish(ra, 250000, 5000) // holds 249,600 each: 9,600 free
+	ta.finish(ra, 250000, 5000) // holds 240,000 each (the priced prompt): 230,400 free
 	tb.finish(rb, 250000, 5000)
 	tr := &turn{admitted: make(chan func(), 1), rep: &AdmissionReport{}, done: make(chan struct{})}
 	go func() {
@@ -445,7 +448,7 @@ func TestCacheAdmissionTinyRequestBesideProtectedHolds(t *testing.T) {
 // Review 3 finding 2: a higher priority displaces the smallest hold that covers it.
 func TestCacheAdmissionPriorityDisplacesBestFit(t *testing.T) {
 	// 200 blocks: big and small leave holds of 63 and 18, busy runs 59, so the claw
-	// (61) does not fit in the 59-60 left without displacing one.
+	// (61) does not fit in the 60 left without displacing one.
 	q, _ := newCacheQueuePool(t, 640000, nil)
 	big := q.start("big", 10, 200000)
 	rbig := mustAdmit(t, big, "big")
@@ -536,7 +539,7 @@ func TestCacheAdmissionHoldFirmThenExpendable(t *testing.T) {
 	mustAdmit(t, q.start("b", 0, 200000), "b")
 	ta.finish(ra, 200000, 3000)
 	tc := q.start("c", 0, 200000)
-	clk.add(60 * time.Second) // firm for 47.6 s x (1 + 0.94 x 1 running) = 92 s
+	clk.add(60 * time.Second) // hold 201,600: firm for 48 s x (1 + 0.94 x 1 running) = 93.1 s
 	q.tick()
 	mustWait(t, tc, "c while a's hold is firm")
 	clk.add(40 * time.Second)
@@ -551,7 +554,7 @@ func TestCacheAdmissionMinHold(t *testing.T) {
 	ra := mustAdmit(t, ta, "a")
 	mustAdmit(t, q.start("b", 0, 300000), "b")
 	ta.finish(ra, 10000, 500)
-	tc := q.start("c", 0, 220000) // needs 2 of a's 3 blocks
+	tc := q.start("c", 0, 220000) // needs 3 of a's 4 blocks
 	clk.add(2 * time.Second)
 	q.tick()
 	mustWait(t, tc, "c 2 s after a's turn")
@@ -590,13 +593,13 @@ func TestCacheAdmissionBusyEngineDoesNotEvict(t *testing.T) {
 		mustAdmit(t, q.start(n, 0, 1000), n)
 	}
 	ta.finish(ra, 150000, 3000)
-	tf := q.start("f", 0, 220000) // needs 9 of a's 46 blocks
+	tf := q.start("f", 0, 220000) // needs 43 of a's 47 blocks
 	clk.add(time.Hour)
 	q.tick()
 	mustWait(t, tf, "f with four running and only an expendable hold to take")
 }
 
-// Order within a priority: a cached thread, then small requests, then cold by wait.
+// Order within a priority: a small request goes before an older cold one.
 func TestCacheAdmissionTierOrder(t *testing.T) {
 	q, clk := newCacheQueue(t, func(c *AdmissionConfig) { c.MaxActive = 1 })
 	ta := q.start("a", 0, 100000)
@@ -849,8 +852,8 @@ func (q *AdmissionQueue) waiterWait(session string) time.Duration {
 
 // A hold whose first look sees nothing is gone when the mirror was reset since its turn
 // was admitted (here the engine restarted mid-turn), rather than exempt from judgement
-// forever. Without a reset in between, a hold the mirror cannot match stays (review 3,
-// rev-2 #2).
+// forever. Without a reset in between, a hold the mirror cannot match stays while firm
+// (review 3, rev-2 #2).
 func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	m := q.mirror
@@ -882,7 +885,7 @@ func TestCacheAdmissionHoldLostDuringItsTurn(t *testing.T) {
 }
 
 // A request tokenized before the engine's block size is known gets its mirror keys once
-// it is, so it is scored by what is cached and its hold can be judged (review 3, rev-2 #3).
+// it is, so it is scored by what is cached (review 3, rev-2 #3).
 func TestCacheAdmissionKeysBuiltOnceBlockSizeKnown(t *testing.T) {
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 8, Cache: CacheConfig{KVEventsEndpoint: "tcp://vllm:5557"}})
 	q.mirror.SetConnected(true)

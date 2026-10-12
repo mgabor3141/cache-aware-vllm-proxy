@@ -91,8 +91,8 @@ func TestAdmissionAllowsConfiguredConcurrency(t *testing.T) {
 	}
 }
 
-// Until the engine's pool is known nothing is admitted; requests wait (the request path
-// keeps streaming clients alive meanwhile) and run once it is read.
+// Until the engine's pool is known nothing is admitted; requests wait and run once it is
+// read.
 func TestAdmissionWaitsForThePool(t *testing.T) {
 	q := NewAdmissionQueue(AdmissionConfig{MaxActive: 4})
 	got := make(chan func(), 1)

@@ -9,7 +9,7 @@ import (
 )
 
 // [DONE] ends the relay even when the engine keeps the response open: the client's
-// stream ends, the permit comes back and the turn leaves its hold.
+// stream ends and the permit comes back.
 func TestDoneEndsStreamWithEngineResponseOpen(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
@@ -43,8 +43,8 @@ func TestDoneEndsStreamWithEngineResponseOpen(t *testing.T) {
 	waitFor(t, "the permit back", func() bool { return h.p.admission.Snapshot().Active == 0 })
 }
 
-// A [DONE] whose blank line arrives in a later read still reaches the client as a complete
-// event (rev-3 2).
+// A [DONE] the engine has not yet ended with a blank line is completed by the proxy, so the
+// client gets a complete event (rev-3 2).
 func TestDoneSplitAcrossReadsEndsWithBlankLine(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

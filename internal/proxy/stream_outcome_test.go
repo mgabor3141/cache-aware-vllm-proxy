@@ -9,7 +9,7 @@ import (
 )
 
 // A stream the engine cut, or one whose client left, is not counted as a success: the
-// log and cavp_requests_total carry 502 and 499 (operator #1, chaos #10).
+// log carries 502 and 499, and cavp_requests_total the 502 (operator #1, chaos #10).
 func TestStreamFailuresNotCountedAs200(t *testing.T) {
 	t.Run("engine cut", func(t *testing.T) {
 		h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

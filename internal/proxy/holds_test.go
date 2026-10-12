@@ -218,8 +218,8 @@ func TestGrantPassWithSlotsFullDoesNotScore(t *testing.T) {
 	}
 }
 
-// A grant pass does not scan every hold for every blocked waiter: its work per waiter
-// does not grow with the session table (scale #1).
+// A grant pass does not build a candidate list per blocked waiter: with 10 holds and 100
+// blocked waiters it allocates less than one object per waiter (scale #1).
 func TestGrantPassBlockedWaitersCheap(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	mustAdmit(t, q.start("r1", 0, 300000), "r1")
@@ -266,8 +266,8 @@ func TestRunningSessionHoldYieldsToHigherPriority(t *testing.T) {
 	t.Errorf("x starved behind a's pinned hold")
 }
 
-// Displacing the hold of a running session frees only what its running requests do not
-// cover (rev-1 N1).
+// Displacing the hold of a running session frees the hold while its running request stays
+// charged: a big turn leaves too little room, a small side call enough (rev-1 N1).
 func TestDisplacingRunningHoldFreesOnlyExcess(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

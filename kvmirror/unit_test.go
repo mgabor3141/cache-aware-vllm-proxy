@@ -60,7 +60,7 @@ func tailEntries(toks []int64, n int, ck, at uint64, ckParent any) []Event {
 func fixtureTokens(t *testing.T) []int64 {
 	t.Helper()
 	_, reqs := loadFixture(t)
-	return reqs[0].Tokens // a real 19,557-token conversation
+	return reqs[0].Tokens // a real 19,533-token conversation
 }
 
 func quietLog(t *testing.T) *bytes.Buffer {
@@ -203,10 +203,10 @@ func TestKVMirrorUnitHitNeedsCachedBlocksAndAKnownEnd(t *testing.T) {
 	}
 }
 
-// A turn that ended on a block boundary leaves no attention entry (the block is full)
-// and its checkpoint one unit below the block's end; one that ended a unit past a block
-// boundary has its checkpoint at the boundary, under the block's own hash (fork patch
-// 0094). The engine drops one unit from the attention hit and finds those checkpoints.
+// Where a turn's last unit boundary falls decides what the engine registers: on a block
+// edge, no attention entry (the block is full) and the checkpoint one unit below; a unit
+// past the edge, the entry there and the checkpoint at the edge, under the block's own
+// hash (fork patch 0094). The engine drops one unit from the attention hit and finds those checkpoints.
 func TestKVMirrorUnitHitAtBlockBoundaries(t *testing.T) {
 	toks := fixtureTokens(t)
 	m := New()
@@ -388,10 +388,9 @@ func decodeAcross(all []int64, block int, next uint64, promote bool, at uint64) 
 // 64,640 (attention entry at 64,704), its 2,309-token decode crosses 65,536 and fills
 // block 15, and the next turn (67,710 tokens, the previous prompt and output verbatim)
 // is cached by the engine to 64,640: its attention reaches through block 15, and the
-// recurrent groups resume at the checkpoint, a block below the probed one. The mirror
-// predicted 0. Whether or not the engine drops the unit entry when the block fills, and
-// whether or not the next turn's block 15 matches the decoded one, the prediction is the
-// checkpoint, and never below the block-level rule.
+// recurrent groups resume at the checkpoint, a block below the probed one (the mirror
+// once predicted 0). The prediction is the checkpoint unless the engine dropped the unit
+// entry and the next turn re-renders the output, and never below the block-level rule.
 func TestKVMirrorUnitHitAfterDecodeFillsTheBlock(t *testing.T) {
 	all := seqPrompt(67710)
 	prev, next := all[:64725], all

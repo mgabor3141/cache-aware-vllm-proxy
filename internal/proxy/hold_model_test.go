@@ -64,7 +64,7 @@ func TestHoldBoundedByPricedPrompt(t *testing.T) {
 }
 
 // A smaller turn that ends without usage keeps the previous hold even when it streamed
-// output (l3-92 F2); with usage, a side call that cannot be told apart keeps it too.
+// output (l3-92 F2).
 func TestTurnWithoutUsageKeepsHold(t *testing.T) {
 	q, _ := newCacheQueue(t, nil)
 	t1 := q.start("s", 0, 300000)
@@ -84,7 +84,7 @@ func TestTurnWithoutUsageKeepsHold(t *testing.T) {
 }
 
 // A release with nothing to show does not re-arm the hold's firmness (l3-94 #4).
-func TestUnobservedReleaseKeepsFirmness(t *testing.T) {
+func TestUnobservedReleaseDoesNotRearmFirmness(t *testing.T) {
 	q, clk := newCacheQueue(t, nil)
 	t1 := q.start("a", 0, 200000)
 	t1.finish(mustAdmit(t, t1, "a"), 200000, 0)

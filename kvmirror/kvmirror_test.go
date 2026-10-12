@@ -46,7 +46,7 @@ func loadFixture(t *testing.T) ([][]byte, []fixtureRequest) {
 }
 
 // Real events captured from a hybrid Qwen3.8 Flash-Next engine (testdata/kvevents, 2026-10-07): request 0 is a fresh
-// 19,557-token conversation, request 1 its second turn, request 2 a new conversation
+// 19,533-token conversation, request 1 its second turn, request 2 a new conversation
 // sharing the system prompt. The engine reported 0, 16,000 and 16,000 cached tokens.
 func TestKVMirrorReplaysCapturedEvents(t *testing.T) {
 	batches, reqs := loadFixture(t)
@@ -182,7 +182,7 @@ func seqPrompt(n int) []int64 {
 
 // An engine restart resets the publisher's sequence. Without a replay in progress, any
 // sequence that goes backwards is a restart, however small the step (review cv-52 #1).
-func TestKVMirrorRestartInsideFormerDuplicateWindow(t *testing.T) {
+func TestKVMirrorBackwardSequenceOutsideReplayIsRestart(t *testing.T) {
 	m := New()
 	m.SetSpeculative(true)
 	toks := seqPrompt(9)
@@ -287,7 +287,7 @@ func TestKVMirrorKeysAtAnotherBlockSizeMatchNothing(t *testing.T) {
 	}
 }
 
-// Two engine hashes for one block: evicting one and storing the other again keeps the
+// Two engine hashes for one block: evicting both and storing one again keeps the
 // block findable (review cv-52 #5).
 func TestKVMirrorAliasRestoredAfterEviction(t *testing.T) {
 	m := New()

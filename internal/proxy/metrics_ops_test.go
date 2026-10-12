@@ -95,8 +95,9 @@ func TestMetricsCountsTokenizeAndEngineMetricsFailures(t *testing.T) {
 	}
 }
 
-// The KV mirror's counters reach /metrics, so a mirror that is connected but skipping
-// every event (offloaded tiers, unreadable hashes) is visible (load3 #100 F9, F10).
+// The KV mirror's counters reach /metrics, including the skipped kinds, so a mirror that
+// is connected but skipping events (offloaded tiers, unreadable hashes) is visible (load3
+// #100 F9, F10).
 func TestMetricsExportMirrorStats(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	g, cpu := 0, "CPU"

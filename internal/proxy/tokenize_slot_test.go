@@ -35,8 +35,8 @@ func TestTokenizeSlotWaitDoesNotForceTheEstimate(t *testing.T) {
 	}
 }
 
-// The callers' /tokenize shares the slots of the proxy's own sizing calls: the engine
-// never sees more concurrent tokenizations than there are slots (round 2, 76#2).
+// The callers' /tokenize is bounded by the slots the proxy's own sizing calls use: the
+// engine never sees more concurrent tokenizations than there are slots (round 2, 76#2).
 func TestUserTokenizeSharesTheSlots(t *testing.T) {
 	var cur, peak atomic.Int64
 	h := newHarnessEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
